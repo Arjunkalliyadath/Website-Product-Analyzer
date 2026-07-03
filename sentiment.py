@@ -1,17 +1,6 @@
-"""
-Sentiment analysis with two layers:
-1. Try the HuggingFace transformers pipeline (needs a working model load).
-2. If pipeline is None or throws, fall back to a fast keyword-based analyser
-   so we always return a real positive/negative/neutral label instead of
-   defaulting everything to neutral.
-"""
-
 import re
 from typing import Optional
 
-# ---------------------------------------------------------------------------
-# Keyword-based fallback (no external dependencies)
-# ---------------------------------------------------------------------------
 _POSITIVE_WORDS = {
     "good", "great", "excellent", "amazing", "awesome", "fantastic",
     "love", "loved", "best", "perfect", "wonderful", "happy", "glad",
@@ -39,7 +28,6 @@ _NEGATIVE_WORDS = {
 _NEGATION = {"not", "no", "never", "don't", "doesn't", "didn't",
              "won't", "can't", "isn't", "wasn't", "hardly", "barely"}
 
-
 def _keyword_sentiment(text: str) -> str:
     tokens = re.findall(r"\b\w+\b", text.lower())
     pos = neg = 0
@@ -58,28 +46,16 @@ def _keyword_sentiment(text: str) -> str:
                 pos += 1
             else:
                 neg += 1
-        negate = False          # reset after one word
+        negate = False
     if pos > neg:
         return "positive"
     if neg > pos:
         return "negative"
     return "neutral"
 
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
 def analyze_sentiment(pipeline, text: str) -> str:
-    """
-    Return 'positive', 'negative', or 'neutral'.
-
-    Uses the HuggingFace pipeline when available; falls back to the fast
-    keyword analyser otherwise.
-    """
     if not text:
         return "neutral"
-
-    # Try the ML pipeline first
     if pipeline is not None:
         try:
             result = pipeline(text)[0]
@@ -90,7 +66,5 @@ def analyze_sentiment(pipeline, text: str) -> str:
                 return "negative"
             return "neutral"
         except Exception:
-            pass  # fall through to keyword fallback
-
-    # Keyword-based fallback – always returns a meaningful label
+            pass
     return _keyword_sentiment(text)

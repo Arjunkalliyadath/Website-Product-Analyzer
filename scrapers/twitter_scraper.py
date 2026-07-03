@@ -1,32 +1,23 @@
 import asyncio
 import concurrent.futures
-<<<<<<< HEAD
 import logging
-=======
->>>>>>> 5b4009c04f14eaf1ec23d9aa8e7e56bc4049ef52
 import sys
 from typing import Dict, List
 
 from scrapers.browser_utils import normalize_comments
 
-<<<<<<< HEAD
 logger = logging.getLogger(__name__)
 
-=======
->>>>>>> 5b4009c04f14eaf1ec23d9aa8e7e56bc4049ef52
-# Tunables — raise/lower these if you want more or fewer results per run.
-MAX_TIMELINE_TWEETS = 30     # tweets/replies pulled straight off the profile
-MAX_TWEETS_TO_OPEN = 6        # how many of those tweets we open to read replies
-MAX_REPLIES_PER_TWEET = 10    # replies collected per opened tweet
-SCROLL_STEPS = 8              # how many times we scroll the timeline to lazy-load more
-
+MAX_TIMELINE_TWEETS = 30
+MAX_TWEETS_TO_OPEN = 6
+MAX_REPLIES_PER_TWEET = 10
+SCROLL_STEPS = 8
 
 def _profile_url(target: str) -> str:
     target = (target or "").strip()
     if target.startswith(("http://", "https://")):
         return target
     return f"https://x.com/{target.lstrip('@')}"
-
 
 async def scrape_twitter_comments(company_data: Dict[str, str]) -> List[str]:
     target = (
@@ -50,8 +41,7 @@ async def scrape_twitter_comments(company_data: Dict[str, str]) -> List[str]:
                         args=["--no-sandbox", "--disable-setuid-sandbox",
                               "--disable-dev-shm-usage"],
                     )
-                    # A real UA + viewport makes X far less likely to serve a
-                    # stripped-down/blocked page than an unconfigured context.
+
                     ctx = browser.new_context(
                         user_agent=(
                             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -66,14 +56,7 @@ async def scrape_twitter_comments(company_data: Dict[str, str]) -> List[str]:
                     try:
                         page.wait_for_selector("article", timeout=10000)
                     except Exception:
-<<<<<<< HEAD
-                        # DIAGNOSTIC (not a fix) — if X never renders a
-                        # single <article> (tweet) within 10s, it almost
-                        # always means X served a login-wall / "something
-                        # went wrong, retry" page to this unauthenticated
-                        # headless session rather than the real timeline.
-                        # Logged so it's visible in the terminal instead of
-                        # silently returning 0 comments with no explanation.
+
                         try:
                             title = page.title()
                         except Exception:
@@ -86,12 +69,7 @@ async def scrape_twitter_comments(company_data: Dict[str, str]) -> List[str]:
                             "session or the official X API.",
                             url, title,
                         )
-=======
-                        pass
->>>>>>> 5b4009c04f14eaf1ec23d9aa8e7e56bc4049ef52
 
-                    # Scroll repeatedly so more than the first screenful of
-                    # tweets gets lazy-loaded into the DOM.
                     for _ in range(SCROLL_STEPS):
                         page.mouse.wheel(0, 1800)
                         page.wait_for_timeout(900)
@@ -111,9 +89,6 @@ async def scrape_twitter_comments(company_data: Dict[str, str]) -> List[str]:
                         except Exception:
                             pass
 
-                    # Open a handful of individual tweets to pull in genuine
-                    # audience replies (the profile timeline alone is mostly
-                    # the brand's own posts, not customer comments).
                     seen_links = []
                     for link in tweet_links:
                         if link not in seen_links:
@@ -125,8 +100,7 @@ async def scrape_twitter_comments(company_data: Dict[str, str]) -> List[str]:
                             page.mouse.wheel(0, 1200)
                             page.wait_for_timeout(1200)
                             articles = page.locator("article").all()
-                            # Skip the first article (it's the original tweet,
-                            # already captured above) — the rest are replies.
+
                             for reply in articles[1:1 + MAX_REPLIES_PER_TWEET]:
                                 try:
                                     text = reply.inner_text()

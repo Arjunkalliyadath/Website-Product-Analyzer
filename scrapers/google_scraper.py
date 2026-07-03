@@ -1,7 +1,3 @@
-"""
-Google Reviews scraper — improved selector coverage and Maps navigation.
-"""
-
 import asyncio
 import concurrent.futures
 import re
@@ -17,29 +13,16 @@ _AGO_RE = re.compile(
     re.IGNORECASE,
 )
 
-<<<<<<< HEAD
-# BUG FIX — the generic SERP snippet selectors (div.VwiC3b, span.aCOpRe)
-# return the text of ANY Google search result snippet, not specifically
-# reviews. For less-common product queries this sometimes surfaces a social
-# profile's bio blurb instead — e.g. "163K followers · 1.7K+ posts ·
-# Purveyors of the World's finest headphones..." — which would otherwise
-# get stored and displayed as if it were a genuine customer review.
 _BIO_STATS_RE = re.compile(
     r"\d[\d,.]*\s*[kKmM]?\+?\s*(followers|following|posts|likes|subscribers)\b",
     re.IGNORECASE,
 )
 
-
 def _looks_like_review(text: str) -> bool:
-    """Reject social-profile-bio snippets picked up by the SERP fallback."""
-    # Two or more "163K followers" / "1.7K+ posts" style stat mentions in
-    # one snippet is a strong signal it's a bio, not a review.
+
     if len(_BIO_STATS_RE.findall(text)) >= 2:
         return False
     return True
-
-=======
->>>>>>> 5b4009c04f14eaf1ec23d9aa8e7e56bc4049ef52
 
 def _strip_review_boilerplate(text: str) -> str:
     t = text
@@ -52,7 +35,6 @@ def _strip_review_boilerplate(text: str) -> str:
     t = re.sub(r"\bShare\b\s*$", "", t)
     t = re.sub(r"\s+", " ", t).strip(" .|\u2022")
     return t
-
 
 async def scrape_google_reviews(company_data: Dict[str, str]) -> List[str]:
     query = company_data.get("company_name", "")
@@ -67,8 +49,8 @@ async def scrape_google_reviews(company_data: Dict[str, str]) -> List[str]:
         raw_results: List[str] = []
 
         review_selectors = [
-            "span.wiI7pd",            # Maps review body (clean)
-            "div.jftiEf",             # Maps review card container
+            "span.wiI7pd",
+            "div.jftiEf",
             "div[data-review-id]",
             "span.review-full-text",
             "div.review-snippet",
@@ -100,13 +82,11 @@ async def scrape_google_reviews(company_data: Dict[str, str]) -> List[str]:
                 )
                 page = ctx.new_page()
 
-                # --- Attempt 1: Google Maps ---
                 try:
                     maps_url = f"https://www.google.com/maps/search/{query.replace(' ', '+')}"
                     page.goto(maps_url, wait_until="domcontentloaded", timeout=30000)
                     page.wait_for_timeout(3000)
 
-                    # Click first result
                     for selector in ["a.hfpxzc", "div[role='article']", "div.Nv2PK"]:
                         try:
                             first = page.locator(selector).first
@@ -117,7 +97,6 @@ async def scrape_google_reviews(company_data: Dict[str, str]) -> List[str]:
                         except Exception:
                             pass
 
-                    # Click Reviews tab
                     for tab_name in ["Reviews", "Review"]:
                         try:
                             tab = page.get_by_role("tab", name=tab_name)
@@ -128,12 +107,10 @@ async def scrape_google_reviews(company_data: Dict[str, str]) -> List[str]:
                         except Exception:
                             pass
 
-                    # Scroll to load more reviews
                     for _ in range(6):
                         page.mouse.wheel(0, 800)
                         page.wait_for_timeout(600)
 
-                    # Expand "More" links
                     try:
                         for more_btn in page.locator("button[aria-label*='more']").all()[:10]:
                             try:
@@ -155,7 +132,6 @@ async def scrape_google_reviews(company_data: Dict[str, str]) -> List[str]:
                 except Exception:
                     pass
 
-                # --- Attempt 2: SERP "reviews" search ---
                 if len(raw_results) < MAX_RESULTS:
                     for search_q in [
                         f"{query} reviews",
@@ -177,7 +153,6 @@ async def scrape_google_reviews(company_data: Dict[str, str]) -> List[str]:
                         except Exception:
                             continue
 
-                # --- Attempt 3: Trustpilot or similar ---
                 if len(raw_results) < 5:
                     try:
                         search_q = f"{query} site:trustpilot.com OR site:g2.com reviews"
@@ -204,11 +179,7 @@ async def scrape_google_reviews(company_data: Dict[str, str]) -> List[str]:
         cleaned: List[str] = []
         for raw in raw_results:
             stripped = _strip_review_boilerplate(raw)
-<<<<<<< HEAD
             if stripped and len(stripped.split()) >= 5 and _looks_like_review(stripped):
-=======
-            if stripped and len(stripped.split()) >= 5:
->>>>>>> 5b4009c04f14eaf1ec23d9aa8e7e56bc4049ef52
                 cleaned.append(stripped)
 
         return normalize_comments(cleaned)[:MAX_RESULTS]

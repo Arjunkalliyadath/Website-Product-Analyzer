@@ -1,14 +1,3 @@
-"""
-Instagram scraper — login-wall aware.
-
-Instagram requires login for almost all profile pages now. Strategy:
-1. Try public embed widget for caption text.
-2. Try direct profile page (works briefly sometimes).
-3. Search Google/Bing with multiple query variants targeting real post captions
-   and user mentions. This is the most reliable fallback.
-4. Try DuckDuckGo as additional source.
-"""
-
 import asyncio
 import concurrent.futures
 import sys
@@ -25,13 +14,6 @@ _CHROME_MARKERS = (
     "this account is private",
 )
 
-<<<<<<< HEAD
-# BUG FIX (July 2026 field test) — the SERP fallback (Attempts 3-5 below)
-# searches Google/Bing/DuckDuckGo for "{company} instagram review/comment",
-# which just as easily surfaces job postings, HR/Glassdoor-style Q&A, and
-# generic company blurbs as it does anything from Instagram — none of which
-# are customer reviews. These markers catch that category of false
-# positive before it's stored and displayed as an "Instagram comment".
 _NON_REVIEW_MARKERS = (
     "job description", "years of experience", "apply now", "we're hiring",
     "we are hiring", "job opening", "career opportunit", "job title",
@@ -40,26 +22,20 @@ _NON_REVIEW_MARKERS = (
     "salary range", "job posting", "now hiring", "currently hiring",
 )
 
-
 def _is_non_review(text: str) -> bool:
     low = text.lower()
     return _is_profile_chrome(text) or any(marker in low for marker in _NON_REVIEW_MARKERS)
-
-=======
->>>>>>> 5b4009c04f14eaf1ec23d9aa8e7e56bc4049ef52
 
 def _is_profile_chrome(text: str) -> bool:
     low = f" {text.lower()} "
     hits = sum(1 for marker in _CHROME_MARKERS if marker in low)
     return hits >= 2
 
-
 def _profile_url(target: str) -> str:
     target = (target or "").strip()
     if target.startswith(("http://", "https://")):
         return target
     return f"https://www.instagram.com/{target.lstrip('@')}/"
-
 
 async def scrape_instagram_comments(company_data: Dict[str, str]) -> List[str]:
     target = (
@@ -89,15 +65,8 @@ async def scrape_instagram_comments(company_data: Dict[str, str]) -> List[str]:
 
         def _add(txt: str) -> None:
             txt = (txt or "").strip()
-<<<<<<< HEAD
-            # Must be at least 6 words and not chrome noise / a job posting
-            # or other non-review content mistakenly surfaced by the SERP
-            # fallback (see BUG FIX note above _NON_REVIEW_MARKERS).
+
             if txt and len(txt.split()) >= 6 and not _is_non_review(txt):
-=======
-            # Must be at least 6 words and not chrome noise
-            if txt and len(txt.split()) >= 6 and not _is_profile_chrome(txt):
->>>>>>> 5b4009c04f14eaf1ec23d9aa8e7e56bc4049ef52
                 if txt not in results:
                     results.append(txt)
 
@@ -120,7 +89,6 @@ async def scrape_instagram_comments(company_data: Dict[str, str]) -> List[str]:
                 )
                 page = ctx.new_page()
 
-                # ── Attempt 1: embed widget ──
                 try:
                     page.goto(profile_url.rstrip("/") + "/embed/",
                                wait_until="domcontentloaded", timeout=15000)
@@ -133,7 +101,6 @@ async def scrape_instagram_comments(company_data: Dict[str, str]) -> List[str]:
                 except Exception:
                     pass
 
-                # ── Attempt 2: direct profile ──
                 if len(results) < MIN_RESULTS_BEFORE_FALLBACK:
                     try:
                         page.goto(profile_url, wait_until="domcontentloaded", timeout=20000)
@@ -150,7 +117,6 @@ async def scrape_instagram_comments(company_data: Dict[str, str]) -> List[str]:
                     except Exception:
                         pass
 
-                # ── Attempt 3: Google search variants ──
                 if len(results) < MIN_RESULTS_BEFORE_FALLBACK:
                     google_queries = [
                         f'site:instagram.com "{company_name}"',
@@ -168,7 +134,7 @@ async def scrape_instagram_comments(company_data: Dict[str, str]) -> List[str]:
                                 wait_until="domcontentloaded", timeout=20000,
                             )
                             page.wait_for_timeout(2000)
-                            # Google SERP snippet selectors
+
                             for sel in ["div.VwiC3b", "span.aCOpRe", "div.IsZvec",
                                         "div.lyLwlc", "span.MUxGbd"]:
                                 for loc in page.locator(sel).all()[:25]:
@@ -179,7 +145,6 @@ async def scrape_instagram_comments(company_data: Dict[str, str]) -> List[str]:
                         except Exception:
                             continue
 
-                # ── Attempt 4: Bing variants ──
                 if len(results) < MIN_RESULTS_BEFORE_FALLBACK:
                     bing_queries = [
                         f'site:instagram.com {company_name}',
@@ -200,7 +165,7 @@ async def scrape_instagram_comments(company_data: Dict[str, str]) -> List[str]:
                                 for loc in page.locator(sel).all()[:25]:
                                     try:
                                         txt = loc.inner_text()
-                                        # Only include if it mentions company
+
                                         if (company_name.lower() in txt.lower()
                                                 or handle.lower() in txt.lower()):
                                             _add(txt)
@@ -209,7 +174,6 @@ async def scrape_instagram_comments(company_data: Dict[str, str]) -> List[str]:
                         except Exception:
                             continue
 
-                # ── Attempt 5: DuckDuckGo ──
                 if len(results) < MIN_RESULTS_BEFORE_FALLBACK:
                     try:
                         q = f"instagram {company_name} reviews comments"

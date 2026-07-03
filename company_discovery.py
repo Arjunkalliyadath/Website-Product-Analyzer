@@ -1,57 +1,3 @@
-<<<<<<< HEAD
-=======
-"""
-company_discovery.py  –  improved company & social-media discovery
-===================================================================
-
-Root-cause fix
---------------
-The old code ranked candidates purely by scoring formulas that gave a
-slight edge to shorter URLs and "social link count", but never explicitly
-preferred the country-TLD version of a domain.  For "Headphone Zone"
-the .com variant consistently won because it appeared first in Google
-results and had the same social-link count as the .in version.
-
-What changed in this rewrite (same architecture, no new frameworks)
--------------------------------------------------------------------
-1.  STRONGER COUNTRY-TLD PREFERENCE
-    * `preferred_tld` now gets a big negative bonus (-600 instead of -400)
-      and is also applied during domain-guess ordering (preferred TLD
-      guesses are listed before .com guesses).
-    * A new `_infer_country_from_ip()` helper silently detects the
-      server's country from ip-api.com so "Headphone Zone" (searched
-      from India) automatically gets .in preference even without the
-      word "india" in the query.
-
-2.  PLAYWRIGHT FALLBACK FOR JS-RENDERED SOCIAL LINKS
-    * `_extract_website_links_playwright()` uses the already-installed
-      Playwright/Chromium to render the homepage and contact/about
-      pages when httpx finds zero social links.  This fixes sites that
-      load their footer social icons via JavaScript.
-    * The function reuses the existing `scrapers.browser_utils` pattern
-      your scrapers already use (async_playwright context manager).
-
-3.  DIRECT SOCIAL-SEARCH FALLBACK
-    * If after visiting every candidate website we still have no social
-      handle, `_fallback_social_search()` runs a targeted Google search
-      for "{company} site:instagram.com", etc. and extracts the handle
-      from the first result.
-
-4.  CANDIDATE FILTER FIX
-    * `_candidate_matches_company()` now also accepts partial-slug
-      matches so "headphonezone" matches "headphonezone.in" even when
-      the slug extracted from the query is just "headphonezone".
-
-5.  BETTER SEARCH QUERIES
-    * Added `"{company_name}" site:.in` (or the appropriate country TLD)
-      to the search URL list so the preferred regional domain gets
-      surfaced from search engines early.
-
-Everything else (scrapers, sentiment, app, templates, utils) is
-untouched.
-"""
-
->>>>>>> 5b4009c04f14eaf1ec23d9aa8e7e56bc4049ef52
 import asyncio
 import logging
 import re
@@ -110,7 +56,7 @@ COUNTRY_TLDS = {
     "france": ".fr",
     "japan": ".co.jp",
 }
-# Map ip-api country codes → TLD
+
 COUNTRY_CODE_TO_TLD = {
     "IN": ".in",
     "GB": ".co.uk",
@@ -131,10 +77,8 @@ HEADERS = {
     )
 }
 
-# Cache the detected country TLD for the lifetime of the process
 _detected_country_tld: Optional[str] = None
 _country_detection_done: bool = False
-
 
 @dataclass
 class DiscoveredLinks:
@@ -144,13 +88,11 @@ class DiscoveredLinks:
     youtube: str = ""
     google_business: str = ""
 
-
 @dataclass
 class WebsiteCandidate:
     url: str
     source: str
     order: int
-
 
 @dataclass
 class WebsiteEvaluation:
@@ -159,31 +101,13 @@ class WebsiteEvaluation:
     social_count: int
     score: tuple
 
-
-# ---------------------------------------------------------------------------
-# Public entry point
-# ---------------------------------------------------------------------------
-
 async def discover_company(company_name: str) -> Dict[str, str]:
-    """Discover a company website and social media links.
-
-    Strategy (in order):
-    1. Parse the query for a direct URL or a country hint.
-    2. Detect the server's country via IP geolocation (cached, non-blocking).
-    3. Collect candidate websites from domain guesses + search engines.
-    4. Visit each candidate with httpx; pick the one with the most social links
-       that best matches the company name and preferred TLD.
-    5. If the chosen site's social links were loaded by JavaScript, re-visit
-       with Playwright to render them.
-    6. If social links are still missing, run targeted social-search fallbacks.
-    """
     raw_query = company_name.strip()
     preferred_tld = _preferred_tld(raw_query)
     company_core = _company_core(raw_query)
     direct_url = _direct_url(raw_query)
     links = DiscoveredLinks()
 
-    # Detect country TLD from IP if not overridden by query words
     if not preferred_tld:
         preferred_tld = await _infer_country_from_ip()
 
@@ -219,9 +143,6 @@ async def discover_company(company_name: str) -> Dict[str, str]:
                 site_urls = await _extract_website_links(client, guessed)
                 _classify_urls(site_urls, links, replace_social=True)
 
-        # ------------------------------------------------------------------
-        # Playwright fallback: re-render the website if social links are missing
-        # ------------------------------------------------------------------
         missing_social = not (links.twitter or links.instagram or links.youtube)
         if links.website and missing_social:
             logger.info(
@@ -232,9 +153,6 @@ async def discover_company(company_name: str) -> Dict[str, str]:
             if playwright_urls:
                 _classify_urls(playwright_urls, links, replace_social=True)
 
-        # ------------------------------------------------------------------
-        # Direct social-search fallback: search each platform separately
-        # ------------------------------------------------------------------
         if not links.instagram or not links.twitter or not links.youtube:
             await _fallback_social_search(
                 client, company_core or raw_query, links
@@ -257,16 +175,7 @@ async def discover_company(company_name: str) -> Dict[str, str]:
         "discovery_version": DISCOVERY_VERSION,
     }
 
-
-# ---------------------------------------------------------------------------
-# Country / TLD detection
-# ---------------------------------------------------------------------------
-
 async def _infer_country_from_ip() -> str:
-    """Return the country TLD for the server's public IP, or '' on failure.
-
-    Result is cached for the process lifetime so it only runs once.
-    """
     global _detected_country_tld, _country_detection_done
     if _country_detection_done:
         return _detected_country_tld or ""
@@ -283,11 +192,6 @@ async def _infer_country_from_ip() -> str:
         _detected_country_tld = ""
     return _detected_country_tld or ""
 
-
-# ---------------------------------------------------------------------------
-# Candidate collection
-# ---------------------------------------------------------------------------
-
 async def _collect_candidates(
     client: httpx.AsyncClient,
     raw_query: str,
@@ -303,17 +207,15 @@ async def _collect_candidates(
             return
         if not _looks_like_official_website(normalized.lower()):
             return
-        # For search results, require a loose name match; guesses are always added.
+
         if source == "search" and not _candidate_matches_company(normalized, company_core):
             return
         seen.add(normalized)
         candidates.append(WebsiteCandidate(normalized, source, len(candidates)))
 
-    # Domain guesses (preferred TLD first)
     for url in _domain_guesses(company_core or raw_query, preferred_tld):
         add(url, "guess")
 
-    # Search engine results
     search_html = await _fetch_many(
         client, _build_search_urls(raw_query, company_core, preferred_tld)
     )
@@ -321,7 +223,6 @@ async def _collect_candidates(
         add(url, "search")
 
     return candidates
-
 
 async def _choose_best_candidate(
     client: httpx.AsyncClient,
@@ -353,9 +254,8 @@ async def _choose_best_candidate(
                 )
             )
 
-            # --- scoring (lower is better) ---
             direct_bonus   = -1000 if (direct_input and candidate.source == "direct") else 0
-            # STRONGER country bonus: -600 (was -400)
+
             country_bonus  = -600  if (preferred_tld and _host_matches_tld(final_url, preferred_tld)) else 0
             social_bonus   = -150  * social_count
             match_score    = _website_match_score(final_url, company_core)
@@ -383,11 +283,6 @@ async def _choose_best_candidate(
         return None
     return sorted(evaluated, key=lambda item: item.score)[0]
 
-
-# ---------------------------------------------------------------------------
-# Search URL builder
-# ---------------------------------------------------------------------------
-
 def _build_search_urls(
     raw_query: str, company_core: str, preferred_tld: str
 ) -> List[str]:
@@ -398,7 +293,7 @@ def _build_search_urls(
     if company_core and company_core != raw_query:
         queries.append(f"{company_core} official website social media")
     if preferred_tld:
-        # Explicit site: filter for the preferred TLD – surfaces regional domains early
+
         queries.append(
             f'"{company_core or raw_query}" site:{preferred_tld.lstrip(".")}'
         )
@@ -416,11 +311,6 @@ def _build_search_urls(
         ])
     return urls
 
-
-# ---------------------------------------------------------------------------
-# HTTP helpers
-# ---------------------------------------------------------------------------
-
 async def _fetch_many(
     client: httpx.AsyncClient, urls: Iterable[str]
 ) -> List[str]:
@@ -435,16 +325,10 @@ async def _fetch_many(
 
     return list(await asyncio.gather(*(fetch(url) for url in urls)))
 
-
 async def _safe_get(
     client: httpx.AsyncClient, url: str, timeout: float = 10.0
 ) -> httpx.Response:
     return await asyncio.wait_for(client.get(url), timeout=timeout)
-
-
-# ---------------------------------------------------------------------------
-# Website link extraction – httpx version (fast)
-# ---------------------------------------------------------------------------
 
 async def _extract_website_links(
     client: httpx.AsyncClient, website: str
@@ -481,19 +365,7 @@ async def _extract_website_links(
 
     return sorted(urls, key=_url_rank)
 
-
-# ---------------------------------------------------------------------------
-# Website link extraction – Playwright version (JS-rendered, Windows-safe)
-# ---------------------------------------------------------------------------
-
 async def _extract_website_links_playwright(website: str) -> List[str]:
-    """
-    Visit `website` with a real Chromium browser, extract social links.
-
-    Windows-safe: runs Playwright in a dedicated thread with a SelectorEventLoop
-    so that asyncio.create_subprocess_exec works even inside uvicorn's
-    ProactorEventLoop on Windows.
-    """
     root = _root_url(website)
     pages_to_visit = [
         root,
@@ -502,7 +374,7 @@ async def _extract_website_links_playwright(website: str) -> List[str]:
         f"{root}/pages/contact-us",
         f"{root}/pages/about-us",
     ]
-    # Capture for use inside the thread closure
+
     _extract_urls_ref = _extract_urls
     _url_rank_ref = _url_rank
     headers_ref = HEADERS
@@ -551,20 +423,11 @@ async def _extract_website_links_playwright(website: str) -> List[str]:
         logger.warning("Playwright social extraction failed for %s: %s", website, exc)
         return []
 
-
-# ---------------------------------------------------------------------------
-# Direct social-search fallback
-# ---------------------------------------------------------------------------
-
 async def _fallback_social_search(
     client: httpx.AsyncClient,
     company_name: str,
     links: DiscoveredLinks,
 ) -> None:
-    """
-    For any social platform that is still missing, run a targeted Google
-    search and extract the handle from the first matching result.
-    """
     tasks = {}
 
     if not links.instagram:
@@ -622,11 +485,6 @@ async def _fallback_social_search(
                     logger.info("Fallback found YouTube: %s", value)
                     break
 
-
-# ---------------------------------------------------------------------------
-# URL classification helpers
-# ---------------------------------------------------------------------------
-
 def _url_rank(url: str) -> tuple:
     lower = url.lower()
     if any(domain in lower for domain in SOCIAL_DOMAINS):
@@ -636,7 +494,6 @@ def _url_rank(url: str) -> tuple:
     if _looks_like_official_website(lower):
         return (2, len(url), lower)
     return (3, len(url), lower)
-
 
 def _classify_urls(
     urls: Iterable[str], links: DiscoveredLinks, replace_social: bool = False
@@ -664,7 +521,6 @@ def _classify_urls(
         elif not links.website and _looks_like_official_website(lower):
             links.website = _root_url(url)
 
-
 def _extract_twitter(url: str) -> str:
     parsed = urlparse(url)
     parts = [part for part in parsed.path.split("/") if part]
@@ -674,7 +530,6 @@ def _extract_twitter(url: str) -> str:
     handle = parts[0].lstrip("@")
     return "" if handle.lower() in blocked else handle
 
-
 def _extract_instagram(url: str) -> str:
     parsed = urlparse(url)
     parts = [part for part in parsed.path.split("/") if part]
@@ -683,7 +538,6 @@ def _extract_instagram(url: str) -> str:
     blocked = {"p", "reel", "stories", "explore", "accounts", "direct"}
     handle = parts[0].lstrip("@")
     return "" if handle.lower() in blocked else handle
-
 
 def _extract_youtube(url: str) -> str:
     parsed = urlparse(url)
@@ -698,7 +552,6 @@ def _extract_youtube(url: str) -> str:
         return parts[1].lstrip("@")
     return ""
 
-
 def _normalize_social_value(value: str, platform: str) -> str:
     if not value:
         return ""
@@ -711,7 +564,6 @@ def _normalize_social_value(value: str, platform: str) -> str:
         }[platform]
         return extractor(value)
     return value.lstrip("@")
-
 
 def _build_social_url(handle: str, platform: str) -> str:
     if not handle:
@@ -727,18 +579,12 @@ def _build_social_url(handle: str, platform: str) -> str:
         return f"https://www.youtube.com/@{handle}"
     return ""
 
-
-# ---------------------------------------------------------------------------
-# URL / domain utilities
-# ---------------------------------------------------------------------------
-
 def _is_google_business(lower_url: str) -> bool:
     return (
         "maps.google." in lower_url
         or "google.com/maps" in lower_url
         or "g.page/" in lower_url
     )
-
 
 def _looks_like_official_website(lower_url: str) -> bool:
     parsed = urlparse(lower_url)
@@ -748,7 +594,6 @@ def _looks_like_official_website(lower_url: str) -> bool:
     if parsed.path.lower().startswith(("/search", "/url", "/maps")):
         return False
     return "." in host
-
 
 def _website_match_score(url: str, company_name: str) -> int:
     if not url:
@@ -778,7 +623,6 @@ def _website_match_score(url: str, company_name: str) -> int:
         score -= 5
     return score
 
-
 def _extract_urls(html: str, base_url: str) -> List[str]:
     urls: Set[str] = set()
     soup = BeautifulSoup(html or "", "html.parser")
@@ -799,7 +643,6 @@ def _extract_urls(html: str, base_url: str) -> List[str]:
             urls.add(candidate)
 
     return sorted(urls, key=_url_rank)
-
 
 def _clean_candidate_url(raw: str, base_url: str) -> str:
     if not raw:
@@ -825,7 +668,6 @@ def _clean_candidate_url(raw: str, base_url: str) -> str:
     raw = unquote(raw).strip()
     return _normalize_candidate_url(raw)
 
-
 def _normalize_candidate_url(raw: str) -> str:
     raw = (raw or "").strip().rstrip("/")
     if not raw:
@@ -840,18 +682,14 @@ def _normalize_candidate_url(raw: str) -> str:
         return ""
     return parsed._replace(fragment="").geturl().rstrip("/")
 
-
 def _root_url(url: str) -> str:
     parsed = urlparse(_normalize_candidate_url(url))
     return f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
 
-
 async def _extract_website_links_plain(
     client: httpx.AsyncClient, website: str
 ) -> List[str]:
-    """Alias kept for backward-compat; delegates to the httpx version."""
     return await _extract_website_links(client, website)
-
 
 async def _guess_website(
     client: httpx.AsyncClient, company_name: str, preferred_tld: str = ""
@@ -865,13 +703,11 @@ async def _guess_website(
     )
     return evaluation.url if evaluation else ""
 
-
 def _domain_guesses(company_name: str, preferred_tld: str = "") -> List[str]:
     slug = re.sub(r"[^a-z0-9]+", "", company_name.lower())
     if not slug:
         return []
 
-    # Preferred TLD first, then .com, then others
     tlds: List[str] = []
     if preferred_tld:
         tlds.append(preferred_tld)
@@ -885,14 +721,12 @@ def _domain_guesses(company_name: str, preferred_tld: str = "") -> List[str]:
         candidates.append(f"https://{slug}{tld}")
     return candidates
 
-
 def _preferred_tld(query: str) -> str:
     normalized = f" {re.sub(r'[^a-z0-9]+', ' ', query.lower())} "
     for phrase, tld in COUNTRY_TLDS.items():
         if f" {phrase} " in normalized:
             return tld
     return ""
-
 
 def _company_core(query: str) -> str:
     if _direct_url(query):
@@ -906,7 +740,6 @@ def _company_core(query: str) -> str:
     ]
     return " ".join(meaningful) or query.strip()
 
-
 def _direct_url(query: str) -> str:
     value = query.strip()
     if not value or " " in value:
@@ -917,7 +750,6 @@ def _direct_url(query: str) -> str:
         return _normalize_candidate_url(value)
     return ""
 
-
 def _host_matches_tld(url: str, tld: str) -> bool:
     if not tld:
         return False
@@ -926,9 +758,7 @@ def _host_matches_tld(url: str, tld: str) -> bool:
         return True
     return tld == ".in" and host.endswith(".co.in")
 
-
 def _candidate_matches_company(url: str, company_name: str) -> bool:
-    """Return True if the candidate URL plausibly belongs to company_name."""
     slug = re.sub(r"[^a-z0-9]+", "", company_name.lower())
     tokens = [
         token
@@ -938,13 +768,12 @@ def _candidate_matches_company(url: str, company_name: str) -> bool:
     host = urlparse(url.lower()).netloc.removeprefix("www.")
     domain_core = host.split(".")[0]
 
-    # Full slug match
     if slug and (slug in host or slug in domain_core):
         return True
-    # All meaningful tokens present in host
+
     if tokens and all(token in host for token in tokens):
         return True
-    # Partial: most tokens present (≥ 60 % of tokens, min 1)
+
     if tokens:
         matched = sum(1 for t in tokens if t in host)
         if matched >= max(1, len(tokens) * 0.6):

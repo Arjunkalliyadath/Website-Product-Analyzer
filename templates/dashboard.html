@@ -39,7 +39,7 @@
       padding: 0 1.5rem 4rem;
     }
 
-    /* ── Nav ── */
+    
     nav {
       display: flex;
       align-items: center;
@@ -78,7 +78,7 @@
     }
     .nav-back:hover { color: var(--primary); border-color: var(--primary); }
 
-    /* ── Company header ── */
+    
     .company-header { margin-bottom: 1.75rem; }
     .company-eyebrow {
       font-size: .7rem;
@@ -111,7 +111,7 @@
     .link-sep { color: var(--border); }
     .link-handle { color: var(--muted); }
 
-    /* ── Grid ── */
+    
     .grid-4 { display: grid; grid-template-columns: repeat(4,1fr); gap: .9rem; margin-bottom: 1.25rem; }
     .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1.25rem; margin-bottom: 1.25rem; }
     @media (max-width: 860px) {
@@ -121,7 +121,7 @@
       .grid-4, .grid-2 { grid-template-columns: 1fr; }
     }
 
-    /* ── Cards ── */
+    
     .card {
       background: var(--surface);
       border: 1px solid var(--border);
@@ -150,7 +150,7 @@
     .card--neutral  .card-value { color: var(--neutral); }
     .card--total    .card-value { color: var(--primary); }
 
-    /* ── Sentiment bar ── */
+    
     .sentiment-bar-wrap { margin-top: .75rem; }
     .sentiment-bar {
       display: flex; height: 7px; border-radius: 100px; overflow: hidden;
@@ -163,10 +163,10 @@
     .legend-item { display: flex; align-items: center; gap: .3rem; }
     .legend-dot { width: 7px; height: 7px; border-radius: 50%; }
 
-    /* ── Chart ── */
+    
     .chart-wrap { position: relative; width: 100%; max-width: 240px; margin: 1rem auto 0; }
 
-    /* ── Platform list ── */
+    
     .platform-list { display: flex; flex-direction: column; gap: .7rem; margin-top: .65rem; }
     .platform-row { display: flex; align-items: center; gap: .7rem; }
     .platform-icon {
@@ -179,10 +179,10 @@
     .platform-bar-fill { height: 100%; border-radius: 100px; transition: width .8s ease; }
     .platform-count { font-weight: 700; font-size: .88rem; color: var(--text); min-width: 2ch; text-align: right; }
 
-    /* ── Section title ── */
+    
     .section-title { font-size: 1rem; font-weight: 700; margin-bottom: .9rem; }
 
-    /* ── Comment filters ── */
+    
     .comment-filters { display: flex; align-items: center; gap: .4rem; flex-wrap: wrap; margin-bottom: .9rem; }
     .filter-divider { width: 1px; align-self: stretch; background: var(--border); margin: 0 .1rem; }
     .filter-btn {
@@ -203,7 +203,7 @@
     .filter-btn.neg.active { background: var(--negative); border-color: var(--negative); color: #fff; }
     .filter-btn.neu.active { background: var(--neutral);  border-color: var(--neutral);  color: #fff; }
 
-    /* ── Comments ── */
+    
     .comments-list { display: flex; flex-direction: column; gap: .55rem; }
     .comment-card {
       background: var(--bg);
@@ -228,14 +228,13 @@
     .badge-neg { background: #fef2f2; color: var(--negative); }
     .badge-neu { background: #fffbeb; color: var(--neutral); }
 
-    /* ── Summary ── */
+    
     .summary-text { font-size: .9rem; line-height: 1.75; color: var(--muted); margin-bottom: 1.1rem; }
     .insight-list { display: flex; flex-direction: column; gap: .5rem; }
     .insight-item { display: flex; gap: .65rem; align-items: flex-start; font-size: .85rem; color: var(--muted); line-height: 1.55; }
-<<<<<<< HEAD
     .insight-icon { color: var(--primary); flex-shrink: 0; margin-top: .1rem; font-weight: 700; }
 
-    /* ── Executive summary grid (Change 7) ── */
+    
     .exec-grid {
       display: grid; grid-template-columns: repeat(3, 1fr); gap: .9rem;
       margin: 1.1rem 0 1.3rem;
@@ -256,7 +255,7 @@
     @media (max-width: 700px) { .insight-columns { grid-template-columns: 1fr; } }
     .insight-heading { font-size: .82rem; font-weight: 700; margin-bottom: .55rem; }
 
-    /* ── Insight tabs ── */
+    
     .subtab-count {
       font-size: .68rem; font-weight: 700; margin-left: .3rem;
       background: rgba(255,255,255,.25); border-radius: 999px; padding: .05rem .45rem;
@@ -264,11 +263,8 @@
     .filter-btn.subtab-btn:not(.active) .subtab-count {
       background: var(--bg); border: 1px solid var(--border); color: var(--muted);
     }
-=======
-    .insight-icon { color: var(--primary); flex-shrink: 0; margin-top: .1rem; }
->>>>>>> 5b4009c04f14eaf1ec23d9aa8e7e56bc4049ef52
 
-    /* ── Downloads ── */
+    
     .download-row { display: flex; gap: .65rem; flex-wrap: wrap; margin-top: 1rem; }
     .dl-btn {
       display: inline-flex; align-items: center; gap: .45rem;
@@ -284,11 +280,10 @@
     }
     .dl-btn:hover { border-color: var(--primary); color: var(--primary); background: var(--primary-l); }
 
-    /* ── Empty ── */
+    
     .empty { text-align: center; padding: 2.5rem; color: var(--muted); font-size: .875rem; }
-<<<<<<< HEAD
 
-    /* ── Brand score ── */
+    
     .score-wrap { display: flex; align-items: baseline; gap: .5rem; margin-top: .3rem; }
     .score-value { font-size: 2.4rem; font-weight: 700; letter-spacing: -.02em; }
     .score-max { font-size: 1rem; color: var(--muted); font-weight: 500; }
@@ -301,7 +296,7 @@
     .score-label.negative, .score-label.very-negative { background: #fef2f2; color: var(--negative); }
     .score-label.no-data { background: var(--bg); color: var(--muted); }
 
-    /* ── Chip list (products/services) ── */
+    
     .chip-list { display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .5rem; }
     .chip {
       background: var(--bg); border: 1px solid var(--border); border-radius: 100px;
@@ -309,7 +304,7 @@
     }
     .chip.chip-scraped { border-color: var(--primary); background: var(--primary-l); color: var(--primary); font-weight: 600; }
 
-    /* ── Product sentiment table ── */
+    
     .sentiment-table { width: 100%; border-collapse: collapse; margin-top: .5rem; }
     .sentiment-table th {
       text-align: left; font-size: .7rem; font-weight: 600; letter-spacing: .05em;
@@ -319,8 +314,6 @@
     .sentiment-table td { padding: .6rem; font-size: .84rem; border-bottom: 1px solid var(--border); }
     .sentiment-table tr:last-child td { border-bottom: none; }
     .mini-bar { display: flex; height: 6px; border-radius: 100px; overflow: hidden; width: 100%; min-width: 90px; }
-=======
->>>>>>> 5b4009c04f14eaf1ec23d9aa8e7e56bc4049ef52
   </style>
 </head>
 <body>
@@ -371,8 +364,7 @@
     </div>
   </div>
 
-<<<<<<< HEAD
-  <!-- Brand score + Product discovery -->
+  
   <div class="grid-2" style="margin-bottom:1.25rem;">
     <div class="card">
       <div class="card-label">Overall Brand Score</div>
@@ -423,9 +415,7 @@
     {% endif %}
   </div>
   {% endif %}
-=======
->>>>>>> 5b4009c04f14eaf1ec23d9aa8e7e56bc4049ef52
-  <!-- Stat cards -->
+  
   <div class="grid-4">
     <div class="card card--total">
       <div class="card-label">Total Comments</div>
@@ -449,7 +439,7 @@
     </div>
   </div>
 
-  <!-- Sentiment bar -->
+  
   <div class="card" style="margin-bottom:1.25rem;">
     <div class="card-label">Sentiment Distribution</div>
     <div class="sentiment-bar-wrap">
@@ -466,7 +456,7 @@
     </div>
   </div>
 
-  <!-- Chart + Platforms -->
+  
   <div class="grid-2" style="margin-bottom:1.25rem;">
     <div class="card">
       <div class="card-label">Sentiment Breakdown</div>
@@ -501,9 +491,8 @@
     </div>
   </div>
 
-<<<<<<< HEAD
   {% if product_sentiment and (product_sentiment.keys() | list | length) > 1 %}
-  <!-- Product-wise sentiment -->
+  
   <div class="card" style="margin-bottom:1.25rem;">
     <div class="section-title">Product-wise Sentiment</div>
     <p class="card-sub" style="margin:-.35rem 0 1rem;">
@@ -537,7 +526,7 @@
   </div>
   {% endif %}
 
-  <!-- Platform-wise sentiment -->
+  
   <div class="card" style="margin-bottom:1.25rem;">
     <div class="section-title">Platform-wise Sentiment</div>
     <table class="sentiment-table">
@@ -565,7 +554,7 @@
     </table>
   </div>
 
-  <!-- Executive Summary (Change 7) -->
+  
   <div class="card" style="margin-bottom:1.25rem;">
     <div class="section-title">Executive Summary</div>
     <p class="summary-text">{{ summary.executive_summary }}</p>
@@ -633,22 +622,6 @@
       {% for rec in summary.recommendations %}
       <div class="insight-item">
         <span class="insight-icon">→</span>
-=======
-  <!-- Summary -->
-  <div class="card" style="margin-bottom:1.25rem;">
-    <div class="section-title">Summary</div>
-    <p class="summary-text">{{ summary.executive_summary }}</p>
-    <div class="insight-list">
-      {% for insight in summary.key_insights %}
-      <div class="insight-item">
-        <span class="insight-icon">→</span>
-        <span>{{ insight }}</span>
-      </div>
-      {% endfor %}
-      {% for rec in summary.recommendations %}
-      <div class="insight-item">
-        <span class="insight-icon">•</span>
->>>>>>> 5b4009c04f14eaf1ec23d9aa8e7e56bc4049ef52
         <span>{{ rec }}</span>
       </div>
       {% endfor %}
@@ -666,7 +639,6 @@
     {% endif %}
   </div>
 
-<<<<<<< HEAD
   {% macro comment_card(c) %}
   <div class="comment-card" data-sentiment="{{ c.sentiment }}" data-platform="{{ c.platform }}">
     <div class="comment-sentiment-dot"
@@ -685,11 +657,7 @@
   </div>
   {% endmacro %}
 
-  <!-- Insights (Change 6 — replaces the old "All Comments (N)" wall with a
-       tabbed view: Top Positive / Top Negative / By Platform. "By
-       Platform" only lists platforms that actually returned data, and
-       clicking one shows up to 10 of its comments — no empty tabs for
-       platforms that returned nothing. -->
+  
   <div class="card">
     <div class="section-title">Insights</div>
     <div class="comment-filters">
@@ -734,47 +702,6 @@
       {% endfor %}
       {% else %}<div class="empty">No comments collected.</div>{% endif %}
     </div>
-=======
-  <!-- Comments -->
-  <div class="card">
-    <div class="section-title">All Comments ({{ total }})</div>
-    <div class="comment-filters">
-      <button class="filter-btn active" onclick="filterComments('all', this)">All</button>
-      <button class="filter-btn pos" onclick="filterComments('positive', this)">Positive</button>
-      <button class="filter-btn neg" onclick="filterComments('negative', this)">Negative</button>
-      <button class="filter-btn neu" onclick="filterComments('neutral', this)">Neutral</button>
-      <span class="filter-divider"></span>
-      <button class="filter-btn" onclick="filterComments('Google', this)">Google</button>
-      <button class="filter-btn" onclick="filterComments('Twitter', this)">Twitter</button>
-      <button class="filter-btn" onclick="filterComments('Instagram', this)">Instagram</button>
-      <button class="filter-btn" onclick="filterComments('YouTube', this)">YouTube</button>
-    </div>
-
-    {% if comments %}
-    <div class="comments-list" id="commentsList">
-      {% for c in comments %}
-      <div class="comment-card"
-           data-sentiment="{{ c.sentiment }}"
-           data-platform="{{ c.platform }}">
-        <div class="comment-sentiment-dot"
-             style="background: {% if c.sentiment == 'positive' %}var(--positive){% elif c.sentiment == 'negative' %}var(--negative){% else %}var(--neutral){% endif %}">
-        </div>
-        <div class="comment-body">
-          <div class="comment-text">{{ c.comment }}</div>
-          <div class="comment-meta">
-            <span class="badge {% if c.sentiment == 'positive' %}badge-pos{% elif c.sentiment == 'negative' %}badge-neg{% else %}badge-neu{% endif %}">
-              {{ c.sentiment }}
-            </span>
-            <span>{{ c.platform }}</span>
-          </div>
-        </div>
-      </div>
-      {% endfor %}
-    </div>
-    {% else %}
-    <div class="empty">No comments collected. Try a more well-known company or check your internet connection.</div>
-    {% endif %}
->>>>>>> 5b4009c04f14eaf1ec23d9aa8e7e56bc4049ef52
   </div>
 
 </div>
@@ -807,7 +734,6 @@ new Chart(ctx, {
   }
 });
 
-<<<<<<< HEAD
 function showInsightTab(tab, btn) {
   document.querySelectorAll('.filter-btn[data-tab]').forEach(b => b.classList.remove('active'));
   btn.classList.add('active');
@@ -821,19 +747,6 @@ function showPlatformTab(platform, btn) {
   btn.classList.add('active');
   document.querySelectorAll('.platform-panel').forEach(p => {
     p.style.display = (p.dataset.platformPanel === platform) ? '' : 'none';
-=======
-function filterComments(filter, btn) {
-  document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
-  btn.classList.add('active');
-  document.querySelectorAll('.comment-card').forEach(card => {
-    if (filter === 'all') {
-      card.style.display = '';
-    } else if (['positive','negative','neutral'].includes(filter)) {
-      card.style.display = card.dataset.sentiment === filter ? '' : 'none';
-    } else {
-      card.style.display = card.dataset.platform === filter ? '' : 'none';
-    }
->>>>>>> 5b4009c04f14eaf1ec23d9aa8e7e56bc4049ef52
   });
 }
 </script>

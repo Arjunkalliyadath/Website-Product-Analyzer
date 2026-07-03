@@ -1,0 +1,841 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{{ company.company_name | title }} — ManobhavaAI</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:       #f7f8fa;
+      --surface:  #ffffff;
+      --border:   #e2e5ea;
+      --primary:  #4f46e5;
+      --primary-l: rgba(79,70,229,0.08);
+      --positive: #16a34a;
+      --negative: #dc2626;
+      --neutral:  #d97706;
+      --text:     #111827;
+      --muted:    #6b7280;
+    }
+
+    html { scroll-behavior: smooth; }
+    body {
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 15px;
+    }
+
+    .shell {
+      max-width: 1160px;
+      margin: 0 auto;
+      padding: 0 1.5rem 4rem;
+    }
+
+    /* ── Nav ── */
+    nav {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 1.1rem 0;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 2rem;
+    }
+    .brand {
+      display: flex; align-items: center; gap: .6rem;
+      text-decoration: none; color: inherit;
+    }
+    .brand-icon {
+      width: 32px; height: 32px;
+      background: var(--primary);
+      border-radius: 8px;
+      display: grid; place-items: center;
+      color: #fff;
+      font-size: .6rem;
+      font-weight: 800;
+      letter-spacing: -.5px;
+    }
+    .brand-name { font-weight: 700; font-size: 1rem; letter-spacing: -.01em; }
+    .brand-name .accent { color: var(--primary); }
+    .nav-back {
+      display: flex; align-items: center; gap: .4rem;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      padding: .45rem .9rem;
+      font-size: .82rem;
+      font-weight: 500;
+      color: var(--muted);
+      text-decoration: none;
+      transition: color .15s, border-color .15s;
+    }
+    .nav-back:hover { color: var(--primary); border-color: var(--primary); }
+
+    /* ── Company header ── */
+    .company-header { margin-bottom: 1.75rem; }
+    .company-eyebrow {
+      font-size: .7rem;
+      font-weight: 600;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      color: var(--primary);
+      margin-bottom: .35rem;
+    }
+    .company-name {
+      font-size: clamp(1.4rem, 3vw, 2rem);
+      font-weight: 700;
+      letter-spacing: -.02em;
+      margin-bottom: .85rem;
+    }
+    .company-links { display: flex; flex-wrap: wrap; gap: .45rem; }
+    .company-link {
+      display: inline-flex; align-items: center; gap: .4rem;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: .35rem .7rem;
+      font-size: .78rem;
+      text-decoration: none;
+      transition: border-color .15s, background .15s;
+    }
+    .company-link:hover { border-color: var(--primary); background: var(--primary-l); }
+    .company-link .dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+    .link-label { font-weight: 600; color: var(--text); }
+    .link-sep { color: var(--border); }
+    .link-handle { color: var(--muted); }
+
+    /* ── Grid ── */
+    .grid-4 { display: grid; grid-template-columns: repeat(4,1fr); gap: .9rem; margin-bottom: 1.25rem; }
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1.25rem; margin-bottom: 1.25rem; }
+    @media (max-width: 860px) {
+      .grid-4 { grid-template-columns: repeat(2,1fr); }
+    }
+    @media (max-width: 600px) {
+      .grid-4, .grid-2 { grid-template-columns: 1fr; }
+    }
+
+    /* ── Cards ── */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1.35rem 1.5rem;
+      box-shadow: 0 1px 3px rgba(0,0,0,.04);
+    }
+    .card-label {
+      font-size: .7rem;
+      font-weight: 600;
+      letter-spacing: .07em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: .55rem;
+    }
+    .card-value {
+      font-size: 2rem;
+      font-weight: 700;
+      letter-spacing: -.02em;
+      line-height: 1;
+    }
+    .card-sub { font-size: .8rem; color: var(--muted); margin-top: .3rem; }
+
+    .card--positive .card-value { color: var(--positive); }
+    .card--negative .card-value { color: var(--negative); }
+    .card--neutral  .card-value { color: var(--neutral); }
+    .card--total    .card-value { color: var(--primary); }
+
+    /* ── Sentiment bar ── */
+    .sentiment-bar-wrap { margin-top: .75rem; }
+    .sentiment-bar {
+      display: flex; height: 7px; border-radius: 100px; overflow: hidden;
+      gap: 2px;
+    }
+    .sb-pos { background: var(--positive); transition: flex .6s ease; }
+    .sb-neg { background: var(--negative); transition: flex .6s ease; }
+    .sb-neu { background: var(--neutral);  transition: flex .6s ease; }
+    .sentiment-legend { display: flex; gap: 1.1rem; margin-top: .6rem; font-size: .76rem; color: var(--muted); }
+    .legend-item { display: flex; align-items: center; gap: .3rem; }
+    .legend-dot { width: 7px; height: 7px; border-radius: 50%; }
+
+    /* ── Chart ── */
+    .chart-wrap { position: relative; width: 100%; max-width: 240px; margin: 1rem auto 0; }
+
+    /* ── Platform list ── */
+    .platform-list { display: flex; flex-direction: column; gap: .7rem; margin-top: .65rem; }
+    .platform-row { display: flex; align-items: center; gap: .7rem; }
+    .platform-icon {
+      width: 28px; height: 28px; border-radius: 6px;
+      display: grid; place-items: center; font-size: .8rem; flex-shrink: 0;
+    }
+    .platform-info { flex: 1; }
+    .platform-name { font-weight: 500; font-size: .85rem; }
+    .platform-bar-bg { height: 3px; background: var(--border); border-radius: 100px; margin-top: .3rem; overflow: hidden; }
+    .platform-bar-fill { height: 100%; border-radius: 100px; transition: width .8s ease; }
+    .platform-count { font-weight: 700; font-size: .88rem; color: var(--text); min-width: 2ch; text-align: right; }
+
+    /* ── Section title ── */
+    .section-title { font-size: 1rem; font-weight: 700; margin-bottom: .9rem; }
+
+    /* ── Comment filters ── */
+    .comment-filters { display: flex; align-items: center; gap: .4rem; flex-wrap: wrap; margin-bottom: .9rem; }
+    .filter-divider { width: 1px; align-self: stretch; background: var(--border); margin: 0 .1rem; }
+    .filter-btn {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: .3rem .7rem;
+      font-size: .78rem;
+      font-weight: 500;
+      color: var(--muted);
+      cursor: pointer;
+      transition: all .15s;
+      font-family: inherit;
+    }
+    .filter-btn:hover { border-color: var(--primary); color: var(--text); }
+    .filter-btn.active { background: var(--primary); border-color: var(--primary); color: #fff; }
+    .filter-btn.pos.active { background: var(--positive); border-color: var(--positive); color: #fff; }
+    .filter-btn.neg.active { background: var(--negative); border-color: var(--negative); color: #fff; }
+    .filter-btn.neu.active { background: var(--neutral);  border-color: var(--neutral);  color: #fff; }
+
+    /* ── Comments ── */
+    .comments-list { display: flex; flex-direction: column; gap: .55rem; }
+    .comment-card {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: .85rem 1rem;
+      display: flex;
+      gap: .9rem;
+      align-items: flex-start;
+      transition: border-color .15s;
+    }
+    .comment-card:hover { border-color: var(--primary); }
+    .comment-sentiment-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; margin-top: .38rem; }
+    .comment-body { flex: 1; }
+    .comment-text { font-size: .875rem; line-height: 1.6; color: var(--text); }
+    .comment-meta { display: flex; gap: .65rem; margin-top: .35rem; font-size: .72rem; color: var(--muted); align-items: center; }
+    .badge {
+      display: inline-block; padding: .12rem .45rem; border-radius: 100px;
+      font-size: .66rem; font-weight: 600; text-transform: uppercase; letter-spacing: .04em;
+    }
+    .badge-pos { background: #f0fdf4; color: var(--positive); }
+    .badge-neg { background: #fef2f2; color: var(--negative); }
+    .badge-neu { background: #fffbeb; color: var(--neutral); }
+
+    /* ── Summary ── */
+    .summary-text { font-size: .9rem; line-height: 1.75; color: var(--muted); margin-bottom: 1.1rem; }
+    .insight-list { display: flex; flex-direction: column; gap: .5rem; }
+    .insight-item { display: flex; gap: .65rem; align-items: flex-start; font-size: .85rem; color: var(--muted); line-height: 1.55; }
+<<<<<<< HEAD
+    .insight-icon { color: var(--primary); flex-shrink: 0; margin-top: .1rem; font-weight: 700; }
+
+    /* ── Executive summary grid (Change 7) ── */
+    .exec-grid {
+      display: grid; grid-template-columns: repeat(3, 1fr); gap: .9rem;
+      margin: 1.1rem 0 1.3rem;
+    }
+    @media (max-width: 700px) { .exec-grid { grid-template-columns: repeat(2, 1fr); } }
+    .exec-stat {
+      background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+      padding: .8rem .9rem;
+    }
+    .exec-label {
+      font-size: .68rem; font-weight: 600; letter-spacing: .06em; text-transform: uppercase;
+      color: var(--muted); margin-bottom: .3rem;
+    }
+    .exec-value { font-size: 1.2rem; font-weight: 700; letter-spacing: -.01em; color: var(--text); }
+    .exec-value--sm { font-size: .95rem; }
+    .exec-unit { font-size: .75rem; font-weight: 500; color: var(--muted); }
+    .insight-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; margin-top: .3rem; }
+    @media (max-width: 700px) { .insight-columns { grid-template-columns: 1fr; } }
+    .insight-heading { font-size: .82rem; font-weight: 700; margin-bottom: .55rem; }
+
+    /* ── Insight tabs ── */
+    .subtab-count {
+      font-size: .68rem; font-weight: 700; margin-left: .3rem;
+      background: rgba(255,255,255,.25); border-radius: 999px; padding: .05rem .45rem;
+    }
+    .filter-btn.subtab-btn:not(.active) .subtab-count {
+      background: var(--bg); border: 1px solid var(--border); color: var(--muted);
+    }
+=======
+    .insight-icon { color: var(--primary); flex-shrink: 0; margin-top: .1rem; }
+>>>>>>> 5b4009c04f14eaf1ec23d9aa8e7e56bc4049ef52
+
+    /* ── Downloads ── */
+    .download-row { display: flex; gap: .65rem; flex-wrap: wrap; margin-top: 1rem; }
+    .dl-btn {
+      display: inline-flex; align-items: center; gap: .45rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: .5rem .9rem;
+      font-size: .82rem;
+      font-weight: 500;
+      color: var(--muted);
+      text-decoration: none;
+      transition: all .15s;
+    }
+    .dl-btn:hover { border-color: var(--primary); color: var(--primary); background: var(--primary-l); }
+
+    /* ── Empty ── */
+    .empty { text-align: center; padding: 2.5rem; color: var(--muted); font-size: .875rem; }
+<<<<<<< HEAD
+
+    /* ── Brand score ── */
+    .score-wrap { display: flex; align-items: baseline; gap: .5rem; margin-top: .3rem; }
+    .score-value { font-size: 2.4rem; font-weight: 700; letter-spacing: -.02em; }
+    .score-max { font-size: 1rem; color: var(--muted); font-weight: 500; }
+    .score-label {
+      display: inline-block; margin-top: .5rem; padding: .18rem .6rem;
+      border-radius: 100px; font-size: .74rem; font-weight: 600;
+    }
+    .score-label.very-positive, .score-label.positive { background: #f0fdf4; color: var(--positive); }
+    .score-label.mixed { background: #fffbeb; color: var(--neutral); }
+    .score-label.negative, .score-label.very-negative { background: #fef2f2; color: var(--negative); }
+    .score-label.no-data { background: var(--bg); color: var(--muted); }
+
+    /* ── Chip list (products/services) ── */
+    .chip-list { display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .5rem; }
+    .chip {
+      background: var(--bg); border: 1px solid var(--border); border-radius: 100px;
+      padding: .3rem .75rem; font-size: .78rem; color: var(--text);
+    }
+    .chip.chip-scraped { border-color: var(--primary); background: var(--primary-l); color: var(--primary); font-weight: 600; }
+
+    /* ── Product sentiment table ── */
+    .sentiment-table { width: 100%; border-collapse: collapse; margin-top: .5rem; }
+    .sentiment-table th {
+      text-align: left; font-size: .7rem; font-weight: 600; letter-spacing: .05em;
+      text-transform: uppercase; color: var(--muted); padding: .5rem .6rem;
+      border-bottom: 1px solid var(--border);
+    }
+    .sentiment-table td { padding: .6rem; font-size: .84rem; border-bottom: 1px solid var(--border); }
+    .sentiment-table tr:last-child td { border-bottom: none; }
+    .mini-bar { display: flex; height: 6px; border-radius: 100px; overflow: hidden; width: 100%; min-width: 90px; }
+=======
+>>>>>>> 5b4009c04f14eaf1ec23d9aa8e7e56bc4049ef52
+  </style>
+</head>
+<body>
+<div class="shell">
+
+  <nav>
+    <a class="brand" href="/">
+      <div class="brand-icon">M-AI</div>
+      <div class="brand-name">Manobhava<span class="accent">AI</span></div>
+    </a>
+    <a class="nav-back" href="/">← New search</a>
+  </nav>
+
+  <div class="company-header">
+    <div class="company-eyebrow">Analysis Report</div>
+    <div class="company-name">{{ company.company_name | title }}</div>
+    <div class="company-links">
+      {% if company.website %}
+      <a class="company-link" href="{{ company.website }}" target="_blank">
+        <span class="dot" style="background:#4285F4"></span>
+        <span class="link-label">Website</span>
+      </a>
+      {% endif %}
+      {% if company.twitter_url %}
+      <a class="company-link" href="{{ company.twitter_url }}" target="_blank">
+        <span class="dot" style="background:#000"></span>
+        <span class="link-label">X / Twitter</span>
+        <span class="link-sep">·</span>
+        <span class="link-handle">@{{ company.twitter }}</span>
+      </a>
+      {% endif %}
+      {% if company.instagram_url %}
+      <a class="company-link" href="{{ company.instagram_url }}" target="_blank">
+        <span class="dot" style="background:#E1306C"></span>
+        <span class="link-label">Instagram</span>
+        <span class="link-sep">·</span>
+        <span class="link-handle">@{{ company.instagram }}</span>
+      </a>
+      {% endif %}
+      {% if company.youtube_url %}
+      <a class="company-link" href="{{ company.youtube_url }}" target="_blank">
+        <span class="dot" style="background:#FF0000"></span>
+        <span class="link-label">YouTube</span>
+        <span class="link-sep">·</span>
+        <span class="link-handle">@{{ company.youtube }}</span>
+      </a>
+      {% endif %}
+    </div>
+  </div>
+
+<<<<<<< HEAD
+  <!-- Brand score + Product discovery -->
+  <div class="grid-2" style="margin-bottom:1.25rem;">
+    <div class="card">
+      <div class="card-label">Overall Brand Score</div>
+      <div class="score-wrap">
+        <div class="score-value">{{ brand_score }}</div>
+        <div class="score-max">/ 100</div>
+      </div>
+      <span class="score-label {{ brand_label | lower | replace(' ', '-') }}">{{ brand_label }}</span>
+    </div>
+    <div class="card">
+      <div class="card-label">Product &amp; Service Discovery</div>
+      <div class="score-wrap" style="gap:1.5rem;">
+        <div><span class="score-value" style="font-size:1.5rem;">{{ products_found }}</span> <span class="card-sub">products found</span></div>
+        <div><span class="score-value" style="font-size:1.5rem;">{{ services_found }}</span> <span class="card-sub">services found</span></div>
+      </div>
+      <div class="card-sub" style="margin-top:.5rem;">{{ products_scraped }} products scraped · {{ reviews_collected }} Google reviews collected</div>
+    </div>
+  </div>
+
+  {% if products or services %}
+  <div class="grid-2" style="margin-bottom:1.25rem;">
+    {% if products %}
+    <div class="card">
+      <div class="card-label">Products Found</div>
+      <div class="chip-list">
+        {% for p in products %}
+        <span class="chip {% if p in (product_sentiment.keys() | list) and p != 'General' %}chip-scraped{% endif %}">{{ p }}</span>
+        {% endfor %}
+      </div>
+      {% if top_positive_product or top_negative_product %}
+      <div class="card-sub" style="margin-top:.75rem;">
+        {% if top_positive_product %}Top positive: <strong style="color:var(--positive)">{{ top_positive_product }}</strong>{% endif %}
+        {% if top_positive_product and top_negative_product %} &nbsp;·&nbsp; {% endif %}
+        {% if top_negative_product %}Top negative: <strong style="color:var(--negative)">{{ top_negative_product }}</strong>{% endif %}
+      </div>
+      {% endif %}
+    </div>
+    {% endif %}
+    {% if services %}
+    <div class="card">
+      <div class="card-label">Services Found</div>
+      <div class="chip-list">
+        {% for s in services %}
+        <span class="chip">{{ s }}</span>
+        {% endfor %}
+      </div>
+    </div>
+    {% endif %}
+  </div>
+  {% endif %}
+=======
+>>>>>>> 5b4009c04f14eaf1ec23d9aa8e7e56bc4049ef52
+  <!-- Stat cards -->
+  <div class="grid-4">
+    <div class="card card--total">
+      <div class="card-label">Total Comments</div>
+      <div class="card-value">{{ total }}</div>
+      <div class="card-sub">across all platforms</div>
+    </div>
+    <div class="card card--positive">
+      <div class="card-label">Positive</div>
+      <div class="card-value">{{ positive }}</div>
+      <div class="card-sub">{{ positive_pct }}% of total</div>
+    </div>
+    <div class="card card--negative">
+      <div class="card-label">Negative</div>
+      <div class="card-value">{{ negative }}</div>
+      <div class="card-sub">{{ negative_pct }}% of total</div>
+    </div>
+    <div class="card card--neutral">
+      <div class="card-label">Neutral</div>
+      <div class="card-value">{{ neutral }}</div>
+      <div class="card-sub">{{ neutral_pct }}% of total</div>
+    </div>
+  </div>
+
+  <!-- Sentiment bar -->
+  <div class="card" style="margin-bottom:1.25rem;">
+    <div class="card-label">Sentiment Distribution</div>
+    <div class="sentiment-bar-wrap">
+      <div class="sentiment-bar">
+        <div class="sb-pos" style="flex:{{ positive_pct }}"></div>
+        <div class="sb-neg" style="flex:{{ negative_pct }}"></div>
+        <div class="sb-neu" style="flex:{{ neutral_pct }}"></div>
+      </div>
+      <div class="sentiment-legend">
+        <div class="legend-item"><div class="legend-dot" style="background:var(--positive)"></div>Positive {{ positive_pct }}%</div>
+        <div class="legend-item"><div class="legend-dot" style="background:var(--negative)"></div>Negative {{ negative_pct }}%</div>
+        <div class="legend-item"><div class="legend-dot" style="background:var(--neutral)"></div>Neutral {{ neutral_pct }}%</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Chart + Platforms -->
+  <div class="grid-2" style="margin-bottom:1.25rem;">
+    <div class="card">
+      <div class="card-label">Sentiment Breakdown</div>
+      <div class="chart-wrap">
+        <canvas id="sentimentChart"></canvas>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-label">Platform Coverage</div>
+      <div class="platform-list">
+        {% set max_count = [platform_counts.Google, platform_counts.Twitter, platform_counts.Instagram, platform_counts.YouTube] | max %}
+        {% set platforms = [
+          ('Google', platform_counts.Google, '🔍', '#4285F4'),
+          ('Twitter / X', platform_counts.Twitter, '𝕏', '#000000'),
+          ('Instagram', platform_counts.Instagram, '📸', '#E1306C'),
+          ('YouTube', platform_counts.YouTube, '▶', '#FF0000')
+        ] %}
+        {% for name, count, icon, color in platforms %}
+        <div class="platform-row">
+          <div class="platform-icon" style="background:{{ color }}18;">{{ icon }}</div>
+          <div class="platform-info">
+            <div class="platform-name">{{ name }}</div>
+            <div class="platform-bar-bg">
+              <div class="platform-bar-fill"
+                style="width:{{ ((count / (max_count if max_count > 0 else 1)) * 100)|int }}%; background:{{ color }};"></div>
+            </div>
+          </div>
+          <div class="platform-count">{{ count }}</div>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+
+<<<<<<< HEAD
+  {% if product_sentiment and (product_sentiment.keys() | list | length) > 1 %}
+  <!-- Product-wise sentiment -->
+  <div class="card" style="margin-bottom:1.25rem;">
+    <div class="section-title">Product-wise Sentiment</div>
+    <p class="card-sub" style="margin:-.35rem 0 1rem;">
+      "General" = brand-wide comments not tied to any single product
+      (the base company search, plus all Instagram/Twitter/YouTube
+      comments — those three platforms aren't queried per-product).
+    </p>
+    <table class="sentiment-table">
+      <thead>
+        <tr>
+          <th>Product</th><th>Comments</th><th>Distribution</th><th>Score</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for label, stats in product_sentiment.items() %}
+        <tr>
+          <td>{{ label }}</td>
+          <td>{{ stats.total }}</td>
+          <td>
+            <div class="mini-bar">
+              <div style="flex:{{ stats.positive_pct }}; background:var(--positive);"></div>
+              <div style="flex:{{ stats.negative_pct }}; background:var(--negative);"></div>
+              <div style="flex:{{ stats.neutral_pct }}; background:var(--neutral);"></div>
+            </div>
+          </td>
+          <td>{{ stats.score }} <span class="card-sub">{{ stats.score_label }}</span></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+
+  <!-- Platform-wise sentiment -->
+  <div class="card" style="margin-bottom:1.25rem;">
+    <div class="section-title">Platform-wise Sentiment</div>
+    <table class="sentiment-table">
+      <thead>
+        <tr>
+          <th>Platform</th><th>Comments</th><th>Distribution</th><th>Score</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for label, stats in platform_sentiment.items() %}
+        <tr>
+          <td>{{ label }}</td>
+          <td>{{ stats.total }}</td>
+          <td>
+            <div class="mini-bar">
+              <div style="flex:{{ stats.positive_pct }}; background:var(--positive);"></div>
+              <div style="flex:{{ stats.negative_pct }}; background:var(--negative);"></div>
+              <div style="flex:{{ stats.neutral_pct }}; background:var(--neutral);"></div>
+            </div>
+          </td>
+          <td>{{ stats.score }} <span class="card-sub">{{ stats.score_label }}</span></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Executive Summary (Change 7) -->
+  <div class="card" style="margin-bottom:1.25rem;">
+    <div class="section-title">Executive Summary</div>
+    <p class="summary-text">{{ summary.executive_summary }}</p>
+
+    <div class="exec-grid">
+      <div class="exec-stat">
+        <div class="exec-label">Overall Brand Score</div>
+        <div class="exec-value">{{ brand_score }} <span class="exec-unit">/ 100</span></div>
+      </div>
+      <div class="exec-stat">
+        <div class="exec-label">Overall Sentiment</div>
+        <div class="exec-value">{{ summary.overall_sentiment }}</div>
+      </div>
+      <div class="exec-stat">
+        <div class="exec-label">Products Analysed</div>
+        <div class="exec-value">{{ products_scraped }}</div>
+      </div>
+      <div class="exec-stat">
+        <div class="exec-label">Platforms Covered</div>
+        <div class="exec-value">{{ summary.platforms_covered }}</div>
+      </div>
+      <div class="exec-stat">
+        <div class="exec-label">Total Reviews</div>
+        <div class="exec-value">{{ total }}</div>
+      </div>
+      <div class="exec-stat">
+        <div class="exec-label">Top Positive Product</div>
+        <div class="exec-value exec-value--sm" style="color:var(--positive)">{{ top_positive_product or "—" }}</div>
+      </div>
+      <div class="exec-stat">
+        <div class="exec-label">Top Negative Product</div>
+        <div class="exec-value exec-value--sm" style="color:var(--negative)">{{ top_negative_product or "—" }}</div>
+      </div>
+      <div class="exec-stat">
+        <div class="exec-label">Most Discussed Product</div>
+        <div class="exec-value exec-value--sm">{{ most_discussed_product or "—" }}</div>
+      </div>
+      <div class="exec-stat">
+        <div class="exec-label">Most Mentioned Feature</div>
+        <div class="exec-value exec-value--sm">{{ summary.most_mentioned_feature }}</div>
+      </div>
+    </div>
+
+    <div class="insight-columns">
+      <div>
+        <div class="insight-heading">Key Positive Insights</div>
+        <div class="insight-list">
+          {% for item in summary.key_positive_insights %}
+          <div class="insight-item"><span class="insight-icon" style="color:var(--positive)">✓</span><span>{{ item }}</span></div>
+          {% endfor %}
+        </div>
+      </div>
+      <div>
+        <div class="insight-heading">Key Customer Complaints</div>
+        <div class="insight-list">
+          {% for item in summary.key_complaints %}
+          <div class="insight-item"><span class="insight-icon" style="color:var(--negative)">!</span><span>{{ item }}</span></div>
+          {% endfor %}
+        </div>
+      </div>
+    </div>
+
+    <div class="insight-heading" style="margin-top:1.1rem;">Suggested Improvements</div>
+    <div class="insight-list">
+      {% for rec in summary.recommendations %}
+      <div class="insight-item">
+        <span class="insight-icon">→</span>
+=======
+  <!-- Summary -->
+  <div class="card" style="margin-bottom:1.25rem;">
+    <div class="section-title">Summary</div>
+    <p class="summary-text">{{ summary.executive_summary }}</p>
+    <div class="insight-list">
+      {% for insight in summary.key_insights %}
+      <div class="insight-item">
+        <span class="insight-icon">→</span>
+        <span>{{ insight }}</span>
+      </div>
+      {% endfor %}
+      {% for rec in summary.recommendations %}
+      <div class="insight-item">
+        <span class="insight-icon">•</span>
+>>>>>>> 5b4009c04f14eaf1ec23d9aa8e7e56bc4049ef52
+        <span>{{ rec }}</span>
+      </div>
+      {% endfor %}
+    </div>
+
+    {% if csv_path or excel_path or json_path %}
+    <div style="margin-top:1.4rem; border-top:1px solid var(--border); padding-top:1.1rem;">
+      <div class="card-label">Export Data</div>
+      <div class="download-row">
+        {% if csv_path %}<a class="dl-btn" href="/{{ csv_path }}">↓ CSV</a>{% endif %}
+        {% if excel_path %}<a class="dl-btn" href="/{{ excel_path }}">↓ Excel</a>{% endif %}
+        {% if json_path %}<a class="dl-btn" href="/{{ json_path }}">↓ JSON</a>{% endif %}
+      </div>
+    </div>
+    {% endif %}
+  </div>
+
+<<<<<<< HEAD
+  {% macro comment_card(c) %}
+  <div class="comment-card" data-sentiment="{{ c.sentiment }}" data-platform="{{ c.platform }}">
+    <div class="comment-sentiment-dot"
+         style="background: {% if c.sentiment == 'positive' %}var(--positive){% elif c.sentiment == 'negative' %}var(--negative){% else %}var(--neutral){% endif %}">
+    </div>
+    <div class="comment-body">
+      <div class="comment-text">{{ c.comment }}</div>
+      <div class="comment-meta">
+        <span class="badge {% if c.sentiment == 'positive' %}badge-pos{% elif c.sentiment == 'negative' %}badge-neg{% else %}badge-neu{% endif %}">
+          {{ c.sentiment }}
+        </span>
+        <span>{{ c.platform }}</span>
+        {% if c.product and c.product != 'General' %}<span>· {{ c.product }}</span>{% endif %}
+      </div>
+    </div>
+  </div>
+  {% endmacro %}
+
+  <!-- Insights (Change 6 — replaces the old "All Comments (N)" wall with a
+       tabbed view: Top Positive / Top Negative / By Platform. "By
+       Platform" only lists platforms that actually returned data, and
+       clicking one shows up to 10 of its comments — no empty tabs for
+       platforms that returned nothing. -->
+  <div class="card">
+    <div class="section-title">Insights</div>
+    <div class="comment-filters">
+      <button class="filter-btn pos active" data-tab="positive" onclick="showInsightTab('positive', this)">Top Positive</button>
+      <button class="filter-btn neg" data-tab="negative" onclick="showInsightTab('negative', this)">Top Negative</button>
+      <button class="filter-btn" data-tab="platform" onclick="showInsightTab('platform', this)">Platform Reviews</button>
+    </div>
+
+    <div class="tab-panel" data-panel="positive">
+      {% if insight_tabs.top_positive %}
+      <div class="comments-list">
+        {% for c in insight_tabs.top_positive %}{{ comment_card(c) }}{% endfor %}
+      </div>
+      {% else %}<div class="empty">No positive reviews collected.</div>{% endif %}
+    </div>
+
+    <div class="tab-panel" data-panel="negative" style="display:none;">
+      {% if insight_tabs.top_negative %}
+      <div class="comments-list">
+        {% for c in insight_tabs.top_negative %}{{ comment_card(c) }}{% endfor %}
+      </div>
+      {% else %}<div class="empty">No negative reviews collected.</div>{% endif %}
+    </div>
+
+    <div class="tab-panel" data-panel="platform" style="display:none;">
+      {% if insight_tabs.by_platform %}
+      <div class="comment-filters" style="margin-bottom:1.1rem;">
+        {% for platform, rows in insight_tabs.by_platform.items() %}
+        <button class="filter-btn subtab-btn {% if loop.first %}active{% endif %}"
+                data-platform="{{ platform }}"
+                onclick="showPlatformTab('{{ platform }}', this)">
+          {{ platform }} <span class="subtab-count">{{ rows|length }}</span>
+        </button>
+        {% endfor %}
+      </div>
+      {% for platform, rows in insight_tabs.by_platform.items() %}
+      <div class="platform-panel" data-platform-panel="{{ platform }}" style="{{ '' if loop.first else 'display:none;' }}">
+        <div class="comments-list">
+          {% for c in rows %}{{ comment_card(c) }}{% endfor %}
+        </div>
+      </div>
+      {% endfor %}
+      {% else %}<div class="empty">No comments collected.</div>{% endif %}
+    </div>
+=======
+  <!-- Comments -->
+  <div class="card">
+    <div class="section-title">All Comments ({{ total }})</div>
+    <div class="comment-filters">
+      <button class="filter-btn active" onclick="filterComments('all', this)">All</button>
+      <button class="filter-btn pos" onclick="filterComments('positive', this)">Positive</button>
+      <button class="filter-btn neg" onclick="filterComments('negative', this)">Negative</button>
+      <button class="filter-btn neu" onclick="filterComments('neutral', this)">Neutral</button>
+      <span class="filter-divider"></span>
+      <button class="filter-btn" onclick="filterComments('Google', this)">Google</button>
+      <button class="filter-btn" onclick="filterComments('Twitter', this)">Twitter</button>
+      <button class="filter-btn" onclick="filterComments('Instagram', this)">Instagram</button>
+      <button class="filter-btn" onclick="filterComments('YouTube', this)">YouTube</button>
+    </div>
+
+    {% if comments %}
+    <div class="comments-list" id="commentsList">
+      {% for c in comments %}
+      <div class="comment-card"
+           data-sentiment="{{ c.sentiment }}"
+           data-platform="{{ c.platform }}">
+        <div class="comment-sentiment-dot"
+             style="background: {% if c.sentiment == 'positive' %}var(--positive){% elif c.sentiment == 'negative' %}var(--negative){% else %}var(--neutral){% endif %}">
+        </div>
+        <div class="comment-body">
+          <div class="comment-text">{{ c.comment }}</div>
+          <div class="comment-meta">
+            <span class="badge {% if c.sentiment == 'positive' %}badge-pos{% elif c.sentiment == 'negative' %}badge-neg{% else %}badge-neu{% endif %}">
+              {{ c.sentiment }}
+            </span>
+            <span>{{ c.platform }}</span>
+          </div>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+    {% else %}
+    <div class="empty">No comments collected. Try a more well-known company or check your internet connection.</div>
+    {% endif %}
+>>>>>>> 5b4009c04f14eaf1ec23d9aa8e7e56bc4049ef52
+  </div>
+
+</div>
+
+<script>
+const ctx = document.getElementById('sentimentChart').getContext('2d');
+new Chart(ctx, {
+  type: 'doughnut',
+  data: {
+    labels: ['Positive', 'Negative', 'Neutral'],
+    datasets: [{
+      data: [{{ positive }}, {{ negative }}, {{ neutral }}],
+      backgroundColor: ['#16a34a', '#dc2626', '#d97706'],
+      borderColor: '#ffffff',
+      borderWidth: 3,
+      hoverOffset: 4,
+    }]
+  },
+  options: {
+    cutout: '68%',
+    plugins: {
+      legend: { display: false },
+      tooltip: {
+        backgroundColor: '#111827',
+        padding: 10,
+        cornerRadius: 6,
+      }
+    },
+    animation: { animateRotate: true, duration: 600 }
+  }
+});
+
+<<<<<<< HEAD
+function showInsightTab(tab, btn) {
+  document.querySelectorAll('.filter-btn[data-tab]').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  document.querySelectorAll('.tab-panel').forEach(p => {
+    p.style.display = (p.dataset.panel === tab) ? '' : 'none';
+  });
+}
+
+function showPlatformTab(platform, btn) {
+  document.querySelectorAll('.subtab-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  document.querySelectorAll('.platform-panel').forEach(p => {
+    p.style.display = (p.dataset.platformPanel === platform) ? '' : 'none';
+=======
+function filterComments(filter, btn) {
+  document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  document.querySelectorAll('.comment-card').forEach(card => {
+    if (filter === 'all') {
+      card.style.display = '';
+    } else if (['positive','negative','neutral'].includes(filter)) {
+      card.style.display = card.dataset.sentiment === filter ? '' : 'none';
+    } else {
+      card.style.display = card.dataset.platform === filter ? '' : 'none';
+    }
+>>>>>>> 5b4009c04f14eaf1ec23d9aa8e7e56bc4049ef52
+  });
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ManobhavaAI — Social Media Brand Analyzer</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #f7f8fa;
+      --surface:   #ffffff;
+      --border:    #e2e5ea;
+      --text:      #111827;
+      --muted:     #6b7280;
+      --primary:   #4f46e5;
+      --primary-d: #4338ca;
+      --primary-l: rgba(79,70,229,0.08);
+    }
+
+    html, body {
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    .page {
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 2rem;
+    }
+
+    /* ── Logo ── */
+    .brand {
+      display: flex; align-items: center; gap: .65rem;
+      margin-bottom: 2.75rem;
+    }
+    .brand-icon {
+      width: 40px; height: 40px;
+      background: var(--primary);
+      border-radius: 10px;
+      display: grid; place-items: center;
+      color: #fff;
+      font-size: .75rem;
+      font-weight: 800;
+      letter-spacing: -.5px;
+    }
+    .brand-name {
+      font-weight: 700; font-size: 1.2rem;
+      letter-spacing: -.02em;
+    }
+    .brand-name .accent { color: var(--primary); }
+
+    /* ── Hero ── */
+    .hero {
+      text-align: center;
+      max-width: 520px;
+      margin-bottom: 2.5rem;
+    }
+    .hero h1 {
+      font-size: clamp(1.6rem, 3.5vw, 2.2rem);
+      font-weight: 700;
+      line-height: 1.25;
+      letter-spacing: -.02em;
+      margin-bottom: .75rem;
+    }
+    .hero p {
+      color: var(--muted);
+      font-size: .95rem;
+      line-height: 1.65;
+    }
+
+    /* ── Card ── */
+    .search-card {
+      width: 100%;
+      max-width: 500px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.75rem;
+      box-shadow: 0 2px 8px rgba(0,0,0,.05);
+    }
+    .search-label {
+      font-size: .78rem;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .05em;
+      margin-bottom: .55rem;
+      display: block;
+    }
+    .search-row {
+      display: flex;
+      gap: .6rem;
+    }
+    .search-input {
+      flex: 1;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: .75rem 1rem;
+      color: var(--text);
+      font-family: inherit;
+      font-size: .95rem;
+      outline: none;
+      transition: border-color .15s, box-shadow .15s;
+    }
+    .search-input::placeholder { color: #9ca3af; }
+    .search-input:focus {
+      border-color: var(--primary);
+      box-shadow: 0 0 0 3px rgba(79,70,229,.12);
+      background: #fff;
+    }
+    .search-btn {
+      background: var(--primary);
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      padding: .75rem 1.35rem;
+      font-family: inherit;
+      font-size: .9rem;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: background .15s, transform .1s;
+    }
+    .search-btn:hover { background: var(--primary-d); }
+    .search-btn:active { transform: scale(.98); }
+
+    /* ── Loading ── */
+    .loading-overlay {
+      display: none;
+      position: fixed; inset: 0; z-index: 100;
+      background: rgba(255,255,255,.94);
+      backdrop-filter: blur(4px);
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 1.25rem;
+    }
+    .loading-overlay.active { display: flex; }
+    .spinner {
+<<<<<<< HEAD
+      width: 34px; height: 34px;
+=======
+      width: 38px; height: 38px;
+>>>>>>> 5b4009c04f14eaf1ec23d9aa8e7e56bc4049ef52
+      border: 3px solid var(--border);
+      border-top-color: var(--primary);
+      border-radius: 50%;
+      animation: spin .7s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+<<<<<<< HEAD
+    .loading-text { font-size: .95rem; font-weight: 600; color: var(--text); text-align: center; }
+    .loading-sub { color: var(--muted); font-size: .82rem; margin-top: .2rem; text-align: center; max-width: 320px; }
+
+    /* ── Loading steps (Change 10) ── */
+    .loading-steps {
+      display: flex; flex-direction: column; gap: .6rem;
+      width: 100%; max-width: 300px; margin-top: .5rem;
+    }
+    .loading-step {
+      display: flex; align-items: center; gap: .65rem;
+      font-size: .85rem; font-weight: 500; color: var(--muted);
+      transition: color .2s;
+    }
+    .loading-step-icon {
+      width: 18px; height: 18px; border-radius: 50%; flex-shrink: 0;
+      border: 2px solid var(--border);
+      display: grid; place-items: center;
+      font-size: .65rem; color: transparent;
+      transition: all .2s;
+    }
+    .loading-step.active .loading-step-icon {
+      border-color: var(--primary);
+      box-shadow: 0 0 0 3px rgba(79,70,229,.12);
+    }
+    .loading-step.done { color: var(--text); }
+    .loading-step.done .loading-step-icon {
+      background: var(--positive); border-color: var(--positive);
+      color: #fff; content: "✓";
+    }
+    .loading-step.done .loading-step-icon::after { content: "✓"; }
+=======
+    .loading-text { font-size: .95rem; font-weight: 600; color: var(--text); }
+    .loading-sub { color: var(--muted); font-size: .82rem; margin-top: .2rem; text-align: center; max-width: 280px; }
+>>>>>>> 5b4009c04f14eaf1ec23d9aa8e7e56bc4049ef52
+
+    /* ── Platforms pills ── */
+    .platforms {
+      display: flex;
+      justify-content: center;
+      gap: .65rem;
+      margin-top: 2rem;
+      flex-wrap: wrap;
+    }
+    .platform-pill {
+      display: flex; align-items: center; gap: .4rem;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: .38rem .75rem;
+      font-size: .78rem;
+      font-weight: 500;
+      color: var(--muted);
+    }
+    .platform-dot { width: 6px; height: 6px; border-radius: 50%; }
+
+    /* ── Error ── */
+    .error-msg {
+      background: #fef2f2;
+      border: 1px solid #fecaca;
+      border-radius: 6px;
+      padding: .6rem .9rem;
+      color: #b91c1c;
+      font-size: .85rem;
+      margin-bottom: 1rem;
+    }
+  </style>
+</head>
+<body>
+
+<div class="loading-overlay" id="loadingOverlay">
+  <div class="spinner"></div>
+<<<<<<< HEAD
+  <div class="loading-text">Analyzing social media…</div>
+  <div class="loading-steps" id="loadingSteps">
+    <div class="loading-step" data-step="0"><span class="loading-step-icon"></span>Discovering Company</div>
+    <div class="loading-step" data-step="1"><span class="loading-step-icon"></span>Finding Social Profiles</div>
+    <div class="loading-step" data-step="2"><span class="loading-step-icon"></span>Discovering Products</div>
+    <div class="loading-step" data-step="3"><span class="loading-step-icon"></span>Collecting Reviews</div>
+    <div class="loading-step" data-step="4"><span class="loading-step-icon"></span>Running Sentiment Analysis</div>
+    <div class="loading-step" data-step="5"><span class="loading-step-icon"></span>Building Dashboard</div>
+  </div>
+  <div class="loading-sub">This may take a few minutes depending on how much data is found.</div>
+=======
+  <div>
+    <div class="loading-text">Analyzing social media…</div>
+    <div class="loading-sub">Fetching comments from Google, Twitter, Instagram and YouTube. This may take a few minutes.</div>
+  </div>
+>>>>>>> 5b4009c04f14eaf1ec23d9aa8e7e56bc4049ef52
+</div>
+
+<div class="page">
+  <div class="brand">
+    <div class="brand-icon">M-AI</div>
+    <div class="brand-name">Manobhava<span class="accent">AI</span></div>
+  </div>
+
+  <div class="hero">
+    <h1>Social Media Brand Analyzer</h1>
+    <p>Enter a company name to collect its public social media mentions and view a sentiment analysis report.</p>
+  </div>
+
+  <div class="search-card">
+    <label class="search-label" for="company">Company name</label>
+
+    {% if error %}
+    <div class="error-msg">{{ error }}</div>
+    {% endif %}
+
+    <form method="POST" action="/analyze" id="analyzeForm">
+      <div class="search-row">
+        <input
+          class="search-input"
+          type="text"
+          id="company"
+          name="company_name"
+          placeholder="e.g. Headphone Zone, Nike, KFC…"
+          autocomplete="off"
+          required
+        />
+        <button class="search-btn" type="submit">Analyze</button>
+      </div>
+    </form>
+  </div>
+
+  <div class="platforms">
+    <div class="platform-pill"><div class="platform-dot" style="background:#4285F4"></div>Google Reviews</div>
+    <div class="platform-pill"><div class="platform-dot" style="background:#000000"></div>X / Twitter</div>
+    <div class="platform-pill"><div class="platform-dot" style="background:#E1306C"></div>Instagram</div>
+    <div class="platform-pill"><div class="platform-dot" style="background:#FF0000"></div>YouTube</div>
+  </div>
+</div>
+
+<script>
+  document.getElementById('analyzeForm').addEventListener('submit', function() {
+    document.getElementById('loadingOverlay').classList.add('active');
+<<<<<<< HEAD
+
+    // CHANGE 10 — step-by-step loading experience. The backend runs as a
+    // single synchronous /analyze request with no progress events, so this
+    // advances a best-effort visual sequence while the request is in
+    // flight; it settles on the last step ("Building Dashboard") rather
+    // than looping, so it never falsely implies the request restarted.
+    var steps = document.querySelectorAll('.loading-step');
+    var stepDurations = [1200, 1600, 1800, 3000, 2200, 1000]; // ms per step (approximate)
+    var i = 0;
+
+    function advance() {
+      if (i > 0) {
+        steps[i - 1].classList.remove('active');
+        steps[i - 1].classList.add('done');
+      }
+      if (i < steps.length) {
+        steps[i].classList.add('active');
+        setTimeout(advance, stepDurations[i] || 1500);
+        i++;
+      }
+    }
+    advance();
+=======
+>>>>>>> 5b4009c04f14eaf1ec23d9aa8e7e56bc4049ef52
+  });
+</script>
+
+</body>
+</html>

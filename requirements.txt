@@ -1,0 +1,14 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+jinja2==3.1.4
+pandas==2.2.3
+numpy==1.26.4
+playwright==1.46.0
+httpx==0.27.2
+beautifulsoup4==4.13.0
+transformers==4.45.0
+torch==2.5.0
+python-multipart==0.0.20
+aiofiles==24.1.0
+requests==2.6.0
+openpyxl==3.1.5

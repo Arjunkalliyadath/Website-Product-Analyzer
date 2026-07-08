@@ -5,6 +5,7 @@ venv/
 .env
 
 downloads/
+debug_html/
 
 .vscode/
 

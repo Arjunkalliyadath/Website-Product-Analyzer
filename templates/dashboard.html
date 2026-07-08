@@ -3,25 +3,30 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>{{ company.company_name | title }} — ManobhavaAI</title>
+  <title>{{ (company.company_name | default("Company")) | title }} — ManobhavaAI</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
     :root {
-      --bg:       #f7f8fa;
-      --surface:  #ffffff;
-      --border:   #e2e5ea;
-      --primary:  #4f46e5;
-      --primary-l: rgba(79,70,229,0.08);
-      --positive: #16a34a;
-      --negative: #dc2626;
-      --neutral:  #d97706;
-      --text:     #111827;
-      --muted:    #6b7280;
+      --bg:       #F7F2E9;
+      --surface:  #FFFDF8;
+      --border:   #E8DDCF;
+      --primary:  #5A4FCF;
+      --primary-l: rgba(90,79,207,0.10);
+      --positive: #2E7D32;
+      --negative: #B3264A;
+      --neutral:  #8A6A1F;
+      --text:     #24211D;
+      --muted:    #7B746C;
+      --yellow-card: #F8E08E;
+      --pink-card:   #F7C7D9;
+      --blue-card:   #D9E7FF;
+      --green-card:  #D8F2C2;
+      --dark:        #1B1B1B;
     }
 
     html { scroll-behavior: smooth; }
@@ -29,7 +34,7 @@
       min-height: 100vh;
       background: var(--bg);
       color: var(--text);
-      font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-family: 'Poppins', -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       font-size: 15px;
     }
 
@@ -45,8 +50,13 @@
       align-items: center;
       justify-content: space-between;
       padding: 1.1rem 0;
-      border-bottom: 1px solid var(--border);
-      margin-bottom: 2rem;
+      background: rgba(255,253,248,.72);
+      backdrop-filter: blur(10px);
+      border: 1px solid var(--border);
+      border-radius: 22px;
+      padding: 1rem 1.2rem;
+      margin: 1.2rem 0 2rem;
+      box-shadow: 0 12px 30px rgba(65,48,28,.06);
     }
     .brand {
       display: flex; align-items: center; gap: .6rem;
@@ -55,7 +65,7 @@
     .brand-icon {
       width: 32px; height: 32px;
       background: var(--primary);
-      border-radius: 8px;
+      border-radius: 10px;
       display: grid; place-items: center;
       color: #fff;
       font-size: .6rem;
@@ -68,7 +78,7 @@
       display: flex; align-items: center; gap: .4rem;
       background: var(--surface);
       border: 1px solid var(--border);
-      border-radius: 7px;
+      border-radius: 999px;
       padding: .45rem .9rem;
       font-size: .82rem;
       font-weight: 500;
@@ -99,7 +109,7 @@
       display: inline-flex; align-items: center; gap: .4rem;
       background: var(--surface);
       border: 1px solid var(--border);
-      border-radius: 6px;
+      border-radius: 999px;
       padding: .35rem .7rem;
       font-size: .78rem;
       text-decoration: none;
@@ -125,9 +135,9 @@
     .card {
       background: var(--surface);
       border: 1px solid var(--border);
-      border-radius: 10px;
+      border-radius: 22px;
       padding: 1.35rem 1.5rem;
-      box-shadow: 0 1px 3px rgba(0,0,0,.04);
+      box-shadow: 0 14px 32px rgba(65,48,28,.07);
     }
     .card-label {
       font-size: .7rem;
@@ -188,7 +198,7 @@
     .filter-btn {
       background: var(--bg);
       border: 1px solid var(--border);
-      border-radius: 6px;
+      border-radius: 999px;
       padding: .3rem .7rem;
       font-size: .78rem;
       font-weight: 500;
@@ -208,7 +218,7 @@
     .comment-card {
       background: var(--bg);
       border: 1px solid var(--border);
-      border-radius: 8px;
+      border-radius: 10px;
       padding: .85rem 1rem;
       display: flex;
       gap: .9rem;
@@ -270,7 +280,7 @@
       display: inline-flex; align-items: center; gap: .45rem;
       background: var(--bg);
       border: 1px solid var(--border);
-      border-radius: 6px;
+      border-radius: 999px;
       padding: .5rem .9rem;
       font-size: .82rem;
       font-weight: 500;
@@ -314,6 +324,90 @@
     .sentiment-table td { padding: .6rem; font-size: .84rem; border-bottom: 1px solid var(--border); }
     .sentiment-table tr:last-child td { border-bottom: none; }
     .mini-bar { display: flex; height: 6px; border-radius: 100px; overflow: hidden; width: 100%; min-width: 90px; }
+
+
+    /* Pinterest-inspired light refresh: structure and backend variables unchanged */
+    .brand-icon {
+      background: linear-gradient(135deg, var(--dark), #3A342E);
+      box-shadow: 0 8px 18px rgba(0,0,0,.16);
+    }
+    .brand-name { font-weight: 800; }
+    .company-header {
+      background: var(--dark);
+      color: #fff;
+      border-radius: 28px;
+      padding: 1.6rem 1.8rem;
+      box-shadow: 0 18px 38px rgba(27,27,27,.16);
+    }
+    .company-eyebrow { color: #F8E08E; }
+    .company-name { color: #fff; }
+    .company-link {
+      background: rgba(255,255,255,.10);
+      border-color: rgba(255,255,255,.18);
+      color: #fff;
+    }
+    .company-link:hover { background: rgba(255,255,255,.16); border-color: rgba(255,255,255,.36); }
+    .company-link .link-label { color: #fff; }
+    .company-link .link-handle, .company-link .link-sep { color: rgba(255,255,255,.68); }
+
+    .card--total    { background: var(--yellow-card); border-color: #ECD06D; }
+    .card--positive { background: var(--green-card);  border-color: #BEE79E; }
+    .card--negative { background: var(--pink-card);   border-color: #EEAFC8; }
+    .card--neutral  { background: var(--blue-card);   border-color: #BCD2FA; }
+    .card--total .card-label,
+    .card--positive .card-label,
+    .card--negative .card-label,
+    .card--neutral .card-label,
+    .card--total .card-sub,
+    .card--positive .card-sub,
+    .card--negative .card-sub,
+    .card--neutral .card-sub { color: rgba(36,33,29,.68); }
+    .card--total .card-value,
+    .card--positive .card-value,
+    .card--negative .card-value,
+    .card--neutral .card-value { color: var(--text); }
+
+    .score-value { color: var(--primary); }
+    .exec-stat, .comment-card, .chip, .filter-btn, .dl-btn {
+      border-radius: 16px;
+    }
+    .filter-btn.active {
+      box-shadow: 0 8px 18px rgba(90,79,207,.18);
+    }
+    .comment-card:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 10px 22px rgba(65,48,28,.06);
+    }
+    .sentiment-table th { background: rgba(90,79,207,.04); }
+    .sentiment-table tr:hover td { background: rgba(255,255,255,.55); }
+
+    /* --- Approved additions: discovery badge, report-generated stamp,
+       brand-score explainer, executive key-insights list --- */
+    .discovery-badge {
+      display: inline-block;
+      margin-left: .55rem;
+      padding: .15rem .55rem;
+      border-radius: 999px;
+      font-size: .6rem;
+      font-weight: 600;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+      background: rgba(255,255,255,.12);
+      border: 1px solid rgba(255,255,255,.24);
+      color: rgba(255,255,255,.78);
+      vertical-align: middle;
+    }
+    .report-generated {
+      margin-top: .9rem;
+      font-size: .74rem;
+      color: rgba(255,255,255,.55);
+    }
+    .score-explainer {
+      margin-top: .6rem;
+      font-size: .78rem;
+      line-height: 1.5;
+      color: var(--muted);
+    }
   </style>
 </head>
 <body>
@@ -328,13 +422,19 @@
   </nav>
 
   <div class="company-header">
-    <div class="company-eyebrow">Analysis Report</div>
-    <div class="company-name">{{ company.company_name | title }}</div>
+    <div class="company-eyebrow">Analysis Report{% if company.discovery_version %}<span class="discovery-badge">{{ company.discovery_version }}</span>{% endif %}</div>
+    <div class="company-name">{{ (company.company_name | default("Company")) | title }}</div>
     <div class="company-links">
       {% if company.website %}
       <a class="company-link" href="{{ company.website }}" target="_blank">
         <span class="dot" style="background:#4285F4"></span>
         <span class="link-label">Website</span>
+      </a>
+      {% endif %}
+      {% if company.google_business %}
+      <a class="company-link" href="{{ company.google_business }}" target="_blank">
+        <span class="dot" style="background:#34A853"></span>
+        <span class="link-label">Google Business</span>
       </a>
       {% endif %}
       {% if company.twitter_url %}
@@ -362,6 +462,9 @@
       </a>
       {% endif %}
     </div>
+    {% if report_generated %}
+    <div class="report-generated">Report generated {{ report_generated }}</div>
+    {% endif %}
   </div>
 
   
@@ -369,21 +472,24 @@
     <div class="card">
       <div class="card-label">Overall Brand Score</div>
       <div class="score-wrap">
-        <div class="score-value">{{ brand_score }}</div>
+        <div class="score-value">{{ brand_score | default(0) }}</div>
         <div class="score-max">/ 100</div>
       </div>
-      <span class="score-label {{ brand_label | lower | replace(' ', '-') }}">{{ brand_label }}</span>
+      <span class="score-label {{ (brand_label | default("No Data")) | lower | replace(' ', '-') }}">{{ brand_label | default("No Data") }}</span>
+      <div class="score-explainer">Positive comments count fully and neutral comments count half, out of every comment collected — negative comments don't add any points. A higher score means more of the conversation is positive.</div>
     </div>
     <div class="card">
       <div class="card-label">Product &amp; Service Discovery</div>
       <div class="score-wrap" style="gap:1.5rem;">
-        <div><span class="score-value" style="font-size:1.5rem;">{{ products_found }}</span> <span class="card-sub">products found</span></div>
-        <div><span class="score-value" style="font-size:1.5rem;">{{ services_found }}</span> <span class="card-sub">services found</span></div>
+        <div><span class="score-value" style="font-size:1.5rem;">{{ products_found | default(0) }}</span> <span class="card-sub">products found</span></div>
+        <div><span class="score-value" style="font-size:1.5rem;">{{ services_found | default(0) }}</span> <span class="card-sub">services found</span></div>
       </div>
-      <div class="card-sub" style="margin-top:.5rem;">{{ products_scraped }} products scraped · {{ reviews_collected }} Google reviews collected</div>
+      <div class="card-sub" style="margin-top:.5rem;">{{ products_scraped | default(0) }} products scraped · {{ reviews_collected | default(0) }} Google reviews collected</div>
     </div>
   </div>
 
+  {%- set products = products | default([], true) -%}
+  {%- set services = services | default([], true) -%}
   {% if products or services %}
   <div class="grid-2" style="margin-bottom:1.25rem;">
     {% if products %}
@@ -391,7 +497,7 @@
       <div class="card-label">Products Found</div>
       <div class="chip-list">
         {% for p in products %}
-        <span class="chip {% if p in (product_sentiment.keys() | list) and p != 'General' %}chip-scraped{% endif %}">{{ p }}</span>
+        <span class="chip {% if p in ((product_sentiment | default({}, true)).keys() | list) and p != 'General' %}chip-scraped{% endif %}">{{ p }}</span>
         {% endfor %}
       </div>
       {% if top_positive_product or top_negative_product %}
@@ -419,23 +525,23 @@
   <div class="grid-4">
     <div class="card card--total">
       <div class="card-label">Total Comments</div>
-      <div class="card-value">{{ total }}</div>
+      <div class="card-value">{{ total | default(0) }}</div>
       <div class="card-sub">across all platforms</div>
     </div>
     <div class="card card--positive">
       <div class="card-label">Positive</div>
-      <div class="card-value">{{ positive }}</div>
-      <div class="card-sub">{{ positive_pct }}% of total</div>
+      <div class="card-value">{{ positive | default(0) }}</div>
+      <div class="card-sub">{{ positive_pct | default(0) }}% of total</div>
     </div>
     <div class="card card--negative">
       <div class="card-label">Negative</div>
-      <div class="card-value">{{ negative }}</div>
-      <div class="card-sub">{{ negative_pct }}% of total</div>
+      <div class="card-value">{{ negative | default(0) }}</div>
+      <div class="card-sub">{{ negative_pct | default(0) }}% of total</div>
     </div>
     <div class="card card--neutral">
       <div class="card-label">Neutral</div>
-      <div class="card-value">{{ neutral }}</div>
-      <div class="card-sub">{{ neutral_pct }}% of total</div>
+      <div class="card-value">{{ neutral | default(0) }}</div>
+      <div class="card-sub">{{ neutral_pct | default(0) }}% of total</div>
     </div>
   </div>
 
@@ -444,14 +550,14 @@
     <div class="card-label">Sentiment Distribution</div>
     <div class="sentiment-bar-wrap">
       <div class="sentiment-bar">
-        <div class="sb-pos" style="flex:{{ positive_pct }}"></div>
-        <div class="sb-neg" style="flex:{{ negative_pct }}"></div>
-        <div class="sb-neu" style="flex:{{ neutral_pct }}"></div>
+        <div class="sb-pos" style="flex:{{ positive_pct | default(0) }}"></div>
+        <div class="sb-neg" style="flex:{{ negative_pct | default(0) }}"></div>
+        <div class="sb-neu" style="flex:{{ neutral_pct | default(0) }}"></div>
       </div>
       <div class="sentiment-legend">
-        <div class="legend-item"><div class="legend-dot" style="background:var(--positive)"></div>Positive {{ positive_pct }}%</div>
-        <div class="legend-item"><div class="legend-dot" style="background:var(--negative)"></div>Negative {{ negative_pct }}%</div>
-        <div class="legend-item"><div class="legend-dot" style="background:var(--neutral)"></div>Neutral {{ neutral_pct }}%</div>
+        <div class="legend-item"><div class="legend-dot" style="background:var(--positive)"></div>Positive {{ positive_pct | default(0) }}%</div>
+        <div class="legend-item"><div class="legend-dot" style="background:var(--negative)"></div>Negative {{ negative_pct | default(0) }}%</div>
+        <div class="legend-item"><div class="legend-dot" style="background:var(--neutral)"></div>Neutral {{ neutral_pct | default(0) }}%</div>
       </div>
     </div>
   </div>
@@ -467,12 +573,17 @@
     <div class="card">
       <div class="card-label">Platform Coverage</div>
       <div class="platform-list">
-        {% set max_count = [platform_counts.Google, platform_counts.Twitter, platform_counts.Instagram, platform_counts.YouTube] | max %}
+        {%- set platform_counts = platform_counts | default({}, true) -%}
+        {%- set pc_google = platform_counts.Google | default(0) -%}
+        {%- set pc_twitter = platform_counts.Twitter | default(0) -%}
+        {%- set pc_instagram = platform_counts.Instagram | default(0) -%}
+        {%- set pc_youtube = platform_counts.YouTube | default(0) -%}
+        {%- set max_count = [pc_google, pc_twitter, pc_instagram, pc_youtube] | max -%}
         {% set platforms = [
-          ('Google', platform_counts.Google, '🔍', '#4285F4'),
-          ('Twitter / X', platform_counts.Twitter, '𝕏', '#000000'),
-          ('Instagram', platform_counts.Instagram, '📸', '#E1306C'),
-          ('YouTube', platform_counts.YouTube, '▶', '#FF0000')
+          ('Google', pc_google, '🔍', '#4285F4'),
+          ('Twitter / X', pc_twitter, '𝕏', '#000000'),
+          ('Instagram', pc_instagram, '📸', '#E1306C'),
+          ('YouTube', pc_youtube, '▶', '#FF0000')
         ] %}
         {% for name, count, icon, color in platforms %}
         <div class="platform-row">
@@ -491,6 +602,7 @@
     </div>
   </div>
 
+  {%- set product_sentiment = product_sentiment | default({}, true) -%}
   {% if product_sentiment and (product_sentiment.keys() | list | length) > 1 %}
   
   <div class="card" style="margin-bottom:1.25rem;">
@@ -536,7 +648,7 @@
         </tr>
       </thead>
       <tbody>
-        {% for label, stats in platform_sentiment.items() %}
+        {% for label, stats in (platform_sentiment | default({}, true)).items() %}
         <tr>
           <td>{{ label }}</td>
           <td>{{ stats.total }}</td>
@@ -555,54 +667,64 @@
   </div>
 
   
+  {%- set summary = summary | default({}, true) %}
   <div class="card" style="margin-bottom:1.25rem;">
     <div class="section-title">Executive Summary</div>
-    <p class="summary-text">{{ summary.executive_summary }}</p>
+    <p class="summary-text">{{ summary.executive_summary | default("Summary unavailable.") }}</p>
 
     <div class="exec-grid">
       <div class="exec-stat">
         <div class="exec-label">Overall Brand Score</div>
-        <div class="exec-value">{{ brand_score }} <span class="exec-unit">/ 100</span></div>
+        <div class="exec-value">{{ brand_score | default(0) }} <span class="exec-unit">/ 100</span></div>
       </div>
       <div class="exec-stat">
         <div class="exec-label">Overall Sentiment</div>
-        <div class="exec-value">{{ summary.overall_sentiment }}</div>
+        <div class="exec-value">{{ summary.overall_sentiment | default("No Data") }}</div>
       </div>
       <div class="exec-stat">
         <div class="exec-label">Products Analysed</div>
-        <div class="exec-value">{{ products_scraped }}</div>
+        <div class="exec-value">{{ products_scraped | default(0) }}</div>
       </div>
       <div class="exec-stat">
         <div class="exec-label">Platforms Covered</div>
-        <div class="exec-value">{{ summary.platforms_covered }}</div>
+        <div class="exec-value">{{ summary.platforms_covered | default(0) }}</div>
       </div>
       <div class="exec-stat">
         <div class="exec-label">Total Reviews</div>
-        <div class="exec-value">{{ total }}</div>
+        <div class="exec-value">{{ total | default(0) }}</div>
       </div>
       <div class="exec-stat">
         <div class="exec-label">Top Positive Product</div>
-        <div class="exec-value exec-value--sm" style="color:var(--positive)">{{ top_positive_product or "—" }}</div>
+        <div class="exec-value exec-value--sm" style="color:var(--positive)">{{ top_positive_product | default("", true) or "—" }}</div>
       </div>
       <div class="exec-stat">
         <div class="exec-label">Top Negative Product</div>
-        <div class="exec-value exec-value--sm" style="color:var(--negative)">{{ top_negative_product or "—" }}</div>
+        <div class="exec-value exec-value--sm" style="color:var(--negative)">{{ top_negative_product | default("", true) or "—" }}</div>
       </div>
       <div class="exec-stat">
         <div class="exec-label">Most Discussed Product</div>
-        <div class="exec-value exec-value--sm">{{ most_discussed_product or "—" }}</div>
+        <div class="exec-value exec-value--sm">{{ most_discussed_product | default("", true) or "—" }}</div>
       </div>
       <div class="exec-stat">
         <div class="exec-label">Most Mentioned Feature</div>
-        <div class="exec-value exec-value--sm">{{ summary.most_mentioned_feature }}</div>
+        <div class="exec-value exec-value--sm">{{ summary.most_mentioned_feature | default("Not enough data") }}</div>
       </div>
     </div>
+
+    {% if summary.key_insights %}
+    <div class="insight-heading">Key Insights</div>
+    <div class="insight-list" style="margin-bottom:1.1rem;">
+      {% for item in summary.key_insights %}
+      <div class="insight-item"><span class="insight-icon">•</span><span>{{ item }}</span></div>
+      {% endfor %}
+    </div>
+    {% endif %}
 
     <div class="insight-columns">
       <div>
         <div class="insight-heading">Key Positive Insights</div>
         <div class="insight-list">
-          {% for item in summary.key_positive_insights %}
+          {% for item in summary.key_positive_insights | default([], true) %}
           <div class="insight-item"><span class="insight-icon" style="color:var(--positive)">✓</span><span>{{ item }}</span></div>
           {% endfor %}
         </div>
@@ -610,7 +732,7 @@
       <div>
         <div class="insight-heading">Key Customer Complaints</div>
         <div class="insight-list">
-          {% for item in summary.key_complaints %}
+          {% for item in summary.key_complaints | default([], true) %}
           <div class="insight-item"><span class="insight-icon" style="color:var(--negative)">!</span><span>{{ item }}</span></div>
           {% endfor %}
         </div>
@@ -619,7 +741,7 @@
 
     <div class="insight-heading" style="margin-top:1.1rem;">Suggested Improvements</div>
     <div class="insight-list">
-      {% for rec in summary.recommendations %}
+      {% for rec in summary.recommendations | default([], true) %}
       <div class="insight-item">
         <span class="insight-icon">→</span>
         <span>{{ rec }}</span>
@@ -627,30 +749,31 @@
       {% endfor %}
     </div>
 
-    {% if csv_path or excel_path or json_path %}
+    {% if csv_path or excel_path or json_path or pdf_path %}
     <div style="margin-top:1.4rem; border-top:1px solid var(--border); padding-top:1.1rem;">
       <div class="card-label">Export Data</div>
       <div class="download-row">
         {% if csv_path %}<a class="dl-btn" href="/{{ csv_path }}">↓ CSV</a>{% endif %}
         {% if excel_path %}<a class="dl-btn" href="/{{ excel_path }}">↓ Excel</a>{% endif %}
         {% if json_path %}<a class="dl-btn" href="/{{ json_path }}">↓ JSON</a>{% endif %}
+        {% if pdf_path %}<a class="dl-btn" href="/{{ pdf_path }}">↓ Download PDF Report</a>{% endif %}
       </div>
     </div>
     {% endif %}
   </div>
 
   {% macro comment_card(c) %}
-  <div class="comment-card" data-sentiment="{{ c.sentiment }}" data-platform="{{ c.platform }}">
+  <div class="comment-card" data-sentiment="{{ c.sentiment | default('neutral') }}" data-platform="{{ c.platform | default('') }}">
     <div class="comment-sentiment-dot"
          style="background: {% if c.sentiment == 'positive' %}var(--positive){% elif c.sentiment == 'negative' %}var(--negative){% else %}var(--neutral){% endif %}">
     </div>
     <div class="comment-body">
-      <div class="comment-text">{{ c.comment }}</div>
+      <div class="comment-text">{{ c.comment | default("") }}</div>
       <div class="comment-meta">
         <span class="badge {% if c.sentiment == 'positive' %}badge-pos{% elif c.sentiment == 'negative' %}badge-neg{% else %}badge-neu{% endif %}">
-          {{ c.sentiment }}
+          {{ c.sentiment | default("neutral") }}
         </span>
-        <span>{{ c.platform }}</span>
+        <span>{{ c.platform | default("") }}</span>
         {% if c.product and c.product != 'General' %}<span>· {{ c.product }}</span>{% endif %}
       </div>
     </div>
@@ -658,6 +781,7 @@
   {% endmacro %}
 
   
+  {%- set insight_tabs = insight_tabs | default({}, true) -%}
   <div class="card">
     <div class="section-title">Insights</div>
     <div class="comment-filters">
@@ -671,7 +795,7 @@
       <div class="comments-list">
         {% for c in insight_tabs.top_positive %}{{ comment_card(c) }}{% endfor %}
       </div>
-      {% else %}<div class="empty">No positive reviews collected.</div>{% endif %}
+      {% else %}<div class="empty">No standout positive reviews yet — check back once more feedback has been collected.</div>{% endif %}
     </div>
 
     <div class="tab-panel" data-panel="negative" style="display:none;">
@@ -679,7 +803,7 @@
       <div class="comments-list">
         {% for c in insight_tabs.top_negative %}{{ comment_card(c) }}{% endfor %}
       </div>
-      {% else %}<div class="empty">No negative reviews collected.</div>{% endif %}
+      {% else %}<div class="empty">No standout negative reviews yet — check back once more feedback has been collected.</div>{% endif %}
     </div>
 
     <div class="tab-panel" data-panel="platform" style="display:none;">
@@ -700,7 +824,7 @@
         </div>
       </div>
       {% endfor %}
-      {% else %}<div class="empty">No comments collected.</div>{% endif %}
+      {% else %}<div class="empty">No comments collected yet for this platform — try running the analysis again later.</div>{% endif %}
     </div>
   </div>
 
@@ -713,7 +837,7 @@ new Chart(ctx, {
   data: {
     labels: ['Positive', 'Negative', 'Neutral'],
     datasets: [{
-      data: [{{ positive }}, {{ negative }}, {{ neutral }}],
+      data: [{{ positive | default(0) }}, {{ negative | default(0) }}, {{ neutral | default(0) }}],
       backgroundColor: ['#16a34a', '#dc2626', '#d97706'],
       borderColor: '#ffffff',
       borderWidth: 3,

@@ -1,12 +1,20 @@
 import asyncio
 import concurrent.futures
 import sys
+import time
 from typing import Dict, List
 
 from scrapers.browser_utils import normalize_comments
 
 MAX_RESULTS = 30
 MIN_RESULTS_BEFORE_FALLBACK = 5
+
+# --- Hard internal time budget -----------------------------------------
+# Kept a few seconds under the outer asyncio.wait_for() cap applied in
+# app.py (20s) so this scraper almost always returns on its own, with
+# whatever it has collected so far, instead of being cut off cold by the
+# outer timeout and losing partial results.
+TIME_BUDGET_SECONDS = 16
 
 _CHROME_MARKERS = (
     "followers", " posts", "view full profile", "following",
@@ -22,20 +30,33 @@ _NON_REVIEW_MARKERS = (
     "salary range", "job posting", "now hiring", "currently hiring",
 )
 
+
 def _is_non_review(text: str) -> bool:
     low = text.lower()
     return _is_profile_chrome(text) or any(marker in low for marker in _NON_REVIEW_MARKERS)
+
 
 def _is_profile_chrome(text: str) -> bool:
     low = f" {text.lower()} "
     hits = sum(1 for marker in _CHROME_MARKERS if marker in low)
     return hits >= 2
 
+
 def _profile_url(target: str) -> str:
     target = (target or "").strip()
     if target.startswith(("http://", "https://")):
         return target
     return f"https://www.instagram.com/{target.lstrip('@')}/"
+
+
+def _looks_blocked(page) -> bool:
+    """Cheap, instant login-wall/checkpoint check (no waiting)."""
+    try:
+        url = page.url or ""
+    except Exception:
+        url = ""
+    return "login" in url or "accounts" in url or "challenge" in url
+
 
 async def scrape_instagram_comments(company_data: Dict[str, str]) -> List[str]:
     target = (
@@ -62,10 +83,13 @@ async def scrape_instagram_comments(company_data: Dict[str, str]) -> List[str]:
         from playwright.sync_api import sync_playwright
 
         results: List[str] = []
+        deadline = time.monotonic() + TIME_BUDGET_SECONDS
+
+        def _time_left() -> float:
+            return deadline - time.monotonic()
 
         def _add(txt: str) -> None:
             txt = (txt or "").strip()
-
             if txt and len(txt.split()) >= 6 and not _is_non_review(txt):
                 if txt not in results:
                     results.append(txt)
@@ -88,11 +112,13 @@ async def scrape_instagram_comments(company_data: Dict[str, str]) -> List[str]:
                     viewport={"width": 1280, "height": 900},
                 )
                 page = ctx.new_page()
+                page.set_default_timeout(7000)
 
+                # --- Primary attempt: public embed page (no login wall) ----
                 try:
                     page.goto(profile_url.rstrip("/") + "/embed/",
-                               wait_until="domcontentloaded", timeout=15000)
-                    page.wait_for_timeout(2000)
+                               wait_until="domcontentloaded", timeout=8000)
+                    page.wait_for_timeout(1200)
                     for loc in page.locator("[class*='Caption'], [class*='caption']").all()[:30]:
                         try:
                             _add(loc.inner_text())
@@ -101,11 +127,13 @@ async def scrape_instagram_comments(company_data: Dict[str, str]) -> List[str]:
                 except Exception:
                     pass
 
-                if len(results) < MIN_RESULTS_BEFORE_FALLBACK:
+                # --- One fallback: direct profile page, skipped instantly if
+                # it redirects to a login/checkpoint wall --------------------
+                if len(results) < MIN_RESULTS_BEFORE_FALLBACK and _time_left() > 4:
                     try:
-                        page.goto(profile_url, wait_until="domcontentloaded", timeout=20000)
-                        page.wait_for_timeout(3000)
-                        if "login" not in page.url and "accounts" not in page.url:
+                        page.goto(profile_url, wait_until="domcontentloaded", timeout=8000)
+                        page.wait_for_timeout(1200)
+                        if not _looks_blocked(page):
                             for sel in ["span._aacl", "div._aacl", "h1", "span"]:
                                 for loc in page.locator(sel).all()[:50]:
                                     try:
@@ -117,76 +145,23 @@ async def scrape_instagram_comments(company_data: Dict[str, str]) -> List[str]:
                     except Exception:
                         pass
 
-                if len(results) < MIN_RESULTS_BEFORE_FALLBACK:
-                    google_queries = [
-                        f'site:instagram.com "{company_name}"',
-                        f'site:instagram.com "{handle}"',
-                        f'"{company_name}" instagram review OR feedback OR comment',
-                        f'"{company_name}" instagram -login -signup',
-                        f'{handle} instagram customer review',
-                    ]
-                    for q in google_queries:
-                        if len(results) >= MAX_RESULTS:
-                            break
-                        try:
-                            page.goto(
-                                f"https://www.google.com/search?q={q.replace(' ', '+')}&hl=en&num=20",
-                                wait_until="domcontentloaded", timeout=20000,
-                            )
-                            page.wait_for_timeout(2000)
-
-                            for sel in ["div.VwiC3b", "span.aCOpRe", "div.IsZvec",
-                                        "div.lyLwlc", "span.MUxGbd"]:
-                                for loc in page.locator(sel).all()[:25]:
-                                    try:
-                                        _add(loc.inner_text())
-                                    except Exception:
-                                        pass
-                        except Exception:
-                            continue
-
-                if len(results) < MIN_RESULTS_BEFORE_FALLBACK:
-                    bing_queries = [
-                        f'site:instagram.com {company_name}',
-                        f'{company_name} instagram posts OR comments',
-                        f'instagram "{company_name}" review',
-                    ]
-                    for q in bing_queries:
-                        if len(results) >= MAX_RESULTS:
-                            break
-                        try:
-                            page.goto(
-                                f"https://www.bing.com/search?q={q.replace(' ', '+')}",
-                                wait_until="domcontentloaded", timeout=20000,
-                            )
-                            page.wait_for_timeout(1800)
-                            for sel in ["p.b_algoSlug", "div.b_caption p",
-                                        "div.b_snippet", "p"]:
-                                for loc in page.locator(sel).all()[:25]:
-                                    try:
-                                        txt = loc.inner_text()
-
-                                        if (company_name.lower() in txt.lower()
-                                                or handle.lower() in txt.lower()):
-                                            _add(txt)
-                                    except Exception:
-                                        pass
-                        except Exception:
-                            continue
-
-                if len(results) < MIN_RESULTS_BEFORE_FALLBACK:
+                # --- One search fallback (single query), only if still short
+                # on data and there's time left ------------------------------
+                if len(results) < MIN_RESULTS_BEFORE_FALLBACK and _time_left() > 4:
                     try:
-                        q = f"instagram {company_name} reviews comments"
+                        q = f'site:instagram.com "{company_name}"'
                         page.goto(
-                            f"https://html.duckduckgo.com/html/?q={q.replace(' ', '+')}",
-                            wait_until="domcontentloaded", timeout=20000,
+                            f"https://www.google.com/search?q={q.replace(' ', '+')}&hl=en&num=20",
+                            wait_until="domcontentloaded", timeout=8000,
                         )
-                        page.wait_for_timeout(1800)
-                        for loc in page.locator("div.result__snippet").all()[:20]:
-                            try:
-                                _add(loc.inner_text())
-                            except Exception:
-                                pass
+                        page.wait_for_timeout(1200)
+                        for sel in ["div.VwiC3b", "span.aCOpRe", "div.IsZvec",
+                                    "div.lyLwlc", "span.MUxGbd"]:
+                            for loc in page.locator(sel).all()[:25]:
+                                try:
+                                    _add(loc.inner_text())
+                                except Exception:
+                                    pass
                     except Exception:
                         pass
 

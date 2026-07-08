@@ -1,6 +1,10 @@
 from typing import List
 
-MAX_PRODUCTS: int = 10
+# Number of products returned by Product Discovery.
+# We only analyze 5 later, but we want the user to be able
+# to choose from the COMPLETE catalogue.
+
+MAX_PRODUCTS: int = 500
 
 MAX_PARALLEL_TASKS: int = 5
 
@@ -17,7 +21,9 @@ BLACKLIST_WORDS: List[str] = [
     "under", "above", "best headphones", "best earphones",
 
     "shop all", "shop", "accessories", "accessory", "brands", "brand",
+
     "about", "about us", "contact", "contact us", "wishlist",
+
     "support", "help", "helpdesk",
 
     "replacement cable",

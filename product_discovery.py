@@ -1,59 +1,167 @@
+"""
+product_discovery.py
+---------------------
+Product Discovery module (Phase 2 rewrite).
+
+Public entry point (unchanged signature, unchanged output keys, so app.py /
+dashboard.html / the rest of the pipeline do not need to change):
+
+    await discover_products(company_data: Dict[str, str]) -> Dict
+
+Returned dict keeps the original keys other modules rely on:
+    products, services, scrape_targets, products_found, services_found,
+    discovery_method, discovery_version
+
+...and adds new, additive keys for future consumers (report generation,
+richer dashboards, etc.) without breaking existing ones:
+    site_type, categories, catalogue
+
+`catalogue` is the full structured product list (List[dict]) described in
+the spec - name, url, category, image, description, price, availability,
+brand, model, sku, variant, confidence, source. `products` / `services`
+remain plain name strings (top-N by confidence) because that is what
+templates/dashboard.html and the sentiment/scraping pipeline key off of.
+
+Pipeline stages (see also product_extraction.py):
+    1. JSON-LD / schema.org structured data (Product, Offer, ItemList,
+       BreadcrumbList) - highest-confidence source, no guessing involved.
+    2. Static HTML "product card" parsing (product-card/grid containers,
+       anchors whose href already looks like a product URL).
+    3. Category/collection page crawl - repeat stages 1+2 on discovered
+       category pages, in parallel, bounded by MAX_CATEGORY_PAGES.
+    3b. robots.txt -> Sitemap: -> sitemap.xml category discovery, used to
+       widen the category list when the nav crawl (stage 3) still comes
+       back thin - e.g. mega-menus that are entirely JS-rendered, or a
+       site whose real category tree isn't reachable from top-nav at all.
+    4. Playwright fallback for JS-rendered / bot-protected sites: scroll,
+       click "Load more", walk simple ?page=N pagination, then re-run the
+       same card extraction against the rendered DOM.
+    5. De-duplication + confidence scoring + noise filtering + ranking.
+
+Playwright session architecture (stage 4):
+    _fetch_static() does one plain HTTP request for the homepage - no
+    browser involved. If that comes back blocked (401/403/429/503, or a 200
+    that is actually an anti-bot interstitial), the ENTIRE analysis for
+    that site is handed to _run_playwright_driven_discovery(), which owns
+    one browser + one context + a small pool of reused pages for the whole
+    analysis, and discovers navigation/category/product links straight from
+    the *rendered* DOM instead of guessing paths like /products, /shop,
+    /catalog, /store, /services. If the homepage loads fine over plain
+    HTTP, the static pipeline (stages 1-3) runs as before and Playwright is
+    only invoked - once, via the same single session - if results still
+    look thin afterwards. Either way there is exactly one browser launch
+    per analysis, closed exactly once when discovery finishes. See the
+    _PlaywrightSession / _run_playwright_driven_discovery docstrings below
+    for why this replaced the previous per-URL browser relaunching.
+"""
+
+from __future__ import annotations
+
 import asyncio
 import logging
+import os
 import re
-from dataclasses import dataclass, field
-from typing import Dict, List, Set, Tuple
-from urllib.parse import quote_plus, urljoin, urlparse
+import time
+import uuid
+from typing import Dict, List, Optional, Set
+from urllib.parse import urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
 
 import config
 from scrapers.browser_utils import run_playwright_async
+from product_extraction import (
+    Product,
+    SiteType,
+    classify_as_service,
+    detect_site_type,
+    discover_category_links,
+    extract_sitemap_locs,
+    filter_category_urls_from_sitemap,
+    is_sitemap_index,
+    is_valid_candidate_name,
+    parse_breadcrumb_category,
+    parse_html_product_cards,
+    parse_jsonld_products,
+    parse_robots_sitemaps,
+    _looks_like_product_url,  # noqa: reused as-is for diagnostics only, not modified
+)
 
 logger = logging.getLogger(__name__)
 
-DISCOVERY_VERSION = "product-discovery-v2"
+# ============================================================================
+# TEMPORARY DIAGNOSTIC INSTRUMENTATION - Adidas/AJIO zero-product investigation
+# ----------------------------------------------------------------------------
+# Everything gated behind DIAGNOSTICS_ENABLED (here, and the block further
+# down marked "END TEMPORARY DIAGNOSTICS") is read-only instrumentation: it
+# logs what Playwright actually received for each rendered page and
+# optionally dumps the raw HTML to disk when a page yields zero products.
+# It does NOT change discovery logic, scoring, selectors, or any pipeline
+# output (products/services/catalogue are untouched). Flip
+# DIAGNOSTICS_ENABLED to False (or delete the block) once done.
+DIAGNOSTICS_ENABLED = True
 
-MAX_PRODUCTS_TO_SCRAPE = config.MAX_PRODUCTS
+# Where zero-product page HTML gets dumped for manual inspection.
+DEBUG_HTML_DIR = "debug_html"
+
+# Extra bot-check / interstitial markers, on top of the ones already used by
+# _looks_like_anti_bot_page() below - checked with NO length cap for
+# diagnostics, since a captcha/interstitial can be embedded inside an
+# otherwise large SPA HTML payload (unlike the production check, which only
+# looks at short responses to avoid false positives on real pages).
+_DIAG_EXTRA_BOT_MARKERS = (
+    "captcha", "are you a robot", "verify you are human", "/sorry/",
+    "unusual traffic", "bot detection", "automated access",
+    "checking if the site connection is secure", "ray id",
+)
+
+_ADD_TO_CART_MARKERS = (
+    "add to cart", "add to bag", "add to basket", "buy now",
+)
+# ============================================================================
+
+DISCOVERY_VERSION = "product-discovery-v5"
+
+# How many product pages we are willing to attempt to build the *full*
+# catalogue (spec target: "if the company sells ~60 products, attempt the
+# complete catalogue"). This is intentionally larger than config.MAX_PRODUCTS
+# (which still governs how many products get scraped for reviews downstream,
+# to keep review-collection runtime unchanged).
+MAX_CATALOGUE_SIZE = 60
+
+# Confidence floor - a candidate below this is discarded outright, however
+# it was discovered. This is the safety net that stops "Access Denied",
+# "Login", stray headings, etc. from ever reaching the dashboard, even if a
+# future selector regression re-introduces them.
+MIN_CONFIDENCE = 0.35
+
+MAX_CATEGORY_PAGES = 12
+MAX_PLAYWRIGHT_PAGES = 6
+MAX_SCROLL_ROUNDS = 6
+MAX_PAGINATION_PAGES = 4
+
+# Pages kept open and reused within the ONE browser/context launched per
+# analysis (see _PlaywrightSession). This bounds how many pages are
+# rendered concurrently - it is a page-pool size, not a page-visit limit
+# (that's MAX_PLAYWRIGHT_PAGES above).
+PLAYWRIGHT_POOL_SIZE = 3
+
+# Spec Step 5 (robots.txt -> Sitemap: -> sitemap.xml). Bounded so a sitemap
+# index with hundreds of child sitemaps can't blow up runtime.
+MAX_SITEMAPS_TO_FOLLOW = 3
+MAX_SITEMAP_INDEX_CHILDREN = 3
+
+# Below this many accepted products after the static + nav-category stages,
+# we treat the site as "still thin" and keep escalating (sitemap, then
+# Playwright) rather than settling for a near-empty catalogue.
+THIN_RESULT_THRESHOLD = 8
 
 CANDIDATE_PATH_SUFFIXES = (
-    "/products", "/product", "/shop", "/shop-all", "/collections",
-    "/collections/all", "/services", "/solutions", "/store", "/catalog",
-    "/menu", "/categories",
+    "/products", "/collections/all", "/shop", "/shop-all", "/collections",
+    "/store", "/catalog", "/services", "/solutions",
 )
 
-NAV_HINT_WORDS = (
-    "shop", "product", "products", "collection", "collections", "service",
-    "services", "solution", "solutions", "store", "catalog", "menu",
-    "category", "categories",
-)
-
-NOISE_TERMS = {
-    "home", "cart", "checkout", "login", "log in", "sign in", "sign up",
-    "register", "account", "my account", "wishlist", "search", "contact",
-    "contact us", "about", "about us", "blog", "news", "help", "faq",
-    "faqs", "terms", "terms of service", "privacy", "privacy policy",
-    "careers", "jobs", "press", "media", "investors", "sitemap",
-    "cookie policy", "cookies", "sign out", "logout", "menu", "close",
-    "skip to content", "skip to main content", "subscribe", "newsletter",
-    "language", "currency", "back", "next", "previous", "read more",
-    "learn more", "view all", "see all", "shop all", "explore",
-}
-
-SERVICE_KEYWORDS = (
-    "membership", "support", "delivery", "returns", "return policy",
-    "subscription", "warranty", "installation", "consultation",
-    "service", "services", "customer support", "customer care",
-    "live chat", "financing", "insurance", "repair", "maintenance",
-    "rental", "loyalty", "rewards", "gift card", "gift cards",
-    "shipping", "exchange", "app", "helpdesk", "helpline", "booking",
-    "reservation", "consulting", "training", "onboarding",
-)
-
-PROMINENCE_HINTS = tuple(hint for tier in config.PROMINENCE_TIERS for hint in tier)
-
-_MIN_LEN, _MAX_LEN = config.MIN_CANDIDATE_LEN, config.MAX_CANDIDATE_LEN
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -61,24 +169,59 @@ HEADERS = {
     )
 }
 
-@dataclass
+
 class ProductDiscoveryResult:
-    products: List[str] = field(default_factory=list)
-    services: List[str] = field(default_factory=list)
-    scrape_targets: List[str] = field(default_factory=list)
-    discovery_method: str = "none"
-    discovery_version: str = DISCOVERY_VERSION
+    def __init__(
+        self,
+        catalogue: Optional[List[Product]] = None,
+        discovery_method: str = "none",
+        site_type: SiteType = SiteType.UNKNOWN,
+        categories: Optional[List[str]] = None,
+    ) -> None:
+        self.catalogue = catalogue or []
+        self.discovery_method = discovery_method
+        self.site_type = site_type
+        self.categories = categories or []
 
     def as_dict(self) -> Dict:
+        ranked = sorted(self.catalogue, key=lambda p: p.confidence, reverse=True)
+        product_items = [p for p in ranked if not p.is_service]
+        service_items = [p for p in ranked if p.is_service]
+
+        product_names = _unique_names(product_items)[: config.MAX_PRODUCTS]
+        service_names = _unique_names(service_items)[: config.MAX_PRODUCTS]
+
         return {
-            "products": self.products,
-            "services": self.services,
-            "scrape_targets": self.scrape_targets,
-            "products_found": len(self.products),
-            "services_found": len(self.services),
+            # --- backward-compatible keys ---
+            "products": product_names,
+            "services": service_names,
+            "scrape_targets": product_names,
+            "products_found": len(product_items),
+            "services_found": len(service_items),
             "discovery_method": self.discovery_method,
-            "discovery_version": self.discovery_version,
+            "discovery_version": DISCOVERY_VERSION,
+            # --- new, additive keys ---
+            "site_type": self.site_type.value,
+            "categories": self.categories,
+            "catalogue": [p.as_dict() for p in ranked[:MAX_CATALOGUE_SIZE]],
         }
+
+
+def _unique_names(products: List[Product]) -> List[str]:
+    seen: Set[str] = set()
+    names: List[str] = []
+    for p in products:
+        lower = p.name.lower()
+        if lower in seen:
+            continue
+        seen.add(lower)
+        names.append(p.name)
+    return names
+
+
+# --------------------------------------------------------------------------
+# Public API
+# --------------------------------------------------------------------------
 
 async def discover_products(company_data: Dict[str, str]) -> Dict:
     website = (company_data.get("website") or "").strip()
@@ -87,258 +230,196 @@ async def discover_products(company_data: Dict[str, str]) -> Dict:
     if not website:
         return ProductDiscoveryResult(discovery_method="skipped-no-website").as_dict()
 
-    candidates: List[str] = []
-    method = "none"
-
-    try:
-        candidates = await _discover_via_playwright(website)
-        if candidates:
-            method = "playwright"
-    except Exception as exc:
-        logger.info("Product discovery via Playwright failed for %s: %s", website, exc)
-        candidates = []
-
-    if len(candidates) < 3 and company_name:
-        try:
-            serp_candidates = await _discover_via_serp(company_name)
-            if serp_candidates:
-                candidates = _merge_unique(candidates, serp_candidates)
-                method = "serp" if method == "none" else f"{method}+serp"
-        except Exception as exc:
-            logger.info("Product discovery via SERP failed for %s: %s", company_name, exc)
-
-    if len(candidates) < 3:
-        try:
-            text_candidates = await _discover_via_homepage_text(website)
-            if text_candidates:
-                candidates = _merge_unique(candidates, text_candidates)
-                method = "text" if method == "none" else f"{method}+text"
-        except Exception as exc:
-            logger.info("Product discovery via homepage text failed for %s: %s", website, exc)
-
-    raw_products, services = _classify(candidates, company_name)
-
-    products = _rank_and_select(raw_products, MAX_PRODUCTS_TO_SCRAPE)
-
-    scrape_targets = products
-
-    result = ProductDiscoveryResult(
-        products=products,
-        services=services,
-        scrape_targets=scrape_targets,
-        discovery_method=method,
-    )
-    logger.info(
-        "Product discovery for %s: %d products, %d services (method=%s)",
-        company_name, len(products), len(services), method,
-    )
-    return result.as_dict()
-
-async def _discover_via_playwright(website: str) -> List[str]:
     root = _root_url(website)
+    stages_used: List[str] = []
+    registry: Dict[str, Product] = {}
+    categories_seen: List[str] = []
 
-    async def _coro() -> List[str]:
-        from playwright.async_api import async_playwright
+    # --- Cheap probe: one plain HTTP request, no browser involved --------
+    # This single request decides which of the two paths below the rest of
+    # the analysis takes. It's what keeps the HTTP-friendly case (e.g.
+    # headphonezone.in) fast: if this succeeds, Playwright is never even
+    # imported for this analysis.
+    homepage_html = await _fetch_static(root)
+    site_type = detect_site_type(homepage_html or "")
 
-        found: List[str] = []
-        seen_lower: Set[str] = set()
-
-        def _add(text: str) -> None:
-            cleaned = _clean_candidate_text(text)
-            if cleaned and cleaned.lower() not in seen_lower:
-                seen_lower.add(cleaned.lower())
-                found.append(cleaned)
-
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
-            )
-            context = await browser.new_context(
-                viewport={"width": 1440, "height": 900},
-                user_agent=HEADERS["User-Agent"],
-            )
-            page = await context.new_page()
-
-            extra_pages: List[str] = []
-            try:
-                await page.goto(root, wait_until="domcontentloaded", timeout=20000)
-                await page.wait_for_timeout(1500)
-
-                for a in await page.locator("nav a, header a").all():
-                    try:
-                        text = (await a.inner_text() or "").strip()
-                        href = await a.get_attribute("href")
-                        if not href or not text:
-                            continue
-                        if any(hint in text.lower() for hint in NAV_HINT_WORDS):
-                            full = urljoin(root, href)
-                            if full.startswith(root) and full not in extra_pages:
-                                extra_pages.append(full)
-                    except Exception:
-                        continue
-            except Exception as exc:
-                logger.info("Playwright homepage visit failed for %s: %s", root, exc)
-
-            pages_to_visit = sorted(
-                dict.fromkeys(
-                    extra_pages[:6] + [f"{root}{suffix}" for suffix in CANDIDATE_PATH_SUFFIXES]
-                ),
-                key=lambda u: 0 if "all" in u.lower() else 1,
-            )[:10]
-
-            for url in pages_to_visit:
-                if len(found) >= 60:
-                    break
-                try:
-                    await page.goto(url, wait_until="domcontentloaded", timeout=15000)
-                    await page.wait_for_timeout(1200)
-                    await _extract_from_page(page, _add)
-                except Exception:
-                    continue
-
-            if len(found) < 60:
-                try:
-                    await page.goto(root, wait_until="domcontentloaded", timeout=20000)
-                    await page.wait_for_timeout(1200)
-                    await _extract_from_page(page, _add)
-                except Exception:
-                    pass
-
-            await context.close()
-            await browser.close()
-
-        return found
-
-    try:
-        return await run_playwright_async(_coro)
-    except Exception as exc:
-        logger.info("Playwright product discovery unavailable for %s: %s", root, exc)
-        return []
-
-_PRODUCT_CARD_SELECTORS = (
-    "[class*='product-card' i]",
-    "[class*='product-item' i]",
-    "[class*='product-grid' i] [class*='title' i]",
-    "[class*='product-grid' i] a[href*='product']",
-    "[class*='grid-item' i] [class*='title' i]",
-    "li.product h2, li.product h3",
-    "li.product a.woocommerce-loop-product__link",
-    "[data-product-title]",
-    "[itemprop='name']",
-    "a[href*='/products/'] [class*='title' i]",
-    "a[href*='/products/']",
-    "a[href*='/product/']",
-)
-
-_HEADING_SELECTORS = ("h1", "h2", "h3")
-
-_EXCLUDED_ANCESTORS = (
-    "nav, header, footer, aside, [role='navigation'], "
-    "[class*='breadcrumb' i], [class*='footer' i], [class*='menu' i], "
-    "[class*='filter' i], [class*='sidebar' i], [class*='pagination' i]"
-)
-
-async def _extract_from_page(page, add_fn) -> None:
-    for sel in (*_PRODUCT_CARD_SELECTORS, *_HEADING_SELECTORS):
+    if not homepage_html:
+        # --- Playwright-driven path (blocked / bot-protected homepage) ---
+        # robots.txt -> sitemap.xml is plain XML/text and rarely sits
+        # behind the same WAF as the storefront itself, so it's still
+        # fetched over plain HTTP here; its links just seed the one
+        # browser session below rather than triggering a browser of their
+        # own.
         try:
-            locator = page.locator(sel)
-            count = min(await locator.count(), 40)
-            for i in range(count):
-                el = locator.nth(i)
-                try:
-                    if not await el.is_visible():
-                        continue
-                    inside_chrome = await el.evaluate(
-                        "(node, sel) => node.closest(sel) !== null",
-                        _EXCLUDED_ANCESTORS,
-                    )
-                    if inside_chrome:
-                        continue
-                    text = (await el.inner_text() or "").strip()
-                    if text:
-                        add_fn(text)
-                except Exception:
-                    continue
-        except Exception:
-            continue
+            seed_links = await _fetch_sitemap_category_links(root, limit=MAX_CATEGORY_PAGES)
+        except Exception as exc:
+            logger.info("Sitemap discovery failed for %s: %s", root, exc)
+            seed_links = []
+        if seed_links:
+            stages_used.append("sitemap")
 
-    try:
-        img_locator = page.locator("a[href*='/products/'] img[alt], a[href*='/product/'] img[alt]")
-        count = min(await img_locator.count(), 60)
-        for i in range(count):
-            img = img_locator.nth(i)
+        pw_registry, pw_categories, pw_site_type, _ = await _run_playwright_driven_discovery(
+            root, seed_links, rediscover_categories=True,
+        )
+        if pw_registry:
+            _ingest(registry, list(pw_registry.values()))
+            stages_used.append("playwright-rendered")
+        if pw_site_type is not SiteType.UNKNOWN:
+            site_type = pw_site_type
+        for c in pw_categories:
+            if c not in categories_seen:
+                categories_seen.append(c)
+
+    else:
+        # --- Static/HTTP path (the common, fast case) ---------------------
+        # Stage 1 + 2: homepage structured data + HTML cards.
+        _ingest(registry, parse_jsonld_products(homepage_html, root))
+        _ingest(registry, parse_html_product_cards(homepage_html, root))
+        if registry:
+            stages_used.append("jsonld" if any("jsonld" in p.source for p in registry.values()) else "html")
+
+        # Stage 3: category / collection page crawl.
+        category_links = discover_category_links(homepage_html, root, limit=MAX_CATEGORY_PAGES)
+        category_links = _merge_default_paths(root, category_links)
+
+        if category_links:
+            category_pages = await _fetch_many(category_links[:MAX_CATEGORY_PAGES])
+            for url, html in category_pages.items():
+                if not html:
+                    continue
+                category_label = parse_breadcrumb_category(html) or _guess_category_from_url(url)
+                if category_label and category_label not in categories_seen:
+                    categories_seen.append(category_label)
+                _ingest(registry, parse_jsonld_products(html, url))
+                _ingest(registry, parse_html_product_cards(html, url, category=category_label))
+            if category_pages:
+                stages_used.append("category-crawl")
+
+        # Stage 3b: sitemap.xml category discovery (spec Step 5). Only
+        # bothered with when the nav crawl left us thin, since most sites
+        # are already resolved by stage 3.
+        if _accepted_count(registry) < THIN_RESULT_THRESHOLD:
             try:
-                inside_chrome = await img.evaluate(
-                    "(node, sel) => node.closest(sel) !== null",
-                    _EXCLUDED_ANCESTORS,
+                sitemap_links = await _fetch_sitemap_category_links(root, limit=MAX_CATEGORY_PAGES)
+            except Exception as exc:
+                logger.info("Sitemap discovery failed for %s: %s", root, exc)
+                sitemap_links = []
+
+            new_links = [link for link in sitemap_links if link not in category_links]
+            if new_links:
+                sitemap_pages = await _fetch_many(new_links[:MAX_CATEGORY_PAGES])
+                got_any = False
+                for url, html in sitemap_pages.items():
+                    if not html:
+                        continue
+                    got_any = True
+                    category_label = parse_breadcrumb_category(html) or _guess_category_from_url(url)
+                    if category_label and category_label not in categories_seen:
+                        categories_seen.append(category_label)
+                    _ingest(registry, parse_jsonld_products(html, url))
+                    _ingest(registry, parse_html_product_cards(html, url, category=category_label))
+                if got_any:
+                    stages_used.append("sitemap")
+                category_links.extend(new_links)
+
+        # Stage 4: Playwright fallback - only if still thin. Homepage
+        # already rendered fine over plain HTTP, so this exists purely to
+        # catch JS-only category grids / infinite scroll. Uses the same
+        # single-session architecture as the blocked-homepage path above -
+        # one browser, launched once, closed once.
+        if _accepted_count(registry) < THIN_RESULT_THRESHOLD:
+            try:
+                pw_registry, pw_categories, _, _ = await _run_playwright_driven_discovery(
+                    root, category_links, rediscover_categories=False,
                 )
-                if inside_chrome:
-                    continue
-                alt = (await img.get_attribute("alt") or "").strip()
-                if alt:
-                    add_fn(alt)
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-async def _discover_via_serp(company_name: str) -> List[str]:
-    queries = [
-        f"{company_name} products",
-        f"{company_name} services",
-    ]
-    candidates: List[str] = []
-
-    async with httpx.AsyncClient(
-        timeout=httpx.Timeout(10.0, connect=6.0),
-        follow_redirects=True,
-        headers=HEADERS,
-        verify=False,
-    ) as client:
-
-        async def fetch(query: str) -> str:
-            try:
-                url = f"https://www.google.com/search?q={quote_plus(query)}"
-                resp = await client.get(url)
-                resp.raise_for_status()
-                return resp.text
+                if pw_registry:
+                    _ingest(registry, list(pw_registry.values()))
+                    stages_used.append("playwright")
+                for c in pw_categories:
+                    if c not in categories_seen:
+                        categories_seen.append(c)
             except Exception as exc:
-                logger.info("SERP fetch failed for %r: %s", query, exc)
-                return ""
+                logger.info("Playwright product discovery failed for %s: %s", root, exc)
 
-        pages = await asyncio.gather(*(fetch(q) for q in queries))
-
-    seen_lower: Set[str] = set()
-    for html in pages:
-        if not html:
+    # --- Stage 5: score, filter, classify ---------------------------------
+    final_catalogue: List[Product] = []
+    for product in registry.values():
+        product.score()
+        if product.confidence < MIN_CONFIDENCE:
             continue
-        soup = BeautifulSoup(html, "html.parser")
+        if not is_valid_candidate_name(product.name):
+            continue
+        product.is_service = classify_as_service(product)
+        final_catalogue.append(product)
 
-        for tag in soup.find_all(["h3", "span", "div"]):
-            text = (tag.get_text() or "").strip()
-            cleaned = _clean_candidate_text(text)
-            if cleaned and cleaned.lower() not in seen_lower and _looks_like_offering(cleaned, company_name):
-                seen_lower.add(cleaned.lower())
-                candidates.append(cleaned)
-            if len(candidates) >= 40:
-                break
+    method = "+".join(stages_used) if stages_used else "none"
+    result = ProductDiscoveryResult(
+        catalogue=final_catalogue,
+        discovery_method=method,
+        site_type=site_type,
+        categories=categories_seen,
+    )
+    payload = result.as_dict()
+    logger.info(
+        "Product discovery for %s: %d products, %d services (method=%s, site_type=%s)",
+        company_name, payload["products_found"], payload["services_found"],
+        method, site_type.value,
+    )
+    return payload
 
-    return candidates
 
-def _looks_like_offering(text: str, company_name: str) -> bool:
-    words = text.split()
-    if not (1 <= len(words) <= 6):
+# --------------------------------------------------------------------------
+# Networking helpers (plain HTTP only - no Playwright in this section)
+# --------------------------------------------------------------------------
+#
+# Many "professional" sites (Sony, Nike, Adidas, AJIO, ...) sit behind bot
+# protection that returns 401 / 403 / 429 / 503 to a plain httpx request,
+# or - even when it returns HTTP 200 - serves an interstitial "checking
+# your browser" / captcha page instead of the real markup.
+#
+# _fetch_static() detects both cases and simply returns "" for them. It
+# used to escalate to a browser right there, per-URL - that per-URL
+# escalation (a fresh browser launch for every blocked URL) was the direct
+# cause of the "browser launched many times" / 6-10 minute runtimes. That
+# responsibility now lives one level up, in discover_products(): a blocked
+# homepage hands the WHOLE analysis to _run_playwright_driven_discovery()
+# (below), which launches exactly one browser for everything that analysis
+# still needs. Sites that work over plain HTTP (e.g. HeadphoneZone) never
+# touch Playwright at all.
+
+ANTI_BOT_STATUS_CODES = {401, 403, 429, 503}
+
+# Conservative, high-precision markers for "this 200 response is actually a
+# bot-check interstitial, not the real page". Only checked against short
+# responses, since a real product/category page is essentially never this
+# small - this keeps the heuristic from ever misfiring on legitimate pages.
+ANTI_BOT_MARKERS = (
+    "checking your browser before accessing",
+    "just a moment...",
+    "cf-browser-verification",
+    "attention required! | cloudflare",
+    "enable javascript and cookies to continue",
+    "please verify you are a human",
+    "request unsuccessful. incapsula",
+    "perimeterx",
+    "you have been blocked",
+    "access denied",
+)
+ANTI_BOT_MAX_LEN = 6000
+
+
+def _looks_like_anti_bot_page(html: str) -> bool:
+    if not html or len(html) > ANTI_BOT_MAX_LEN:
         return False
-    if text.lower() == company_name.lower():
-        return False
+    lowered = html.lower()
+    return any(marker in lowered for marker in ANTI_BOT_MARKERS)
 
-    if text.endswith((".", "!", "?")) and len(words) > 4:
-        return False
-    return True
 
-async def _discover_via_homepage_text(website: str) -> List[str]:
-    root = _root_url(website)
+async def _fetch_static(url: str) -> str:
+    """Plain HTTP fetch, nothing more. Returns "" on any failure, including
+    a bot-blocked status code or an anti-bot interstitial disguised as a
+    200 - callers decide what to do about a blocked site (see
+    discover_products()); this function never launches a browser itself."""
     try:
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(10.0, connect=6.0),
@@ -346,117 +427,573 @@ async def _discover_via_homepage_text(website: str) -> List[str]:
             headers=HEADERS,
             verify=False,
         ) as client:
-            resp = await client.get(root)
+            resp = await client.get(url)
             resp.raise_for_status()
-            html = resp.text
+            text = resp.text
+            if _looks_like_anti_bot_page(text):
+                logger.info("Anti-bot challenge page detected (HTTP 200): %s", url)
+                return ""
+            return text
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+        if status in ANTI_BOT_STATUS_CODES:
+            logger.info("HTTP blocked (%d): %s", status, url)
+        else:
+            logger.info("Static fetch failed for %s: HTTP %d", url, status)
+        return ""
     except Exception as exc:
-        logger.info("Homepage text fetch failed for %s: %s", root, exc)
-        return []
+        logger.info("Static fetch failed for %s: %s", url, exc)
+        return ""
 
-    soup = BeautifulSoup(html, "html.parser")
-    candidates: List[str] = []
-    seen_lower: Set[str] = set()
 
-    for tag in soup.find_all(["h1", "h2", "h3", "h4", "li", "a"]):
-        text = (tag.get_text() or "").strip()
-        cleaned = _clean_candidate_text(text)
-        if cleaned and cleaned.lower() not in seen_lower:
-            seen_lower.add(cleaned.lower())
-            candidates.append(cleaned)
-        if len(candidates) >= 60:
+async def _fetch_many(urls: List[str]) -> Dict[str, str]:
+    semaphore = asyncio.Semaphore(config.MAX_PARALLEL_TASKS)
+
+    async def _one(url: str) -> tuple:
+        async with semaphore:
+            html = await _fetch_static(url)
+            return url, html
+
+    results = await asyncio.gather(*(_one(u) for u in urls), return_exceptions=False)
+    return {url: html for url, html in results}
+
+
+async def _fetch_sitemap_category_links(root: str, limit: int = 15) -> List[str]:
+    """Spec Step 5: robots.txt -> Sitemap: -> sitemap.xml -> category URLs.
+
+    Falls back to the conventional /sitemap.xml path if robots.txt doesn't
+    declare one (many sites omit the "Sitemap:" line but still serve the
+    file at the default location). Follows a bounded number of child
+    sitemaps if the top-level file turns out to be a sitemap index.
+    """
+    # These are plain-text/XML resources, fetched over plain HTTP only.
+    # Rendering them in a browser would hand back a syntax-highlighted DOM
+    # instead of raw text, which the sitemap/robots parsers below can't
+    # read. A WAF blocking these is also rarely solved by JS execution
+    # anyway, so there's nothing to gain by escalating here.
+    robots_txt = await _fetch_static(f"{root}/robots.txt")
+    sitemap_urls = parse_robots_sitemaps(robots_txt)
+    if not sitemap_urls:
+        sitemap_urls = [f"{root}/sitemap.xml"]
+
+    all_locs: List[str] = []
+    for sitemap_url in sitemap_urls[:MAX_SITEMAPS_TO_FOLLOW]:
+        xml_text = await _fetch_static(sitemap_url)
+        if not xml_text:
+            continue
+        locs = extract_sitemap_locs(xml_text)
+        if is_sitemap_index(xml_text):
+            child_htmls = await _fetch_many(locs[:MAX_SITEMAP_INDEX_CHILDREN])
+            for child_xml in child_htmls.values():
+                all_locs.extend(extract_sitemap_locs(child_xml))
+        else:
+            all_locs.extend(locs)
+
+    return filter_category_urls_from_sitemap(all_locs, root, limit=limit)
+
+
+def _merge_default_paths(root: str, discovered: List[str]) -> List[str]:
+    merged = list(dict.fromkeys(discovered))
+    for suffix in CANDIDATE_PATH_SUFFIXES:
+        candidate = f"{root}{suffix}"
+        if candidate not in merged:
+            merged.append(candidate)
+    return merged
+
+
+def _guess_category_from_url(url: str) -> str:
+    path = urlparse(url).path.strip("/")
+    if not path:
+        return ""
+    segment = path.split("/")[-1]
+    return segment.replace("-", " ").replace("_", " ").title()[: config.MAX_CANDIDATE_LEN]
+
+
+# ============================================================================
+# TEMPORARY DIAGNOSTICS - helper functions
+# ----------------------------------------------------------------------------
+# Called from exactly one place: _PlaywrightSession.goto_and_extract(), which
+# is itself the single choke point every rendered page passes through -
+# homepage, every discovered category page, and every ?page=N pagination
+# step (see _render_category_with_pagination and the homepage render call in
+# _run_playwright_driven_discovery). So instrumenting just that one method
+# gives full per-page coverage without touching orchestration logic.
+#
+# Read-only: these functions only ever call logger.info(...) and (on a
+# zero-product page) write a file under DEBUG_HTML_DIR. They never mutate
+# the registry, never change what discover_products() returns.
+
+def _diag_is_bot_check_page(html: str) -> bool:
+    """Looser, uncapped bot-check/captcha detector for diagnostics only.
+    (Deliberately separate from the production _looks_like_anti_bot_page()
+    above, which caps at ANTI_BOT_MAX_LEN to avoid false positives on real
+    pages - here we want to know even if a captcha snippet is buried inside
+    a large SPA payload.)"""
+    if not html:
+        return False
+    lowered = html.lower()
+    if _looks_like_anti_bot_page(html):
+        return True
+    return any(marker in lowered for marker in _DIAG_EXTRA_BOT_MARKERS)
+
+
+def _safe_filename_from_url(url: str) -> str:
+    """Turns a URL into a filesystem-safe filename fragment."""
+    parsed = urlparse(url)
+    raw = f"{parsed.netloc}{parsed.path}"
+    if parsed.query:
+        raw += f"_{parsed.query}"
+    safe = re.sub(r"[^a-zA-Z0-9._-]+", "_", raw).strip("_")
+    return (safe or "page")[:150]
+
+
+def _save_debug_html_sync(url: str, html: str) -> Optional[str]:
+    """Blocking file write - always called via asyncio.to_thread() below so
+    it can't stall page rendering for other pages in the same gather()."""
+    try:
+        os.makedirs(DEBUG_HTML_DIR, exist_ok=True)
+        base = _safe_filename_from_url(url)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        filename = f"{base}__{stamp}__{uuid.uuid4().hex[:6]}.html"
+        path = os.path.join(DEBUG_HTML_DIR, filename)
+        with open(path, "w", encoding="utf-8", errors="ignore") as f:
+            f.write(html or "")
+        return path
+    except Exception as exc:
+        logger.info("[DIAG] Failed to save debug HTML for %s: %s", url, exc)
+        return None
+
+
+async def _log_page_diagnostics(page, requested_url: str, html: str) -> None:
+    """Logs the per-page diagnostic snapshot requested for the Adidas/AJIO
+    investigation, then dumps the HTML to disk if this page's own JSON-LD +
+    HTML-card extraction came back with zero products."""
+    try:
+        final_url = page.url or requested_url
+    except Exception:
+        final_url = requested_url
+
+    status = getattr(page, "_diag_last_status", None)
+
+    try:
+        title = await page.title()
+    except Exception:
+        title = ""
+
+    html_len = len(html or "")
+
+    soup = BeautifulSoup(html or "", "html.parser")
+    all_links = soup.find_all("a", href=True)
+    num_links = len(all_links)
+
+    num_candidate_product_links = 0
+    for a in all_links:
+        try:
+            href = urljoin(final_url, a["href"])
+        except Exception:
+            continue
+        if _looks_like_product_url(href):
+            num_candidate_product_links += 1
+
+    # Re-uses the real extraction functions as-is (imported above) so these
+    # counts reflect exactly what production discovery would find on this
+    # page - no separate/duplicated heuristics to keep in sync.
+    try:
+        jsonld_products = parse_jsonld_products(html or "", final_url)
+    except Exception:
+        jsonld_products = []
+    try:
+        card_products = parse_html_product_cards(html or "", final_url)
+    except Exception:
+        card_products = []
+
+    has_jsonld_product = bool(jsonld_products)
+    num_candidate_cards = len(card_products)
+
+    lowered = (html or "").lower()
+    has_cart_cta = any(marker in lowered for marker in _ADD_TO_CART_MARKERS)
+    is_bot_check = _diag_is_bot_check_page(html or "")
+
+    logger.info(
+        "[DIAG] requested_url=%s final_url=%s http_status=%s title=%r "
+        "html_len=%d links=%d candidate_product_links=%d "
+        "candidate_product_cards=%d jsonld_product=%s add_to_cart_text=%s "
+        "bot_check_page=%s",
+        requested_url, final_url, status, title, html_len, num_links,
+        num_candidate_product_links, num_candidate_cards, has_jsonld_product,
+        has_cart_cta, is_bot_check,
+    )
+
+    total_found = num_candidate_cards + len(jsonld_products)
+    if total_found == 0:
+        saved_path = await asyncio.to_thread(_save_debug_html_sync, final_url, html or "")
+        if saved_path:
+            logger.info(
+                "[DIAG] Zero products extracted from %s - saved HTML to %s (%d bytes) for inspection.",
+                final_url, saved_path, html_len,
+            )
+# END TEMPORARY DIAGNOSTICS
+# ============================================================================
+
+
+# --------------------------------------------------------------------------
+# Playwright session (JS-rendered / bot-protected sites)
+# --------------------------------------------------------------------------
+#
+# This replaces the old per-URL browser relaunching (both the fetch-level
+# fallback and the old _discover_via_playwright). The design has exactly
+# ONE call to run_playwright_async() in this entire module -
+# _run_playwright_driven_discovery(), below - and it owns the complete
+# lifecycle of one browser for one analysis: launch, every render it will
+# ever need, then close. Nothing about a browser/context/page is ever
+# stored on a long-lived object and reused across separate
+# run_playwright_async() calls, which is what previously left Playwright
+# objects bound to an execution context that had already gone away
+# (-> 'NoneType' has no attribute 'send', Task was destroyed but pending,
+# Event loop is closed, BaseSubprocessTransport warnings).
+
+class _PlaywrightSession:
+    """One browser + one context + a small pool of reusable pages, scoped
+    to a single _run_playwright_driven_discovery() call. Must only ever be
+    created and torn down *inside* the same run_playwright_async()
+    invocation - never held across two separate calls to it."""
+
+    def __init__(self, playwright, browser, context, pages: List) -> None:
+        self._playwright = playwright
+        self._browser = browser
+        self._context = context
+        self._all_pages = pages
+        self._pool: asyncio.Queue = asyncio.Queue()
+        for page in pages:
+            self._pool.put_nowait(page)
+
+    @classmethod
+    async def launch(cls, pool_size: int = PLAYWRIGHT_POOL_SIZE) -> "_PlaywrightSession":
+        from playwright.async_api import async_playwright
+
+        logger.info("Launching Playwright (one browser for this analysis)...")
+        playwright = await async_playwright().start()
+        browser = await playwright.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+            ],
+        )
+        context = await browser.new_context(
+            viewport={"width": 1440, "height": 900},
+            user_agent=HEADERS["User-Agent"],
+            locale="en-US",
+            timezone_id="Asia/Kolkata",
+            device_scale_factor=1,
+            is_mobile=False,
+            has_touch=False,
+            extra_http_headers={
+                "Accept": (
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                    "image/webp,*/*;q=0.8"
+                ),
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+        )
+
+        # --- Stealth: reduce the headless/automation fingerprint -----------
+        # Scoped entirely to this method, per instruction. Applied once via
+        # context.add_init_script() so it runs before any page script on
+        # every page in the pool (including ones created below). Only
+        # patches the handful of properties that are the most commonly
+        # checked headless-Chromium "tells" - it does not touch the
+        # User-Agent (left unchanged as instructed), request headers,
+        # extraction logic, or diagnostics elsewhere in this file.
+        stealth_script = """
+        (() => {
+          // 1. navigator.webdriver - the single most common automation check.
+          Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+
+          // 2. window.chrome - missing/incomplete in headless Chromium by default.
+          window.chrome = window.chrome || { runtime: {} };
+
+          // 3. Permissions API - headless Chromium answers a Notification
+          //    permission query synchronously in a way that differs from a
+          //    real profile; align it with the real Notification.permission.
+          if (window.navigator.permissions && window.navigator.permissions.query) {
+            const originalQuery = window.navigator.permissions.query.bind(window.navigator.permissions);
+            window.navigator.permissions.query = (parameters) => (
+              parameters && parameters.name === 'notifications'
+                ? Promise.resolve({ state: Notification.permission })
+                : originalQuery(parameters)
+            );
+          }
+
+          // 4. navigator.plugins / mimeTypes - empty arrays in headless by default.
+          Object.defineProperty(navigator, 'plugins', {
+            get: () => [1, 2, 3, 4, 5].map(() => ({ name: 'Chrome PDF Plugin' })),
+          });
+          Object.defineProperty(navigator, 'mimeTypes', {
+            get: () => [1, 2].map(() => ({ type: 'application/pdf' })),
+          });
+
+          // 5. navigator.languages - keep consistent with the context locale.
+          Object.defineProperty(navigator, 'languages', {
+            get: () => ['en-US', 'en'],
+          });
+
+          // 6. WebGL vendor/renderer - default headless value ("Google
+          //    SwiftShader" / software rendering) is a well-known headless
+          //    tell. Report a plausible real-GPU vendor/renderer instead.
+          const patchWebGL = (proto) => {
+            if (!proto) return;
+            const originalGetParameter = proto.getParameter;
+            proto.getParameter = function (parameter) {
+              if (parameter === 37445) return 'Intel Inc.';               // UNMASKED_VENDOR_WEBGL
+              if (parameter === 37446) return 'Intel Iris OpenGL Engine'; // UNMASKED_RENDERER_WEBGL
+              return originalGetParameter.apply(this, arguments);
+            };
+          };
+          patchWebGL(window.WebGLRenderingContext && window.WebGLRenderingContext.prototype);
+          patchWebGL(window.WebGL2RenderingContext && window.WebGL2RenderingContext.prototype);
+        })();
+        """
+        await context.add_init_script(stealth_script)
+
+        pages = [await context.new_page() for _ in range(pool_size)]
+        logger.info("Playwright session ready: 1 browser, 1 context, %d pages.", pool_size)
+        return cls(playwright, browser, context, pages)
+
+
+    async def acquire_page(self):
+        """Check a page out of the pool. Blocks (does not create a new
+        page) if all pages are currently in use - this is what bounds
+        concurrency instead of a separate semaphore."""
+        return await self._pool.get()
+
+    async def release_page(self, page) -> None:
+        await self._pool.put(page)
+
+    async def render(self, url: str) -> str:
+        """Convenience wrapper: check a page out, navigate, return HTML,
+        check the page back in. Use acquire_page/release_page directly
+        instead when a caller needs the same page across several
+        navigations (e.g. pagination), to avoid checkout/release churn."""
+        page = await self.acquire_page()
+        try:
+            return await self.goto_and_extract(page, url)
+        finally:
+            await self.release_page(page)
+
+    async def goto_and_extract(self, page, url: str) -> str:
+        try:
+            response = await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+            # Stashed on the page object purely so the diagnostics block
+            # below can read it - not used anywhere in normal discovery.
+            page._diag_last_status = response.status if response else None
+            try:
+                await page.wait_for_load_state("networkidle", timeout=6000)
+            except Exception:
+                pass
+            await _auto_scroll_and_expand(page)
+            html = await page.content()
+            if DIAGNOSTICS_ENABLED:
+                try:
+                    await _log_page_diagnostics(page, url, html)
+                except Exception as diag_exc:
+                    # Diagnostics must never be able to break real discovery.
+                    logger.info("[DIAG] instrumentation failed for %s: %s", url, diag_exc)
+            return html
+        except Exception as exc:
+            logger.info("Playwright render failed for %s: %s", url, exc)
+            return ""
+
+    async def aclose(self) -> None:
+        """Closes every page, the context, the browser, and stops the
+        driver - called exactly once, from the finally block inside the
+        same run_playwright_async() call that created this session, so the
+        browser closes only after discovery has actually finished."""
+        for page in self._all_pages:
+            try:
+                await page.close()
+            except Exception:
+                pass
+        try:
+            await self._context.close()
+        except Exception:
+            pass
+        try:
+            await self._browser.close()
+        except Exception:
+            pass
+        try:
+            await self._playwright.stop()
+        except Exception:
+            pass
+        logger.info("Playwright session closed.")
+
+
+async def _render_category_with_pagination(
+    session: _PlaywrightSession,
+    url: str,
+    registry: Dict[str, Product],
+    categories_seen: List[str],
+) -> None:
+    """Renders one category/product page and walks its ?page=N pagination,
+    all on a single page checked out once from the pool (not re-acquired
+    per pagination step)."""
+    page = await session.acquire_page()
+    try:
+        html = await session.goto_and_extract(page, url)
+        if not html:
+            return
+        category_label = parse_breadcrumb_category(html) or _guess_category_from_url(url)
+        if category_label and category_label not in categories_seen:
+            categories_seen.append(category_label)
+        _ingest(registry, parse_jsonld_products(html, url))
+        _ingest(registry, parse_html_product_cards(html, url, category=category_label))
+
+        for page_num in range(2, MAX_PAGINATION_PAGES + 1):
+            if _accepted_count(registry) >= MAX_CATALOGUE_SIZE:
+                break
+            sep = "&" if "?" in url else "?"
+            paged_url = f"{url}{sep}page={page_num}"
+            paged_html = await session.goto_and_extract(page, paged_url)
+            if not paged_html:
+                break
+            new_products = parse_jsonld_products(paged_html, paged_url) + \
+                parse_html_product_cards(paged_html, paged_url, category=category_label)
+            if not new_products:
+                break
+            _ingest(registry, new_products)
+    finally:
+        await session.release_page(page)
+
+
+async def _run_playwright_driven_discovery(
+    root: str,
+    category_urls: List[str],
+    rediscover_categories: bool = False,
+) -> tuple:
+    """The ONLY call site of run_playwright_async() in this module.
+
+    Launches exactly one browser + one context for this call, renders the
+    homepage plus every relevant category/product page off a small pool of
+    reused pages (never a new page per URL, never a new browser per URL),
+    and closes the whole session before returning - so a browser never
+    outlives, and is never reused across, more than one of these calls.
+
+    rediscover_categories=True means the plain-HTTP homepage fetch never
+    even worked (403 / anti-bot), so once the homepage is rendered here,
+    navigation/category links and internal product-page links are
+    discovered straight from the *rendered* DOM (requirement 5) instead of
+    guessing paths like /products, /shop, /catalog, /store, /services -
+    those blind guesses are used only as a last-resort safety net if DOM
+    discovery still comes back empty. When False (the static pipeline just
+    came back thin), `category_urls` is already a good list from the
+    static stages and is used as-is.
+    """
+
+    async def _coro() -> tuple:
+        session: Optional[_PlaywrightSession] = None
+        try:
+            session = await _PlaywrightSession.launch()
+
+            registry: Dict[str, Product] = {}
+            categories_seen: List[str] = []
+
+            homepage_html = await session.render(root)
+            site_type = detect_site_type(homepage_html or "")
+            if homepage_html:
+                _ingest(registry, parse_jsonld_products(homepage_html, root))
+                _ingest(registry, parse_html_product_cards(homepage_html, root))
+
+            pages_to_visit = list(dict.fromkeys(category_urls))
+            if rediscover_categories:
+                nav_links = discover_category_links(homepage_html or "", root, limit=MAX_CATEGORY_PAGES)
+                pages_to_visit = list(dict.fromkeys([*nav_links, *pages_to_visit]))
+                if not pages_to_visit:
+                    # Last-resort safety net only - real nav/category links
+                    # from the rendered DOM are always tried first.
+                    pages_to_visit = _merge_default_paths(root, [])
+            pages_to_visit = pages_to_visit[:MAX_PLAYWRIGHT_PAGES]
+
+            if pages_to_visit:
+                await asyncio.gather(
+                    *(
+                        _render_category_with_pagination(session, url, registry, categories_seen)
+                        for url in pages_to_visit
+                    )
+                )
+
+            return registry, categories_seen, site_type, homepage_html
+        finally:
+            if session is not None:
+                await session.aclose()
+
+    try:
+        return await run_playwright_async(_coro)
+    except Exception as exc:
+        logger.info("Playwright-driven discovery failed for %s: %s", root, exc)
+        return {}, [], SiteType.UNKNOWN, ""
+
+
+async def _auto_scroll_and_expand(page) -> None:
+    """Scroll to trigger lazy-loaded grids and click any visible 'load more'
+    style button, up to a bounded number of rounds."""
+    load_more_selectors = (
+        "button:has-text('Load more')",
+        "button:has-text('Show more')",
+        "a:has-text('Load more')",
+        "a:has-text('Show more')",
+        "[class*=load-more i]",
+        "[class*=show-more i]",
+    )
+
+    last_height = 0
+    for _ in range(MAX_SCROLL_ROUNDS):
+        try:
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(700)
+            clicked = False
+            for sel in load_more_selectors:
+                try:
+                    locator = page.locator(sel).first
+                    if await locator.is_visible(timeout=500):
+                        await locator.click(timeout=1500)
+                        await page.wait_for_timeout(900)
+                        clicked = True
+                        break
+                except Exception:
+                    continue
+            height = await page.evaluate("document.body.scrollHeight")
+            if height == last_height and not clicked:
+                break
+            last_height = height
+        except Exception:
             break
 
-    return candidates
 
-def _classify(candidates: List[str], company_name: str) -> Tuple[List[str], List[str]]:
-    products: List[str] = []
-    services: List[str] = []
-    seen_lower: Set[str] = set()
-    company_lower = (company_name or "").lower()
+# --------------------------------------------------------------------------
+# Registry / merge helpers
+# --------------------------------------------------------------------------
 
-    for candidate in candidates:
-        lower = candidate.lower()
-        if lower in seen_lower:
+def _ingest(registry: Dict[str, Product], products: List[Product]) -> None:
+    for product in products:
+        if not is_valid_candidate_name(product.name):
             continue
-
-        if lower == company_lower or _is_blacklisted(candidate):
-            continue
-        if not (_MIN_LEN <= len(candidate) <= _MAX_LEN):
-            continue
-        seen_lower.add(lower)
-
-        if any(keyword in lower for keyword in SERVICE_KEYWORDS):
-            services.append(candidate)
+        key = product.key()
+        if key in registry:
+            registry[key].merge(product)
         else:
-            products.append(candidate)
+            registry[key] = product
 
-    return products, services
 
-def _rank_and_select(products: List[str], limit: int) -> List[str]:
-    tiers: List[List[str]] = [[] for _ in config.PROMINENCE_TIERS]
-    leftover: List[str] = []
-    seen_lower: Set[str] = set()
+def _accepted_count(registry: Dict[str, Product]) -> int:
+    count = 0
+    for product in registry.values():
+        if product.score() >= MIN_CONFIDENCE:
+            count += 1
+    return count
 
-    for item in products:
-        lower = item.lower()
-        if lower in seen_lower:
-            continue
-        seen_lower.add(lower)
-
-        placed = False
-        for tier_index, hints in enumerate(config.PROMINENCE_TIERS):
-            if any(hint in lower for hint in hints):
-                tiers[tier_index].append(item)
-                placed = True
-                break
-        if not placed:
-            leftover.append(item)
-
-    ordered = [item for tier in tiers for item in tier] + leftover
-    return ordered[:limit]
-
-def _is_blacklisted(text: str) -> bool:
-
-    lower = text.lower().strip()
-    if not lower:
-        return True
-    if lower in NOISE_TERMS:
-        return True
-    if any(word in lower for word in config.BLACKLIST_WORDS):
-        return True
-
-    if lower in config.EXACT_BADGE_TERMS:
-        return True
-    if re.fullmatch(r"#\s*\d+(\s*[-:.]?\s*(best\s?seller|new|featured|trending|hot|sale))?", lower):
-        return True
-
-    if re.search(r"\b(under|above|below)\b\s*[₹$€£]?\s*\d", lower):
-        return True
-    if re.search(r"[₹$€£]\s*\d[\d,]*\s*(?:-|–|to)\s*[₹$€£]?\s*\d", lower):
-        return True
-
-    if re.fullmatch(r"\d+", lower):
-        return True
-    return False
-
-def _clean_candidate_text(text: str) -> str:
-    text = re.sub(r"\s+", " ", (text or "")).strip(" \u2022-|·")
-    if not text:
-        return ""
-    if len(text) < _MIN_LEN or len(text) > _MAX_LEN:
-        return ""
-    if _is_blacklisted(text):
-        return ""
-    return text
-
-def _merge_unique(base: List[str], extra: List[str]) -> List[str]:
-    seen_lower = {item.lower() for item in base}
-    merged = list(base)
-    for item in extra:
-        if item.lower() not in seen_lower:
-            seen_lower.add(item.lower())
-            merged.append(item)
-    return merged
 
 def _root_url(url: str) -> str:
     parsed = urlparse(url if "://" in url else f"https://{url}")

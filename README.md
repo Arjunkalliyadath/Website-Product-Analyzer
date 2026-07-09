@@ -329,20 +329,6 @@ Website-Product-Analyzer/
 
 ---
 
-# 📈 Future Scope
-
-- Amazon Reviews Integration
-- Flipkart Reviews Integration
-- Reddit Sentiment Analysis
-- LinkedIn Mentions
-- Real-time Monitoring
-- Scheduled Reports
-- Competitor Comparison
-- Aspect-Based Sentiment Analysis
-- AI-generated Business Insights
-- Cloud Deployment
-
----
 
 # 👨‍💻 Author
 

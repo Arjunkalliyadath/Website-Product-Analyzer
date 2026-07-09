@@ -410,14 +410,6 @@ async def analyze(request: Request, company_name: str = Form(...)):
 
         export_base = Path("downloads") / f"{re.sub(r'[^a-zA-Z0-9]+', '_', company_name).strip('_').lower()}"
         export_base.mkdir(parents=True, exist_ok=True)
-
-        csv_path   = export_base / "comments.csv"
-        excel_path = export_base / "comments.xlsx"
-        json_path  = export_base / "comments.json"
-
-        df.to_csv(csv_path, index=False)
-        df.to_excel(excel_path, index=False)
-        df.to_json(json_path, orient="records", indent=2)
         _log_stage("Report Generation", time.perf_counter() - _stage_start)
 
         # Human-readable "Report Generated" stamp for the dashboard header.
@@ -490,9 +482,6 @@ async def analyze(request: Request, company_name: str = Form(...)):
                     "values": [positive, negative, neutral],
                 },
                 "summary":        summary,
-                "csv_path":       csv_path.as_posix(),
-                "excel_path":     excel_path.as_posix(),
-                "json_path":      json_path.as_posix(),
                 "pdf_path":       pdf_path_str,
                 "download_dir":   str(export_base).replace("\\", "/"),
                 "report_generated": report_generated,
@@ -536,7 +525,7 @@ async def analyze(request: Request, company_name: str = Form(...)):
                 "platform_counts": {"Google": 0, "Twitter": 0, "Instagram": 0, "YouTube": 0},
                 "chart_payload": {"labels": ["Positive", "Negative", "Neutral"], "values": [0, 0, 0]},
                 "summary":     _empty_summary,
-                "csv_path": "", "excel_path": "", "json_path": "", "pdf_path": "",
+                "pdf_path": "",
                 "download_dir": "downloads",
                 "report_generated": datetime.utcnow().strftime("%B %d, %Y at %H:%M UTC"),
             },
@@ -895,14 +884,6 @@ async def analyze_selected(
 
         export_base = Path("downloads") / f"{re.sub(r'[^a-zA-Z0-9]+', '_', company_name).strip('_').lower()}"
         export_base.mkdir(parents=True, exist_ok=True)
-
-        csv_path   = export_base / "comments.csv"
-        excel_path = export_base / "comments.xlsx"
-        json_path  = export_base / "comments.json"
-
-        df.to_csv(csv_path, index=False)
-        df.to_excel(excel_path, index=False)
-        df.to_json(json_path, orient="records", indent=2)
         _log_stage("Report Generation", time.perf_counter() - _stage_start)
 
         report_generated = datetime.utcnow().strftime("%B %d, %Y at %H:%M UTC")
@@ -973,9 +954,6 @@ async def analyze_selected(
                     "values": [positive, negative, neutral],
                 },
                 "summary":        summary,
-                "csv_path":       csv_path.as_posix(),
-                "excel_path":     excel_path.as_posix(),
-                "json_path":      json_path.as_posix(),
                 "pdf_path":       pdf_path_str,
                 "download_dir":   str(export_base).replace("\\", "/"),
                 "report_generated": report_generated,
@@ -1020,7 +998,7 @@ async def analyze_selected(
                 "platform_counts": {"Google": 0, "Twitter": 0, "Instagram": 0, "YouTube": 0},
                 "chart_payload": {"labels": ["Positive", "Negative", "Neutral"], "values": [0, 0, 0]},
                 "summary":     _empty_summary,
-                "csv_path": "", "excel_path": "", "json_path": "", "pdf_path": "",
+                "pdf_path": "",
                 "download_dir": "downloads",
                 "report_generated": datetime.utcnow().strftime("%B %d, %Y at %H:%M UTC"),
             },

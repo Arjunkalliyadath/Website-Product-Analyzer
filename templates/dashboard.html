@@ -749,14 +749,11 @@
       {% endfor %}
     </div>
 
-    {% if csv_path or excel_path or json_path or pdf_path %}
+    {% if pdf_path %}
     <div style="margin-top:1.4rem; border-top:1px solid var(--border); padding-top:1.1rem;">
       <div class="card-label">Export Data</div>
       <div class="download-row">
-        {% if csv_path %}<a class="dl-btn" href="/{{ csv_path }}">↓ CSV</a>{% endif %}
-        {% if excel_path %}<a class="dl-btn" href="/{{ excel_path }}">↓ Excel</a>{% endif %}
-        {% if json_path %}<a class="dl-btn" href="/{{ json_path }}">↓ JSON</a>{% endif %}
-        {% if pdf_path %}<a class="dl-btn" href="/{{ pdf_path }}">↓ Download PDF Report</a>{% endif %}
+        <a class="dl-btn" href="/{{ pdf_path }}">↓ 📄 Download Analysis Report</a>
       </div>
     </div>
     {% endif %}

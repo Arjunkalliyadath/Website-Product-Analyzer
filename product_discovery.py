@@ -28,19 +28,30 @@ Pipeline stages (see also product_extraction.py):
     2. Static HTML "product card" parsing (product-card/grid containers,
        anchors whose href already looks like a product URL).
     3. Category/collection page crawl - repeat stages 1+2 on discovered
-       category pages, in parallel, bounded by MAX_CATEGORY_PAGES.
+       category pages, in parallel, bounded by MAX_CATEGORY_PAGES. Nav/
+       header link discovery (product_extraction.discover_category_links)
+       is supplemented in this module by _discover_extra_category_links(),
+       which additionally scopes into mega-menu/dropdown/flyout panels and
+       footer "shop by category" widgets that a plain nav/header/[role
+       =navigation] scan can miss. Each category page also walks its own
+       ?page=N pagination over plain HTTP (see
+       _crawl_category_static_with_pagination), stopping automatically the
+       moment a page returns nothing new.
     3b. robots.txt -> Sitemap: -> sitemap.xml category discovery, used to
        widen the category list when the nav crawl (stage 3) still comes
        back thin - e.g. mega-menus that are entirely JS-rendered, or a
        site whose real category tree isn't reachable from top-nav at all.
     4. Playwright fallback for JS-rendered / bot-protected sites: scroll,
-       click "Load more", walk simple ?page=N pagination, then re-run the
-       same card extraction against the rendered DOM.
+       click "Load more", walk ?page=N pagination, and - when a site
+       paginates purely via a stateful "Next" control rather than a
+       predictable query param - fall back to clicking that control, then
+       re-run the same card extraction against the rendered DOM.
     5. De-duplication + confidence scoring + noise filtering + ranking.
 
 Playwright session architecture (stage 4):
     _fetch_static() does one plain HTTP request for the homepage - no
-    browser involved. If that comes back blocked (401/403/429/503, or a 200
+    browser involved. If that comes back blocked (401/403/429/500/502/503/
+    504, or a 200
     that is actually an anti-bot interstitial), the ENTIRE analysis for
     that site is handed to _run_playwright_driven_discovery(), which owns
     one browser + one context + a small pool of reused pages for the whole
@@ -53,6 +64,10 @@ Playwright session architecture (stage 4):
     per analysis, closed exactly once when discovery finishes. See the
     _PlaywrightSession / _run_playwright_driven_discovery docstrings below
     for why this replaced the previous per-URL browser relaunching.
+
+    A single `visited_urls` set is threaded through the static pipeline
+    (stages 3 and 3b) so a URL discovered by both the nav crawl and the
+    sitemap crawl in the same analysis is only ever fetched once.
 """
 
 from __future__ import annotations
@@ -86,6 +101,8 @@ from product_extraction import (
     parse_jsonld_products,
     parse_robots_sitemaps,
     _looks_like_product_url,  # noqa: reused as-is for diagnostics only, not modified
+    _CATEGORY_HINT_WORDS,  # noqa: reused as-is, same hint list as discover_category_links()
+    _CATEGORY_EXCLUDE_WORDS,  # noqa: reused as-is, same exclude list as discover_category_links()
 )
 
 logger = logging.getLogger(__name__)
@@ -121,7 +138,7 @@ _ADD_TO_CART_MARKERS = (
 )
 # ============================================================================
 
-DISCOVERY_VERSION = "product-discovery-v5"
+DISCOVERY_VERSION = "product-discovery-v6"
 
 # How many product pages we are willing to attempt to build the *full*
 # catalogue (spec target: "if the company sells ~60 products, attempt the
@@ -160,6 +177,35 @@ THIN_RESULT_THRESHOLD = 8
 CANDIDATE_PATH_SUFFIXES = (
     "/products", "/collections/all", "/shop", "/shop-all", "/collections",
     "/store", "/catalog", "/services", "/solutions",
+)
+
+# Additional CSS scopes checked by _discover_extra_category_links() for
+# mega-menu / dropdown / flyout submenu panels and footer "shop by
+# category" widgets - containers discover_category_links() (product_
+# extraction.py; scoped to nav/header/[role=navigation]/[class*=menu i]/
+# [class*=nav i]) does not look inside. A mega-menu panel is frequently a
+# sibling <div>, not itself a <nav>, and a footer category grid is
+# explicitly outside that function's scope, so both routinely get missed by
+# the base scan alone (Improvement 1: hidden collections / mega-menus).
+EXTRA_CATEGORY_SCOPES = (
+    "[class*=mega i]", "[class*=megamenu i]", "[class*=dropdown i]",
+    "[class*=submenu i]", "[class*=flyout i]", "[class*=nav-panel i]",
+    "footer",
+)
+
+# Best-effort "Next page" control selectors, checked by _click_next_page()
+# when a plain ?page=N URL bump doesn't surface new products - i.e. the
+# storefront paginates via a stateful control rather than a predictable
+# query param (Improvement 2: "Next Page buttons").
+_NEXT_PAGE_SELECTORS = (
+    "a[rel=next]",
+    "link[rel=next]",
+    "a[aria-label='Next']",
+    "a[aria-label*=next i]",
+    "button[aria-label*=next i]",
+    "[class*=pagination i] a:has-text('Next')",
+    "a:has-text('Next')",
+    "button:has-text('Next')",
 )
 
 HEADERS = {
@@ -235,15 +281,29 @@ async def discover_products(company_data: Dict[str, str]) -> Dict:
     registry: Dict[str, Product] = {}
     categories_seen: List[str] = []
 
+    # Tracks every URL fetched over plain HTTP during the static pipeline
+    # (stages 3 / 3b) so a link discovered by both the nav crawl and the
+    # sitemap crawl in the same analysis is never fetched twice
+    # (Improvement 7: avoid duplicate requests / crawling the same page
+    # twice). Playwright rendering is intentionally not deduped against
+    # this set - it captures JS-rendered content the static fetch cannot.
+    visited_urls: Set[str] = set()
+
     # --- Cheap probe: one plain HTTP request, no browser involved --------
     # This single request decides which of the two paths below the rest of
     # the analysis takes. It's what keeps the HTTP-friendly case (e.g.
     # headphonezone.in) fast: if this succeeds, Playwright is never even
     # imported for this analysis.
     homepage_html = await _fetch_static(root)
+    visited_urls.add(root)
     site_type = detect_site_type(homepage_html or "")
 
     if not homepage_html:
+        logger.info(
+            "Using Playwright fallback for %s: plain HTTP homepage fetch "
+            "did not return usable HTML (blocked status code or anti-bot "
+            "interstitial).", root,
+        )
         # --- Playwright-driven path (blocked / bot-protected homepage) ---
         # robots.txt -> sitemap.xml is plain XML/text and rarely sits
         # behind the same WAF as the storefront itself, so it's still
@@ -280,19 +340,36 @@ async def discover_products(company_data: Dict[str, str]) -> Dict:
 
         # Stage 3: category / collection page crawl.
         category_links = discover_category_links(homepage_html, root, limit=MAX_CATEGORY_PAGES)
+
+        # Improvement 1: mega-menu / dropdown / flyout / footer category
+        # links that discover_category_links() doesn't scope into. Purely
+        # additive - never removes anything the base scan already found.
+        extra_links = _discover_extra_category_links(
+            homepage_html, root, exclude=set(category_links), limit=MAX_CATEGORY_PAGES,
+        )
+        if extra_links:
+            logger.info(
+                "Mega-menu/footer discovery found %d additional category "
+                "link(s) for %s (nav crawl alone found %d).",
+                len(extra_links), root, len(category_links),
+            )
+            category_links = list(dict.fromkeys([*category_links, *extra_links]))
+            stages_used.append("mega-menu")
+
         category_links = _merge_default_paths(root, category_links)
 
         if category_links:
-            category_pages = await _fetch_many(category_links[:MAX_CATEGORY_PAGES])
-            for url, html in category_pages.items():
-                if not html:
-                    continue
-                category_label = parse_breadcrumb_category(html) or _guess_category_from_url(url)
-                if category_label and category_label not in categories_seen:
-                    categories_seen.append(category_label)
-                _ingest(registry, parse_jsonld_products(html, url))
-                _ingest(registry, parse_html_product_cards(html, url, category=category_label))
-            if category_pages:
+            crawl_targets = [u for u in category_links[:MAX_CATEGORY_PAGES] if u not in visited_urls]
+            semaphore = asyncio.Semaphore(config.MAX_PARALLEL_TASKS)
+            results = await asyncio.gather(
+                *(
+                    _crawl_category_static_with_pagination(
+                        url, semaphore, registry, categories_seen, visited_urls,
+                    )
+                    for url in crawl_targets
+                )
+            )
+            if any(results):
                 stages_used.append("category-crawl")
 
         # Stage 3b: sitemap.xml category discovery (spec Step 5). Only
@@ -305,20 +382,21 @@ async def discover_products(company_data: Dict[str, str]) -> Dict:
                 logger.info("Sitemap discovery failed for %s: %s", root, exc)
                 sitemap_links = []
 
-            new_links = [link for link in sitemap_links if link not in category_links]
+            new_links = [
+                link for link in sitemap_links
+                if link not in category_links and link not in visited_urls
+            ]
             if new_links:
-                sitemap_pages = await _fetch_many(new_links[:MAX_CATEGORY_PAGES])
-                got_any = False
-                for url, html in sitemap_pages.items():
-                    if not html:
-                        continue
-                    got_any = True
-                    category_label = parse_breadcrumb_category(html) or _guess_category_from_url(url)
-                    if category_label and category_label not in categories_seen:
-                        categories_seen.append(category_label)
-                    _ingest(registry, parse_jsonld_products(html, url))
-                    _ingest(registry, parse_html_product_cards(html, url, category=category_label))
-                if got_any:
+                semaphore = asyncio.Semaphore(config.MAX_PARALLEL_TASKS)
+                results = await asyncio.gather(
+                    *(
+                        _crawl_category_static_with_pagination(
+                            link, semaphore, registry, categories_seen, visited_urls,
+                        )
+                        for link in new_links[:MAX_CATEGORY_PAGES]
+                    )
+                )
+                if any(results):
                     stages_used.append("sitemap")
                 category_links.extend(new_links)
 
@@ -328,6 +406,11 @@ async def discover_products(company_data: Dict[str, str]) -> Dict:
         # single-session architecture as the blocked-homepage path above -
         # one browser, launched once, closed once.
         if _accepted_count(registry) < THIN_RESULT_THRESHOLD:
+            logger.info(
+                "Using Playwright fallback for %s: static pipeline found "
+                "only %d accepted product(s), below THIN_RESULT_THRESHOLD "
+                "(%d).", root, _accepted_count(registry), THIN_RESULT_THRESHOLD,
+            )
             try:
                 pw_registry, pw_categories, _, _ = await _run_playwright_driven_discovery(
                     root, category_links, rediscover_categories=False,
@@ -360,10 +443,25 @@ async def discover_products(company_data: Dict[str, str]) -> Dict:
         categories=categories_seen,
     )
     payload = result.as_dict()
+
+    # Improvement 8: a clear, explicit reason why discovery stopped where
+    # it did, in addition to the summary line below - useful when a run
+    # comes back thin and someone needs to know whether that's because the
+    # catalogue really is small, or because a stage was never reached.
+    accepted = len(final_catalogue) - sum(1 for p in final_catalogue if p.is_service)
+    if accepted >= MAX_CATALOGUE_SIZE:
+        stop_reason = f"reached MAX_CATALOGUE_SIZE ({MAX_CATALOGUE_SIZE})"
+    elif stages_used:
+        stop_reason = f"all applicable stages exhausted (stages_used={stages_used})"
+    else:
+        stop_reason = "no stage produced any accepted candidate"
+    logger.info("Discovery for %s stopped because: %s", root, stop_reason)
+
     logger.info(
-        "Product discovery for %s: %d products, %d services (method=%s, site_type=%s)",
+        "Product discovery for %s: %d products, %d services (method=%s, site_type=%s, "
+        "categories=%d, urls_fetched=%d)",
         company_name, payload["products_found"], payload["services_found"],
-        method, site_type.value,
+        method, site_type.value, len(categories_seen), len(visited_urls),
     )
     return payload
 
@@ -372,22 +470,26 @@ async def discover_products(company_data: Dict[str, str]) -> Dict:
 # Networking helpers (plain HTTP only - no Playwright in this section)
 # --------------------------------------------------------------------------
 #
-# Many "professional" sites (Sony, Nike, Adidas, AJIO, ...) sit behind bot
-# protection that returns 401 / 403 / 429 / 503 to a plain httpx request,
-# or - even when it returns HTTP 200 - serves an interstitial "checking
-# your browser" / captcha page instead of the real markup.
+# Many "professional" sites (Sony, Nike, Adidas, AJIO, ConceptKart, ...) sit
+# behind bot protection / transient-error responses that return
+# 401 / 403 / 429 / 500 / 502 / 503 / 504 to a plain httpx request, or -
+# even when it returns HTTP 200 - serve an interstitial "checking your
+# browser" / captcha page instead of the real markup.
 #
-# _fetch_static() detects both cases and simply returns "" for them. It
-# used to escalate to a browser right there, per-URL - that per-URL
-# escalation (a fresh browser launch for every blocked URL) was the direct
-# cause of the "browser launched many times" / 6-10 minute runtimes. That
-# responsibility now lives one level up, in discover_products(): a blocked
-# homepage hands the WHOLE analysis to _run_playwright_driven_discovery()
-# (below), which launches exactly one browser for everything that analysis
-# still needs. Sites that work over plain HTTP (e.g. HeadphoneZone) never
-# touch Playwright at all.
+# _fetch_static() detects both cases and simply returns "" for them - with
+# ZERO retries over plain HTTP once one of these status codes is seen,
+# since retrying the same blocked/erroring endpoint over and over just
+# burns time that a real browser would spend rendering the page
+# successfully instead. It used to escalate to a browser right there,
+# per-URL - that per-URL escalation (a fresh browser launch for every
+# blocked URL) was the direct cause of the "browser launched many times" /
+# 6-10 minute runtimes. That responsibility now lives one level up, in
+# discover_products(): a blocked homepage hands the WHOLE analysis to
+# _run_playwright_driven_discovery() (below), which launches exactly one
+# browser for everything that analysis still needs. Sites that work over
+# plain HTTP (e.g. HeadphoneZone) never touch Playwright at all.
 
-ANTI_BOT_STATUS_CODES = {401, 403, 429, 503}
+ANTI_BOT_STATUS_CODES = {401, 403, 429, 500, 502, 503, 504}
 
 # Conservative, high-precision markers for "this 200 response is actually a
 # bot-check interstitial, not the real page". Only checked against short
@@ -437,7 +539,10 @@ async def _fetch_static(url: str) -> str:
     except httpx.HTTPStatusError as exc:
         status = exc.response.status_code
         if status in ANTI_BOT_STATUS_CODES:
-            logger.info("HTTP blocked (%d): %s", status, url)
+            logger.info(
+                "HTTP blocked (%d) for %s - skipping HTTP entirely (no "
+                "retries) and switching to Playwright.", status, url,
+            )
         else:
             logger.info("Static fetch failed for %s: HTTP %d", url, status)
         return ""
@@ -456,6 +561,65 @@ async def _fetch_many(urls: List[str]) -> Dict[str, str]:
 
     results = await asyncio.gather(*(_one(u) for u in urls), return_exceptions=False)
     return {url: html for url, html in results}
+
+
+async def _crawl_category_static_with_pagination(
+    url: str,
+    semaphore: asyncio.Semaphore,
+    registry: Dict[str, Product],
+    categories_seen: List[str],
+    visited: Set[str],
+) -> bool:
+    """Static-HTTP counterpart to _render_category_with_pagination() below:
+    fetches one category page, then walks its ?page=N pagination over plain
+    HTTP (no browser) as long as each new page still yields products not
+    already in the registry, stopping automatically the moment a page
+    fails to load or returns nothing new, or MAX_PAGINATION_PAGES is hit
+    (Improvement 2: pagination + "stop automatically when no new products
+    appear"). Also enforces the shared `visited` de-dup set so this URL -
+    and each of its ?page=N steps - is only ever fetched once per analysis
+    (Improvement 7).
+
+    Returns True if the base URL fetch itself succeeded (used by callers
+    purely to decide whether to record the stage as "used" in
+    discovery_method - it does not gate whether products were found).
+    """
+    if url in visited:
+        return False
+    visited.add(url)
+
+    async with semaphore:
+        html = await _fetch_static(url)
+    if not html:
+        return False
+
+    category_label = parse_breadcrumb_category(html) or _guess_category_from_url(url)
+    if category_label and category_label not in categories_seen:
+        categories_seen.append(category_label)
+    _ingest(registry, parse_jsonld_products(html, url))
+    _ingest(registry, parse_html_product_cards(html, url, category=category_label))
+
+    for page_num in range(2, MAX_PAGINATION_PAGES + 1):
+        if _accepted_count(registry) >= MAX_CATALOGUE_SIZE:
+            break
+        sep = "&" if "?" in url else "?"
+        paged_url = f"{url}{sep}page={page_num}"
+        if paged_url in visited:
+            break
+        visited.add(paged_url)
+
+        async with semaphore:
+            paged_html = await _fetch_static(paged_url)
+        if not paged_html:
+            break
+
+        new_products = parse_jsonld_products(paged_html, paged_url) + \
+            parse_html_product_cards(paged_html, paged_url, category=category_label)
+        if not new_products:
+            break
+        _ingest(registry, new_products)
+
+    return True
 
 
 async def _fetch_sitemap_category_links(root: str, limit: int = 15) -> List[str]:
@@ -499,6 +663,60 @@ def _merge_default_paths(root: str, discovered: List[str]) -> List[str]:
         if candidate not in merged:
             merged.append(candidate)
     return merged
+
+
+def _discover_extra_category_links(
+    html: str,
+    page_url: str,
+    exclude: Optional[Set[str]] = None,
+    limit: int = MAX_CATEGORY_PAGES,
+) -> List[str]:
+    """Supplements product_extraction.discover_category_links() with links
+    that live inside mega-menu / dropdown / flyout panels or a footer "shop
+    by category" widget - containers the base function doesn't scope into
+    (it only looks at nav/header/[role=navigation]/[class*=menu i]/
+    [class*=nav i]). A mega-menu flyout panel is frequently rendered as a
+    sibling <div> rather than nested inside a <nav>, and footer category
+    grids are outside that function's scope entirely, so both routinely go
+    undiscovered by the base scan alone (Improvement 1). Uses the exact
+    same hint/exclude word lists as discover_category_links() so results
+    are held to the same bar - this is purely additive coverage, not a
+    looser filter.
+
+    Read-only, static BeautifulSoup parsing - never touches the network.
+    """
+    if not html:
+        return []
+    soup = BeautifulSoup(html, "html.parser")
+    root = _root_url(page_url)
+    seen: Set[str] = set(exclude or ())
+
+    found: List[str] = []
+    try:
+        scopes = soup.select(", ".join(EXTRA_CATEGORY_SCOPES))
+    except Exception:
+        return []
+
+    for scope in scopes:
+        for a in scope.find_all("a", href=True):
+            text = (a.get_text(" ", strip=True) or "").lower()
+            href = a["href"]
+            if not href or href.startswith("#") or href.startswith("javascript:"):
+                continue
+            full = urljoin(page_url, href)
+            if not full.startswith(root) or full in seen:
+                continue
+            if any(w in text for w in _CATEGORY_EXCLUDE_WORDS):
+                continue
+            if any(w in text for w in _CATEGORY_HINT_WORDS) or any(
+                w in full.lower() for w in _CATEGORY_HINT_WORDS
+            ):
+                seen.add(full)
+                found.append(full)
+                if len(found) >= limit:
+                    return found
+
+    return found
 
 
 def _guess_category_from_url(url: str) -> str:
@@ -831,15 +1049,51 @@ class _PlaywrightSession:
         logger.info("Playwright session closed.")
 
 
+async def _click_next_page(page) -> bool:
+    """Best-effort click of a "Next page" control. Used as a supplementary
+    pagination path in _render_category_with_pagination() when a plain
+    ?page=N URL bump doesn't surface any new products at all - some
+    storefronts paginate purely via a stateful "Next" control rather than a
+    predictable query param (Improvement 2). Tries each selector in
+    _NEXT_PAGE_SELECTORS in order and stops at the first one that is
+    actually visible and clickable; returns False if none are, which is
+    the normal/expected outcome for the many sites that don't paginate
+    this way."""
+    for sel in _NEXT_PAGE_SELECTORS:
+        try:
+            locator = page.locator(sel).first
+            if await locator.is_visible(timeout=500):
+                await locator.click(timeout=1500)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=6000)
+                except Exception:
+                    pass
+                return True
+        except Exception:
+            continue
+    return False
+
+
 async def _render_category_with_pagination(
     session: _PlaywrightSession,
     url: str,
     registry: Dict[str, Product],
     categories_seen: List[str],
 ) -> None:
-    """Renders one category/product page and walks its ?page=N pagination,
-    all on a single page checked out once from the pool (not re-acquired
-    per pagination step)."""
+    """Renders one category/product page and walks its pagination, all on a
+    single page checked out once from the pool (not re-acquired per
+    pagination step).
+
+    Two pagination strategies are tried, in order:
+      1. ?page=N query-param bumps (cheap, no click involved) - stops the
+         moment a page returns no HTML or no new products.
+      2. If (1) produced nothing new on its very first attempt (page 2),
+         the site likely doesn't support query-param pagination at all, so
+         fall back to clicking a "Next page" control instead
+         (_click_next_page), bounded the same way.
+    Either way, discovery stops automatically the first time a step yields
+    no new products, no HTML, or MAX_CATALOGUE_SIZE is reached.
+    """
     page = await session.acquire_page()
     try:
         html = await session.goto_and_extract(page, url)
@@ -851,9 +1105,10 @@ async def _render_category_with_pagination(
         _ingest(registry, parse_jsonld_products(html, url))
         _ingest(registry, parse_html_product_cards(html, url, category=category_label))
 
+        used_query_pagination = False
         for page_num in range(2, MAX_PAGINATION_PAGES + 1):
             if _accepted_count(registry) >= MAX_CATALOGUE_SIZE:
-                break
+                return
             sep = "&" if "?" in url else "?"
             paged_url = f"{url}{sep}page={page_num}"
             paged_html = await session.goto_and_extract(page, paged_url)
@@ -864,6 +1119,30 @@ async def _render_category_with_pagination(
             if not new_products:
                 break
             _ingest(registry, new_products)
+            used_query_pagination = True
+
+        if not used_query_pagination and _accepted_count(registry) < MAX_CATALOGUE_SIZE:
+            # ?page=N produced nothing new right away - go back to the
+            # original (unpaged) rendering and walk "Next" clicks instead.
+            html = await session.goto_and_extract(page, url)
+            if not html:
+                return
+            for _ in range(MAX_PAGINATION_PAGES - 1):
+                if _accepted_count(registry) >= MAX_CATALOGUE_SIZE:
+                    break
+                clicked = await _click_next_page(page)
+                if not clicked:
+                    break
+                await _auto_scroll_and_expand(page)
+                try:
+                    next_html = await page.content()
+                except Exception:
+                    break
+                new_products = parse_jsonld_products(next_html, page.url) + \
+                    parse_html_product_cards(next_html, page.url, category=category_label)
+                if not new_products:
+                    break
+                _ingest(registry, new_products)
     finally:
         await session.release_page(page)
 
@@ -884,8 +1163,10 @@ async def _run_playwright_driven_discovery(
     rediscover_categories=True means the plain-HTTP homepage fetch never
     even worked (403 / anti-bot), so once the homepage is rendered here,
     navigation/category links and internal product-page links are
-    discovered straight from the *rendered* DOM (requirement 5) instead of
-    guessing paths like /products, /shop, /catalog, /store, /services -
+    discovered straight from the *rendered* DOM (requirement 5) - both the
+    base nav/header scan (discover_category_links) and the mega-menu/
+    footer supplement (_discover_extra_category_links) - instead of
+    guessing paths like /products, /shop, /catalog, /store, /services;
     those blind guesses are used only as a last-resort safety net if DOM
     discovery still comes back empty. When False (the static pipeline just
     came back thin), `category_urls` is already a good list from the
@@ -909,7 +1190,15 @@ async def _run_playwright_driven_discovery(
             pages_to_visit = list(dict.fromkeys(category_urls))
             if rediscover_categories:
                 nav_links = discover_category_links(homepage_html or "", root, limit=MAX_CATEGORY_PAGES)
-                pages_to_visit = list(dict.fromkeys([*nav_links, *pages_to_visit]))
+                extra_links = _discover_extra_category_links(
+                    homepage_html or "", root, exclude=set(nav_links), limit=MAX_CATEGORY_PAGES,
+                )
+                if extra_links:
+                    logger.info(
+                        "Mega-menu/footer discovery (rendered DOM) found %d "
+                        "additional category link(s) for %s.", len(extra_links), root,
+                    )
+                pages_to_visit = list(dict.fromkeys([*nav_links, *extra_links, *pages_to_visit]))
                 if not pages_to_visit:
                     # Last-resort safety net only - real nav/category links
                     # from the rendered DOM are always tried first.

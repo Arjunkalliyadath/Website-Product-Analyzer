@@ -23,13 +23,25 @@ This module deliberately does NOT:
     - perform a Google/search-engine query
     - guess or brute-force candidate domains
     - call any AI/Gemini lookup
-    - use Playwright / headless browser rendering
     - validate/score whether a domain is "the real brand site"
 
 Everything returned comes directly from the one homepage HTML response.
 Social links are located by scanning every <a> tag (which inherently
 covers header, footer, and nav markup, since they're all part of the same
 DOM) and relevant <meta> tags, then matched against known social domains.
+
+--------------------------------------------------------------------------
+PLAYWRIGHT FALLBACK (added)
+--------------------------------------------------------------------------
+Some homepages (e.g. ConceptKart) return a blocked status code -
+403 / 429 / 500 / 502 / 503 / 504 - to a plain httpx request even though a
+real browser loads them fine. When that happens (or the plain request
+fails outright - timeout, connection reset, TLS handshake failure), this
+module makes exactly ONE follow-up attempt via a headless Playwright
+browser instead of retrying the same blocked HTTP request. No HTTP retries
+are attempted first - a blocked status code skips straight to Playwright.
+If Playwright is unavailable or also fails, the function still returns its
+normal empty-field result rather than raising.
 
 --------------------------------------------------------------------------
 BACKWARD COMPATIBILITY
@@ -91,6 +103,26 @@ _ICON_RELS = (
     "apple-touch-icon-precomposed", "mask-icon",
 )
 
+# HTTP status codes that mean "this homepage is bot-protected / erroring at
+# the edge, not actually missing" - a plain httpx request never has a
+# realistic shot at these, so we skip straight to Playwright instead of
+# retrying the same blocked request over plain HTTP.
+_BLOCKED_STATUS_CODES = {403, 429, 500, 502, 503, 504}
+
+_PW_LAUNCH_ARGS = [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-blink-features=AutomationControlled",
+]
+
+# Website metadata extraction is a one-shot call per analysis (not a
+# high-frequency scraper), so the Playwright fallback launches and tears
+# down its own browser rather than keeping a worker pool alive - contrast
+# with google/twitter/instagram/youtube scrapers, which reuse a pool of
+# browser contexts across many calls.
+_PW_NAV_TIMEOUT_MS = 15000
+
 
 # --------------------------------------------------------------------------
 # Public entry point
@@ -148,14 +180,84 @@ async def _fetch_homepage(url: str) -> "tuple[str, str]":
         ) as client:
             response = await client.get(url)
             if response.status_code >= 400:
-                logger.info(
-                    "Website metadata: %s returned HTTP %s", url, response.status_code
-                )
-                return "", str(response.url) or url
+                final_url = str(response.url) or url
+                if response.status_code in _BLOCKED_STATUS_CODES:
+                    # Bot-protected / erroring at the edge - a plain HTTP
+                    # retry has no realistic shot at succeeding here, so we
+                    # skip HTTP entirely (zero retries) and go straight to
+                    # a real browser instead.
+                    logger.info(
+                        "Website metadata: %s returned HTTP %s (bot-protected) "
+                        "- skipping HTTP retries. Using Playwright fallback.",
+                        url, response.status_code,
+                    )
+                    pw_html, pw_url = await _fetch_homepage_playwright(url)
+                    if pw_html:
+                        return pw_html, pw_url
+                else:
+                    logger.info(
+                        "Website metadata: %s returned HTTP %s", url, response.status_code
+                    )
+                return "", final_url
             return response.text, str(response.url) or url
     except Exception as exc:
         logger.warning("Website metadata: fetch failed for %s: %s", url, exc)
+        # A network-level failure (timeout, connection reset, TLS handshake
+        # failure, etc.) is also worth one Playwright attempt - a real
+        # browser handles TLS/anti-bot fingerprinting differently than a
+        # plain httpx client and can succeed where the plain request could
+        # not, without ever retrying the same plain HTTP request itself.
+        logger.info("Website metadata: %s - using Playwright fallback.", url)
+        pw_html, pw_url = await _fetch_homepage_playwright(url)
+        if pw_html:
+            return pw_html, pw_url
         return "", url
+
+
+async def _fetch_homepage_playwright(url: str) -> "tuple[str, str]":
+    """Last-resort homepage fetch via a real headless browser.
+
+    Only called when a plain HTTP request came back blocked (403 / 429 /
+    500 / 502 / 503 / 504) or failed outright. Never raises - any failure
+    here just means the caller falls back to the normal empty-field
+    result, exactly as if this function didn't exist.
+    """
+    try:
+        from playwright.async_api import async_playwright
+    except Exception as exc:
+        logger.warning(
+            "Website metadata: Playwright unavailable (%s); cannot use "
+            "the browser fallback for %s.", exc, url,
+        )
+        return "", ""
+
+    try:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(headless=True, args=_PW_LAUNCH_ARGS)
+            try:
+                context = await browser.new_context(
+                    user_agent=_HEADERS["User-Agent"],
+                    locale="en-US",
+                    viewport={"width": 1280, "height": 900},
+                )
+                page = await context.new_page()
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=_PW_NAV_TIMEOUT_MS)
+                    await page.wait_for_timeout(1000)
+                    html = await page.content()
+                    final_url = page.url or url
+                    logger.info(
+                        "Website metadata: Playwright fallback succeeded for %s.", url
+                    )
+                    return html, final_url
+                finally:
+                    await page.close()
+                    await context.close()
+            finally:
+                await browser.close()
+    except Exception as exc:
+        logger.warning("Website metadata: Playwright fallback failed for %s: %s", url, exc)
+        return "", ""
 
 
 # --------------------------------------------------------------------------

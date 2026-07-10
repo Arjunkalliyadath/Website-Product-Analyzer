@@ -14,25 +14,28 @@ if sys.platform.startswith("win"):
     except Exception:
         pass
 
-if not hasattr(ssl, "PROTOCOL_SSLv23"):
-    ssl.PROTOCOL_SSLv23 = ssl.PROTOCOL_TLS
-
-import collections
 try:
-    import collections.abc as _abc
-    for _name in ("Callable", "MutableMapping", "Mapping", "Iterable",
-                  "MutableSequence", "MappingView"):
-        if not hasattr(collections, _name) and hasattr(_abc, _name):
-            setattr(collections, _name, getattr(_abc, _name))
+    if not hasattr(ssl, "PROTOCOL_SSLv23"):
+        fallback_tls = getattr(ssl, "PROTOCOL_TLS", None)
+        if fallback_tls is None:
+            fallback_tls = getattr(ssl, "PROTOCOL_TLS_CLIENT", None)
+        if fallback_tls is not None:
+            ssl.PROTOCOL_SSLv23 = fallback_tls
 except Exception:
     pass
+
+import collections
+import collections.abc as _abc
+for _name in ("Callable", "MutableMapping", "Mapping", "Iterable",
+              "MutableSequence", "MappingView"):
+    if not hasattr(collections, _name) and hasattr(_abc, _name):
+        setattr(collections, _name, getattr(_abc, _name))
 
 import pandas as pd
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from transformers import pipeline
 
 # --- PDF report generation (reportlab only) --------------------------------
 # Purely additive: used only by generate_pdf_report() below. Does not touch
@@ -55,7 +58,7 @@ from reportlab.platypus import (
 import config
 from company_discovery import extract_website_metadata
 from product_discovery import discover_products
-from sentiment import analyze_sentiment, analyze_sentiment_batch
+from sentiment import analyze_sentiment, analyze_sentiment_batch, get_sentiment_pipeline
 from url_utils import derive_company_name, is_url, normalize_url
 from utils import clean_comment, normalize_text, remove_links, unique_comments
 from scrapers.google_scraper import scrape_google_reviews
@@ -79,27 +82,16 @@ app.mount("/downloads", StaticFiles(directory=str(DOWNLOADS_DIR)), name="downloa
 
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
-sentiment_pipeline = None
+# NOTE: sentiment-pipeline loading used to be duplicated here (a second,
+# ad-hoc `get_sentiment_pipeline()` that called `transformers.pipeline(...)`
+# directly, with its own `_patch_ssl_compatibility()` helper). That copy
+# never forced offline mode, so every analysis run paid for a real
+# HEAD-request attempt to huggingface.co (and its full retry/backoff
+# sequence) before falling back to the local cache. The single, real
+# loader — the one that actually forces offline mode and never touches the
+# network — now lives exclusively in sentiment.py and is imported above.
+# See sentiment.get_sentiment_pipeline() for the loading logic itself.
 
-def get_sentiment_pipeline():
-    global sentiment_pipeline
-    if sentiment_pipeline is None:
-        try:
-            sentiment_pipeline = pipeline(
-                "sentiment-analysis",
-                model="cardiffnlp/twitter-roberta-base-sentiment-latest",
-                tokenizer="cardiffnlp/twitter-roberta-base-sentiment-latest",
-                truncation=True,
-                max_length=512,
-            )
-            logger.info("HuggingFace sentiment pipeline loaded successfully.")
-        except Exception as exc:
-            logger.warning(
-                "HuggingFace pipeline unavailable (%s). "
-                "Keyword-based sentiment will be used instead.", exc
-            )
-            sentiment_pipeline = None
-    return sentiment_pipeline
 
 @app.get("/")
 def index(request: Request):
@@ -1522,4 +1514,4 @@ def generate_pdf_report(
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=True)
+    uvicorn.run("app:app", host="127.0.0.1", port=8001, reload=True)

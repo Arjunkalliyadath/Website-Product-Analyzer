@@ -1,0 +1,8 @@
+reason: zero_comments
+identifier: https://www.instagram.com/conceptkartofficial/
+final_url: https://www.instagram.com/conceptkartofficial/embed/
+page_title: Instagram
+embed_page_loaded: True
+profile_page_loaded: None
+login_wall_present: True
+diagnosis: no_public_comments

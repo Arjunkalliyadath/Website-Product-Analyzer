@@ -6,6 +6,8 @@ import re
 import sys
 import threading
 import time
+from difflib import SequenceMatcher
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 from scrapers.browser_utils import normalize_comments
@@ -275,9 +277,16 @@ _PLACE_RESULT_SELECTORS = [
 # elimination.
 _BUSINESS_PAGE_INDICATOR_SELECTORS = [
     # Most reliable structural indicators — present on place detail pages.
+    # NOTE: "div[role='main'] h1" was intentionally removed. The search-results
+    # page renders role="main" on its left-side panel, which contains
+    # <h1 class="fontTitleLarge IFMGgb">Results</h1> as a direct descendant.
+    # That made the selector fire as a false positive while still on the search
+    # list, causing _navigated() and the step-1.5 guard to confirm "business page"
+    # before any SPA navigation had actually occurred.  All remaining selectors
+    # below return 0 matches on the search-results page (verified against the
+    # captured debug HTML) and are therefore safe to use as business-page indicators.
     "h1.DUwDvf",
     "div.TIHn2 h1",
-    "div[role='main'] h1",
     # Tab/pill navigation bar present on every place detail page.
     "div[role='tablist']",
     # Business action buttons (address, call, etc.) are place-detail-only.
@@ -488,22 +497,54 @@ def _adaptive_nav_timeout(time_left) -> int:
 
 
 def _goto_with_retry(page, url: str, *, timeout: int, time_left, retries: int = NAV_RETRIES) -> bool:
+    # ``timeout`` is accepted for call-site compatibility but is intentionally
+    # ignored: we recompute an adaptive timeout before every attempt so that
+    # retries never ask for more time than the scraper actually has left.
     last_exc = None
-    for attempt in range(retries + 1):
-        if time_left() <= 3:
-            logger.warning("Skipping navigation to %s: out of time budget.", url)
+    total_attempts = retries + 1
+    for attempt in range(total_attempts):
+        remaining = time_left()
+        if remaining <= 3:
+            logger.warning(
+                "Skipping navigation to %s: out of time budget "
+                "(attempt=%d/%d remaining=%.1fs).",
+                url, attempt + 1, total_attempts, remaining,
+            )
             return False
+        # Recompute adaptive timeout against the *current* remaining budget,
+        # not the value frozen at call time.  This is the core fix: a failed
+        # attempt burns real wall-clock time, so each retry must recalculate
+        # rather than reuse a stale number that can now exceed what is left.
+        attempt_timeout = _adaptive_nav_timeout(time_left)
+        if attempt > 0:
+            logger.info(
+                "Google nav retry attempt=%d/%d url=%s remaining=%.1fs chosen_timeout=%dms",
+                attempt + 1, total_attempts, url, remaining, attempt_timeout,
+            )
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+            page.goto(url, wait_until="domcontentloaded", timeout=attempt_timeout)
             return True
         except Exception as exc:
             last_exc = exc
             logger.warning(
                 "Navigation attempt %d/%d to %s failed: %s",
-                attempt + 1, retries + 1, url, exc,
+                attempt + 1, total_attempts, url, exc,
             )
-            time.sleep(NAV_RETRY_BACKOFF_SECONDS * (attempt + 1))
-    logger.error("Giving up on %s after %d attempts: %s", url, retries + 1, last_exc)
+            if attempt < retries:
+                # Cap the backoff sleep to what is actually left minus the
+                # minimum guard (3 s) so we never sleep past the deadline.
+                backoff = min(
+                    NAV_RETRY_BACKOFF_SECONDS * (attempt + 1),
+                    max(0.0, time_left() - 3),
+                )
+                if backoff <= 0:
+                    logger.warning(
+                        "No time left for backoff before retry %d/%d to %s; aborting.",
+                        attempt + 2, total_attempts, url,
+                    )
+                    break
+                time.sleep(backoff)
+    logger.error("Giving up on %s after %d attempts: %s", url, total_attempts, last_exc)
     return False
 
 
@@ -840,21 +881,70 @@ def _shutdown_all_workers() -> None:
 atexit.register(_shutdown_all_workers)
 
 
-def _save_debug_artifacts(page, query: str, reason: str) -> None:
-    """Save HTML/screenshot ONLY on failure/zero-results for debugging.
-    Never on success path.
+# Evidence directory for zero-result debug captures. Lives at
+# <project_root>/debug (sibling of app.py's DOWNLOADS_DIR), since this file
+# is itself at <project_root>/scrapers/google_scraper.py.
+_DEBUG_DIR = Path(__file__).resolve().parent.parent / "debug"
+
+
+def _save_debug_artifacts(page, query: str, reason: str, extra: Dict[str, str] = None) -> None:
+    """Save HTML/screenshot/context ONLY on failure/zero-results for
+    debugging. Never on the success path.
+
+    Writes three files under ``_DEBUG_DIR``, all sharing one base name
+    stamped with date-time + milliseconds + thread id so concurrent or
+    rapid-fire failures never overwrite each other:
+      * <base>.png - screenshot
+      * <base>.html - full page HTML
+      * <base>.txt  - final URL, page title, reason, and whatever
+        selector/redirect evidence the caller passes in ``extra``
+        (e.g. which Reviews selector matched/failed, search-vs-place
+        redirect classification).
     """
     try:
-        ts = int(time.time())
-        safe_query = re.sub(r'[^a-zA-Z0-9]', '_', query)[:50]
-        base = f"debug_google_{safe_query}_{ts}"
-        page.content().encode("utf-8")  # ensure readable
-        with open(f"{base}.html", "w", encoding="utf-8") as f:
-            f.write(page.content())
-        page.screenshot(path=f"{base}.png", timeout=2000)
-        logger.warning("Saved debug artifacts for %s: %s (%s)", query, reason, base)
+        _DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+        safe_query = re.sub(r'[^a-zA-Z0-9]', '_', query)[:50].strip('_') or "unknown"
+        stamp = f"{time.strftime('%Y%m%d_%H%M%S')}_{int(time.time() * 1000) % 1000:03d}_{threading.get_ident()}"
+        base = _DEBUG_DIR / f"google_{safe_query}_{stamp}"
+
+        final_url = _safe_url(page)
+        try:
+            title = page.title()
+        except Exception:
+            title = "<unavailable>"
+
+        try:
+            page.screenshot(path=f"{base}.png", timeout=3000, full_page=True)
+        except Exception:
+            logger.warning("[GOOGLE_DEBUG] could not capture screenshot for query=%r", query)
+
+        try:
+            with open(f"{base}.html", "w", encoding="utf-8") as f:
+                f.write(page.content())
+        except Exception:
+            logger.warning("[GOOGLE_DEBUG] could not capture HTML for query=%r", query)
+
+        info = {
+            "reason": reason,
+            "query": query,
+            "final_url": final_url,
+            "page_title": title,
+        }
+        if extra:
+            info.update(extra)
+        try:
+            with open(f"{base}.txt", "w", encoding="utf-8") as f:
+                for k, v in info.items():
+                    f.write(f"{k}: {v}\n")
+        except Exception:
+            pass
+
+        logger.warning(
+            "[GOOGLE_DEBUG] saved zero-result evidence for query=%r reason=%s: %s.{png,html,txt}",
+            query, reason, base,
+        )
     except Exception:
-        pass
+        logger.exception("[GOOGLE_DEBUG] failed to save debug artifacts for query=%r", query)
 
 
 def _normalize_business_key(name: str) -> str:
@@ -907,6 +997,24 @@ def _detect_maps_layout(page, time_left) -> str:
     # Small, time-budget-aware wait - this check must stay cheap since it
     # runs before we know whether a click loop is even needed.
     budget_ms = min(2500, max(500, int(time_left() * 1000 * 0.15)))
+
+    # Multiple distinct "/maps/place/" links is an unambiguous sign that
+    # we're still looking at a multi-result search list (a real business
+    # detail page only ever links to itself, if at all). This is checked
+    # BEFORE the business-page indicators below because those indicators
+    # (e.g. div[role='tablist'] for the filter-chip row, or a rating
+    # jsaction hook on an individual result card) can also appear on the
+    # search-results page itself and were causing a real results list to
+    # be misclassified as "business_page" - which then skipped clicking
+    # into the actual business entirely and left every downstream
+    # Reviews-tab selector looking for a tab that was never on the page.
+    try:
+        place_link_count = page.locator("a[href*='/maps/place/']").count()
+    except Exception:
+        place_link_count = 0
+    if place_link_count > 1:
+        return "search_results"
+
     if _any_selector_present(page, _BUSINESS_PAGE_INDICATOR_SELECTORS, timeout=budget_ms):
         return "business_page"
     if _any_selector_present(page, _SEARCH_RESULTS_INDICATOR_SELECTORS, timeout=budget_ms):
@@ -1070,6 +1178,7 @@ def _scrape_maps(page, query: str, time_left, company_data: Dict[str, str] = Non
 
     if not _goto_with_retry(page, maps_url, timeout=_adaptive_nav_timeout(time_left), time_left=time_left):
         _log_diag(DIAG_NAV_FAILURE, query, "initial Maps navigation failed after retries")
+        _save_debug_artifacts(page, query, "nav_failure")
         return texts, False
 
     # Bumped from 1200ms: this is the initial settle wait before we start
@@ -1082,6 +1191,7 @@ def _scrape_maps(page, query: str, time_left, company_data: Dict[str, str] = Non
 
     if _bot_checked(page):
         _log_diag(DIAG_BOT_PAGE, query, "bot-check/captcha page encountered on Maps")
+        _save_debug_artifacts(page, query, "bot_check")
         return texts, True
 
     # --- Step 1: classify the page layout before assuming a results list
@@ -1109,6 +1219,127 @@ def _scrape_maps(page, query: str, time_left, company_data: Dict[str, str] = Non
         target_name = (company_data or {}).get("company_name", query) or query
         target_website = (company_data or {}).get("website", "") or ""
 
+        def _click_place_result(click_target, attempt_query: str) -> bool:
+            """Navigate to a place-result element and confirm real
+            navigation happened (URL flips from /maps/search/ to
+            /maps/place/, or the detail-page title/tablist indicators
+            appear) instead of assuming a click always lands on it.
+
+            Google's search-result card anchor (`a.hfpxzc`) already carries
+            a fully-resolved "/maps/place/..." href at scrape time, but a
+            plain `.click()` hands control to Maps' own jsaction router
+            (the anchor's click is *not* a native link follow - Maps calls
+            preventDefault() and does an internal SPA transition instead),
+            which can race the results list's virtualization or get
+            swallowed as a hover/preview instead of a navigation. Since we
+            already have the destination URL as a plain string, going
+            straight there via goto() is more reliable than depending on
+            that client-side transition to complete - so it's tried first,
+            with the click-based approach kept as a fallback for the rare
+            candidate where no real href was resolvable.
+            """
+            def _navigated() -> bool:
+                url = _safe_url(page)
+                # If the URL still contains /maps/search/ we have definitively
+                # NOT left the search-results page — return False immediately
+                # regardless of what DOM selectors match.  This is the
+                # defence-in-depth companion to removing "div[role='main'] h1"
+                # from _BUSINESS_PAGE_INDICATOR_SELECTORS: the search-results
+                # page hosts role="main" containing <h1>Results</h1>, so any
+                # descendant-h1 selector on role=main fires as a false positive
+                # while still on the search list.  Anchoring confirmation to
+                # URL state first eliminates that class of false positives.
+                if "/maps/search/" in url:
+                    return False
+                if "/maps/place/" in url:
+                    return True
+                return _any_selector_present(page, _BUSINESS_PAGE_INDICATOR_SELECTORS, timeout=1200)
+
+            try:
+                href = click_target.get_attribute("href") or ""
+            except Exception as _href_exc:
+                logger.warning(
+                    "[CPR] get_attribute('href') raised for query=%r: %s",
+                    attempt_query, _href_exc,
+                )
+                href = ""
+            logger.info(
+                "[CPR] href resolved: query=%r href=%r has_place_path=%s",
+                attempt_query, href[:200], "/maps/place/" in href,
+            )
+            if "/maps/place/" in href:
+                logger.info(
+                    "[CPR] calling _goto_with_retry: query=%r url=%r remaining=%.1fs",
+                    attempt_query, href[:200], time_left(),
+                )
+                _goto_ok = _goto_with_retry(page, href, timeout=_adaptive_nav_timeout(time_left), time_left=time_left, retries=1)
+                logger.info(
+                    "[CPR] _goto_with_retry returned %s: query=%r post_goto_url=%r",
+                    _goto_ok, attempt_query, _safe_url(page)[:200],
+                )
+                if _goto_ok:
+                    _nav_result = _navigated()
+                    logger.info(
+                        "[CPR] _navigated() after goto=%s: query=%r url=%r",
+                        _nav_result, attempt_query, _safe_url(page)[:200],
+                    )
+                    if _nav_result:
+                        return True
+                    logger.warning(
+                        "[CPR] goto succeeded but _navigated()=False: query=%r url=%r "
+                        "— falling through to click-based attempts",
+                        attempt_query, _safe_url(page)[:200],
+                    )
+                # goto() itself may have "succeeded" (page loaded) without
+                # tripping _navigated()'s checks, or may have failed outright;
+                # either way fall through to the click-based attempts below
+                # rather than giving up on this candidate.
+
+            for attempt in (1, 2):
+                logger.info(
+                    "[CPR] click attempt %d/2: query=%r pre_click_url=%r remaining=%.1fs",
+                    attempt, attempt_query, _safe_url(page)[:200], time_left(),
+                )
+                try:
+                    click_target.click(timeout=3000)
+                    logger.info(
+                        "[CPR] click() returned without exception: query=%r attempt=%d",
+                        attempt_query, attempt,
+                    )
+                except Exception as _click_exc:
+                    logger.warning(
+                        "[CPR] click() raised on attempt %d/2: query=%r exc=%s",
+                        attempt, attempt_query, _click_exc,
+                    )
+                    continue
+
+                deadline = time.monotonic() + min(4.0, max(1.5, time_left() * 0.3))
+                _poll_n = 0
+                while time.monotonic() < deadline:
+                    _poll_url = _safe_url(page)
+                    _poll_nav = _navigated()
+                    logger.info(
+                        "[CPR] post-click poll #%d attempt=%d: query=%r navigated=%s url=%r",
+                        _poll_n, attempt, attempt_query, _poll_nav, _poll_url[:200],
+                    )
+                    if _poll_nav:
+                        return True
+                    _poll_n += 1
+                    page.wait_for_timeout(300)
+
+                if attempt == 1:
+                    logger.info(
+                        "Click on place result did not navigate for "
+                        "query=%r; retrying on the same element.",
+                        attempt_query,
+                    )
+            logger.warning(
+                "[CPR] _click_place_result returning False: query=%r "
+                "all goto+click attempts exhausted final_url=%r",
+                attempt_query, _safe_url(page)[:200],
+            )
+            return False
+
         for selector in _PLACE_RESULT_SELECTORS:
             if time_left() <= 15:
                 break
@@ -1122,24 +1353,89 @@ def _scrape_maps(page, query: str, time_left, company_data: Dict[str, str] = Non
                     if time_left() <= 12:
                         break
                     try:
-                        name_el = result.locator("h1, h2, .fontHeadlineSmall, [role='heading']").first
-                        name_text = (name_el.inner_text(timeout=1000) if name_el.count() > 0 else "").strip()
-                        link = result.get_attribute("href") or ""
+                        # --- Resolve the actual navigable link for this
+                        # candidate. `result` is already the anchor when
+                        # the matched selector targets `a[...]` directly;
+                        # otherwise look for the place-link anchor nested
+                        # inside the card/article wrapper so step 3 below
+                        # can click that instead of the (non-navigating)
+                        # container. Falls back to the container itself
+                        # only if no such anchor exists in this DOM variant.
+                        if result.get_attribute("href") or "":
+                            anchor = result
+                        else:
+                            anchor = result.locator("a[href*='/maps/place/']").first
+                            if anchor.count() == 0:
+                                anchor = None
+
+                        # --- Name lookup across current Maps search-card
+                        # DOM variants. The anchor's own aria-label is the
+                        # most stable source - Maps puts the full business
+                        # name there regardless of which obfuscated class
+                        # the visible title div/span currently uses - so
+                        # it's tried first; the original heading-tag
+                        # selectors plus a couple of additional class
+                        # variants remain as fallbacks for layouts where
+                        # the aria-label is missing or generic.
+                        name_text = ""
+                        if anchor is not None:
+                            name_text = (anchor.get_attribute("aria-label") or "").strip()
+                        if not name_text:
+                            for name_sel in (
+                                "h1, h2, .fontHeadlineSmall, [role='heading']",
+                                "div.qBF1Pd, span.qBF1Pd",
+                                "div[class*='fontHeadlineSmall'], span[class*='fontHeadlineSmall']",
+                            ):
+                                name_el = result.locator(name_sel).first
+                                if name_el.count() > 0:
+                                    name_text = name_el.inner_text(timeout=1000).strip()
+                                    if name_text:
+                                        break
+
+                        link = (anchor.get_attribute("href") if anchor is not None else "") or ""
+                        if not link:
+                            link = result.get_attribute("href") or ""
+
                         score = 0
-                        if name_text and target_name.lower() in name_text.lower():
-                            score += 80
+                        if name_text:
+                            name_lower = name_text.lower()
+                            if target_name.lower() in name_lower:
+                                score += 80
+                            else:
+                                # Fuzzy fallback: a strict substring check
+                                # scores a near-match (e.g. an extra
+                                # "- Corporate Office" suffix, or minor
+                                # punctuation/spacing differences) as a
+                                # complete miss even though it's clearly
+                                # the right business.
+                                similarity = SequenceMatcher(None, target_name.lower(), name_lower).ratio()
+                                if similarity >= 0.6:
+                                    score += int(similarity * 80)
                         if target_website and target_website.lower() in link.lower():
                             score += 100
+
                         if score > best_match_score:
                             best_match_score = score
-                            result.click(timeout=3000)
-                            page.wait_for_timeout(1500)
-                            clicked_into_place = True
+                            click_target = anchor if anchor is not None else result
+                            if _click_place_result(click_target, query):
+                                clicked_into_place = True
+                                logger.info(
+                                    "Google Maps matched business: %r (score=%d) for query=%r",
+                                    name_text, score, query,
+                                )
+                                break
+                            # Click didn't actually navigate anywhere - undo
+                            # the score claim so a lower-scoring candidate
+                            # further down the list still gets a chance
+                            # instead of being blocked by a match that
+                            # never landed.
                             logger.info(
-                                "Google Maps matched business: %r (score=%d) for query=%r",
+                                "Click did not navigate to a place page for "
+                                "candidate %r (score=%d, query=%r); trying "
+                                "the next candidate instead.",
                                 name_text, score, query,
                             )
-                            break
+                            best_match_score = 0
                     except Exception:
                         continue
                 if clicked_into_place:
@@ -1175,6 +1471,47 @@ def _scrape_maps(page, query: str, time_left, company_data: Dict[str, str] = Non
                 "continuing anyway since this is still the best candidate found.",
                 best_match_score, query,
             )
+
+    # --- Step 1.5: confirm we're actually on the business detail page
+    # (title + tab bar both present) before Step 2 goes looking for the
+    # Reviews tab. Both paths above can set clicked_into_place = True
+    # without that being true - a "business_page" layout classification
+    # can be wrong, and a click can register without the resulting page
+    # having actually finished rendering. Proceeding into Step 2 in
+    # either case just burns the rest of the time budget on Reviews-tab
+    # selectors that were never going to match. ---
+    if clicked_into_place and not _any_selector_present(
+        page, _BUSINESS_PAGE_INDICATOR_SELECTORS, timeout=2500
+    ):
+        logger.warning(
+            "Expected to be on the business detail page for query=%r but "
+            "no business-page indicator (title/tablist) is present; "
+            "treating as not found instead of searching for a Reviews "
+            "tab that isn't there.",
+            query,
+        )
+        clicked_into_place = False
+        _log_diag(
+            DIAG_BUSINESS_NOT_FOUND, query,
+            "clicked_into_place was set but no business-page indicator "
+            "(title/tablist) was present on final check",
+        )
+
+    # --- Fail fast: if the business isn't on Maps at all, Steps 2-4 below
+    # (Reviews tab hunt, panel wait, scroll loop) cannot possibly succeed -
+    # there's no business page for any of them to act on. Previously we ran
+    # all of it anyway, which reliably burned 10-15s finding nothing before
+    # falling through to DIAG_ZERO_REVIEWS. That time is much better spent
+    # in the caller's search/Bing fallbacks, which - unlike Maps reviews -
+    # don't require the business to have a Maps listing at all. ---
+    if not clicked_into_place:
+        _log_diag(
+            DIAG_BUSINESS_NOT_FOUND, query,
+            "skipping Reviews-tab/panel/scroll steps - no business page to "
+            "act on; returning early so search/Bing fallbacks get the "
+            "remaining time budget instead",
+        )
+        return texts, False
 
     # --- Step 2: switch to the Reviews tab. ---
     #
@@ -1344,6 +1681,20 @@ def _scrape_maps(page, query: str, time_left, company_data: Dict[str, str] = Non
             f"layout={layout} business_found={clicked_into_place} "
             f"reviews_tab_found={reviews_tab_found} panel_ready={panel_ready} "
             f"scroll_node_count={found_count}",
+        )
+        _save_debug_artifacts(
+            page, query, "zero_reviews",
+            extra={
+                # "business_page" = Google redirected straight to the Place
+                # page; "search_results" = still sitting on the Search
+                # results list; "unknown" = neither indicator matched.
+                "maps_redirect_target": layout,
+                "business_matched": str(clicked_into_place),
+                "reviews_selector_matched": reviews_tab_selector_used or "<none>",
+                "reviews_selectors_tried": ", ".join(_REVIEWS_TAB_SELECTORS),
+                "review_panel_rendered": str(panel_ready),
+                "scroll_node_count": str(found_count),
+            },
         )
 
     return texts, False
@@ -1568,6 +1919,18 @@ async def scrape_google_reviews(company_data: Dict[str, str]) -> List[str]:
 
     # --- 2) If another job for the same business is already scraping,
     # piggyback on that instead of opening a second Maps session. ---
+    #
+    # IMPORTANT: we `asyncio.shield()` the wait here. Without it, if *this*
+    # caller gets cancelled (e.g. app.py's per-job asyncio.wait_for hits its
+    # 30s hard timeout), asyncio propagates that cancellation into whatever
+    # we're directly awaiting - which would be the SAME shared future every
+    # other piggybacking job is also awaiting. One slow job timing out would
+    # then kill the scrape for every other product in the batch, and each of
+    # those callers would receive a CancelledError instead of a result list
+    # (CancelledError isn't an Exception subclass, so it also wasn't being
+    # filtered out by the `isinstance(outcome, Exception)` checks upstream).
+    # shield() decouples "this caller stopped waiting" from "the shared work
+    # stops running".
     existing_task = _inflight_tasks.get(cache_key)
     if existing_task is not None and not existing_task.done():
         logger.info(
@@ -1577,7 +1940,15 @@ async def scrape_google_reviews(company_data: Dict[str, str]) -> List[str]:
             cache_key, query,
         )
         try:
-            return list(await existing_task)
+            return list(await asyncio.shield(existing_task))
+        except asyncio.CancelledError:
+            logger.warning(
+                "Caller for query=%r stopped waiting (its own timeout) on "
+                "shared Google Reviews scrape for %r; the scrape itself "
+                "keeps running in the background for other jobs/cache.",
+                query, cache_key,
+            )
+            return []
         except Exception:
             logger.exception("Shared Google Reviews task for %r failed.", cache_key)
             return []
@@ -1587,13 +1958,44 @@ async def scrape_google_reviews(company_data: Dict[str, str]) -> List[str]:
     loop = asyncio.get_running_loop()
     task = loop.run_in_executor(_EXECUTOR, _scrape_sync, query, company_data)
     _inflight_tasks[cache_key] = task
+
+    # Populate the cache from a done-callback rather than from the code
+    # right after `await task` below. That matters because this coroutine
+    # (the "owner") can itself be cancelled by its own caller's timeout -
+    # if caching only happened after a successful `await`, a timed-out
+    # owner would never cache anything, and every other job (including
+    # ones that arrive *after* this one, like a semaphore-delayed job)
+    # would find neither a cache entry nor a live inflight task and would
+    # be forced to start yet another full scrape from scratch.
+    def _on_scrape_done(t: "asyncio.Future", key: str = cache_key) -> None:
+        _inflight_tasks.pop(key, None)
+        if t.cancelled():
+            logger.warning(
+                "Background Google Reviews scrape for business=%r was "
+                "cancelled before completion; nothing to cache.", key,
+            )
+            return
+        exc = t.exception()
+        if exc is not None:
+            logger.error("Background Google Reviews scrape for %r failed: %s", key, exc)
+            return
+        _review_cache[key] = (time.monotonic(), list(t.result()))
+
+    task.add_done_callback(_on_scrape_done)
+
     try:
-        result = await task
+        result = await asyncio.shield(task)
+    except asyncio.CancelledError:
+        logger.warning(
+            "Caller for query=%r stopped waiting (its own timeout) on the "
+            "Google Reviews scrape it started for %r; the scrape itself "
+            "keeps running in the background and will populate the cache "
+            "for later callers.",
+            query, cache_key,
+        )
+        return []
     except Exception:
         logger.exception("Unhandled error scraping Google reviews for query=%r.", query)
-        result = []
-    finally:
-        _inflight_tasks.pop(cache_key, None)
+        return []
 
-    _review_cache[cache_key] = (time.monotonic(), list(result))
-    return result
+    return result

@@ -6,6 +6,7 @@ import re
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Dict, List
 
 from scrapers.browser_utils import normalize_comments
@@ -28,7 +29,7 @@ logger = logging.getLogger(__name__)
 # outer timeout and losing partial results. Lowered from 16 -> 12 now that
 # navigation itself fails fast (NAV_TIMEOUT_MS, NAVIGATION_RETRIES in
 # config.py).
-TIME_BUDGET_SECONDS = 12
+TIME_BUDGET_SECONDS = 17
 
 # How many candidate video URLs to gather from the channel/search page
 # before visiting them for comments. Listing videos is cheap; visiting
@@ -63,9 +64,17 @@ _CONSENT_LABELS = ("Accept all", "I agree", "Accept the use of cookies", "Reject
 _COMMENT_TEXT_SELECTOR = (
     "ytd-comment-renderer #content-text, "
     "ytd-comment-view-model #content-text, "
-    "ytd-backstage-comment #content-text"
+    "ytd-comment-view-model #content-text span, "
+    "ytd-comment-view-model .yt-core-attributed-string, "
+    "ytd-comment-view-model yt-attributed-string, "
+    "ytd-backstage-comment #content-text, "
+    "#comment #content-text, "
+    "ytd-comment-thread-renderer #content-text"
 )
-_COMMENTS_CONTAINER_SELECTOR = "ytd-comments, #comments, ytd-item-section-renderer#sections"
+_COMMENTS_CONTAINER_SELECTOR = (
+    "ytd-comments, #comments, ytd-item-section-renderer#sections, "
+    "ytd-comment-thread-renderer, ytd-comments-header-renderer"
+)
 
 # "Read more" / "more replies" controls are scoped to *inside* the comments
 # section (the leading "ytd-comments "). The unscoped selector this
@@ -75,11 +84,14 @@ _COMMENTS_CONTAINER_SELECTOR = "ytd-comments, #comments, ytd-item-section-render
 # comment, i.e. exactly the "unrelated control" failure mode to avoid.
 _READ_MORE_SELECTOR = (
     "ytd-comments ytd-expander #more, "
-    "ytd-comments tp-yt-paper-button#more"
+    "ytd-comments tp-yt-paper-button#more, "
+    "ytd-comments ytd-comment-view-model ytd-expander #more, "
+    "ytd-comments #more.ytd-expander"
 )
 _MORE_REPLIES_SELECTOR = (
     "ytd-comments ytd-comment-replies-renderer #more-replies, "
-    "ytd-comments ytd-comment-replies-renderer tp-yt-paper-button#more-replies"
+    "ytd-comments ytd-comment-replies-renderer tp-yt-paper-button#more-replies, "
+    "ytd-comments ytd-comment-replies-renderer ytd-button-renderer#more-replies"
 )
 
 _VIDEO_TILE_WAIT_SELECTOR = "a#video-title, a#video-title-link, ytd-rich-grid-renderer"
@@ -117,7 +129,7 @@ _BLOCKED_RESOURCE_TYPES = {"image", "font"}
 _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
+    "Chrome/131.0.0.0 Safari/537.36"
 )
 _LAUNCH_ARGS = ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
 
@@ -295,9 +307,25 @@ def _ensure_context():
     context = browser.new_context(
         user_agent=_USER_AGENT,
         locale="en-US",
+        viewport={"width": 1280, "height": 900},
+        java_script_enabled=True,
+        extra_http_headers={
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "sec-ch-ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+        },
     )
+    # Mask the webdriver flag that YouTube uses for bot detection
+    context.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+        window.chrome = { runtime: {} };
+    """)
     context.set_default_timeout(8000)
-    context.set_default_navigation_timeout(10000)
+    context.set_default_navigation_timeout(12000)
     _install_resource_blocking(context)
 
     handle.browser = browser
@@ -416,6 +444,74 @@ def _diagnose_blocking_state(page) -> str:
     return "rendering_failure_or_no_results"
 
 
+# Evidence directory for zero-result debug captures. Lives at
+# <project_root>/debug (sibling of app.py's DOWNLOADS_DIR), since this file
+# is itself at <project_root>/scrapers/youtube_scraper.py.
+_DEBUG_DIR = Path(__file__).resolve().parent.parent / "debug"
+
+
+def _save_debug_artifacts(page, identifier: str, reason: str, extra: Dict[str, str] = None) -> None:
+    """Save HTML/screenshot/context ONLY on failure/zero-results for
+    debugging. Never on the success path.
+
+    Writes three files under ``_DEBUG_DIR``, all sharing one base name
+    stamped with date-time + milliseconds + thread id so concurrent or
+    rapid-fire failures never overwrite each other:
+      * <base>.png - screenshot
+      * <base>.html - full page HTML
+      * <base>.txt  - final URL, page title, reason, and whatever the
+        caller passes in ``extra`` (e.g. consent-dialog appearance,
+        video-grid load status).
+    """
+    try:
+        _DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+        safe_id = re.sub(r'[^a-zA-Z0-9]', '_', identifier)[:50].strip('_') or "unknown"
+        stamp = f"{time.strftime('%Y%m%d_%H%M%S')}_{int(time.time() * 1000) % 1000:03d}_{threading.get_ident()}"
+        base = _DEBUG_DIR / f"youtube_{safe_id}_{stamp}"
+
+        try:
+            final_url = page.url or ""
+        except Exception:
+            final_url = "<unavailable>"
+        try:
+            title = page.title()
+        except Exception:
+            title = "<unavailable>"
+
+        try:
+            page.screenshot(path=f"{base}.png", timeout=3000, full_page=True)
+        except Exception:
+            logger.warning("[YOUTUBE_DEBUG] could not capture screenshot for %s", identifier)
+
+        try:
+            with open(f"{base}.html", "w", encoding="utf-8") as f:
+                f.write(page.content())
+        except Exception:
+            logger.warning("[YOUTUBE_DEBUG] could not capture HTML for %s", identifier)
+
+        info = {
+            "reason": reason,
+            "identifier": identifier,
+            "final_url": final_url,
+            "page_title": title,
+        }
+        if extra:
+            info.update(extra)
+        try:
+            with open(f"{base}.txt", "w", encoding="utf-8") as f:
+                for k, v in info.items():
+                    f.write(f"{k}: {v}\n")
+        except Exception:
+            pass
+
+        logger.warning(
+            "[YOUTUBE_DEBUG] saved zero-result evidence for %s reason=%s: %s.{png,html,txt}",
+            identifier, reason, base,
+        )
+    except Exception:
+        logger.exception("[YOUTUBE_DEBUG] failed to save debug artifacts for %s", identifier)
+
+
 def _adaptive_nav_timeout(time_left) -> int:
     """Scale the navigation timeout to how much of the internal time
     budget is actually left, instead of a fixed 5000ms for every attempt.
@@ -435,22 +531,62 @@ def _adaptive_nav_timeout(time_left) -> int:
     return int(min(NAV_TIMEOUT_MS_MAX, max(NAV_TIMEOUT_MS_MIN, remaining_ms * 0.5)))
 
 
+_YT_NAV_RETRY_BACKOFF_SECONDS = 0.75
+
+
 def _goto_with_retry(page, url: str, *, timeout: int, time_left, retries: int = NAVIGATION_RETRIES) -> bool:
+    # ``timeout`` is accepted for call-site compatibility but is intentionally
+    # ignored: we recompute an adaptive timeout before every attempt so that
+    # retries never ask for more time than the scraper actually has left.
     last_exc = None
-    for attempt in range(retries + 1):
-        if time_left() <= 3:
-            logger.warning("Skipping navigation to %s: out of time budget.", url)
+    total_attempts = retries + 1
+    for attempt in range(total_attempts):
+        remaining = time_left()
+        if remaining <= 3:
+            logger.warning(
+                "Skipping navigation to %s: out of time budget "
+                "(attempt=%d/%d remaining=%.1fs).",
+                url, attempt + 1, total_attempts, remaining,
+            )
             return False
+        # Recompute adaptive timeout against the *current* remaining budget,
+        # not the value frozen at call time.  This is the core fix: a failed
+        # attempt burns real wall-clock time, so each retry must recalculate
+        # rather than reuse a stale number that can now exceed what is left.
+        attempt_timeout = _adaptive_nav_timeout(time_left)
+        if attempt > 0:
+            logger.info(
+                "YouTube nav retry attempt=%d/%d url=%s remaining=%.1fs chosen_timeout=%dms",
+                attempt + 1, total_attempts, url, remaining, attempt_timeout,
+            )
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+            # Use "load" instead of "domcontentloaded": YouTube's comment
+            # section is bootstrapped by JS that fires during the load event,
+            # not at DOMContentLoaded. Using domcontentloaded meant we started
+            # scrolling before the comment lazy-loader JS had even been parsed.
+            page.goto(url, wait_until="load", timeout=attempt_timeout)
             return True
         except Exception as exc:
             last_exc = exc
             logger.warning(
                 "YouTube nav attempt %d/%d to %s failed: %s",
-                attempt + 1, retries + 1, url, exc,
+                attempt + 1, total_attempts, url, exc,
             )
-    logger.error("Giving up on %s after %d attempts: %s", url, retries + 1, last_exc)
+            if attempt < retries:
+                # Cap the backoff sleep to what is actually left minus the
+                # minimum guard (3 s) so we never sleep past the deadline.
+                backoff = min(
+                    _YT_NAV_RETRY_BACKOFF_SECONDS * (attempt + 1),
+                    max(0.0, time_left() - 3),
+                )
+                if backoff <= 0:
+                    logger.warning(
+                        "No time left for backoff before retry %d/%d to %s; aborting.",
+                        attempt + 2, total_attempts, url,
+                    )
+                    break
+                time.sleep(backoff)
+    logger.error("Giving up on %s after %d attempts: %s", url, total_attempts, last_exc)
     return False
 
 
@@ -670,46 +806,67 @@ def _scroll_comments_until_idle(page, time_left, remaining_budget: int) -> List[
 
     _dismiss_consent(page)
 
+    # Phase 1: Scroll down past the video player to trigger YouTube's
+    # Intersection Observer that bootstraps the comment section.
+    # YouTube only hydrates comments when #comments enters the viewport;
+    # scroll_into_view_if_needed alone is not reliable because the element
+    # may not exist yet when we call it. We do a series of timed scrolls
+    # first to let the page JS attach the container, then attempt targeting.
+    try:
+        # Quick scroll past the video description to where comments live
+        page.evaluate("window.scrollTo(0, document.documentElement.scrollHeight * 0.3)")
+        page.wait_for_timeout(600)
+        page.evaluate("window.scrollTo(0, document.documentElement.scrollHeight * 0.5)")
+        page.wait_for_timeout(600)
+    except Exception:
+        pass
+
     container_found = True
     try:
-        page.locator(_COMMENTS_CONTAINER_SELECTOR).first.scroll_into_view_if_needed(timeout=4000)
+        page.locator(_COMMENTS_CONTAINER_SELECTOR).first.scroll_into_view_if_needed(timeout=5000)
         # Nudge a little further so the container sits clearly inside the
         # viewport rather than right at its edge — YouTube's lazy comment
         # loader is keyed off actual visibility, and landing exactly on
         # the boundary has been observed to leave it un-triggered.
-        page.evaluate("window.scrollBy(0, 300)")
+        page.evaluate("window.scrollBy(0, 400)")
+        page.wait_for_timeout(400)
     except Exception:
         container_found = False
 
     if not container_found:
-        # scroll_into_view_if_needed failed, most likely because the
-        # comments container hasn't attached to the DOM yet on a
-        # slow-rendering watch page. Comments normally sit a few
-        # viewport-heights below the fold, so a few blind scrolls give
-        # YouTube's lazy loader a chance to attach the container before we
-        # conclude this video has no reachable comments at all — this is
-        # the actual fix for "idle detection concluding no comments exist"
-        # before scrolling ever reached the real comments container.
-        for _ in range(3):
+        # Container hasn't attached yet — blind scrolls to coax the lazy loader
+        for step in (1200, 1500, 1800, 2000):
             try:
-                page.evaluate("window.scrollBy(0, 1200)")
+                page.evaluate(f"window.scrollBy(0, {step})")
             except Exception:
                 break
-            page.wait_for_timeout(300)
+            page.wait_for_timeout(400)
         try:
-            page.locator(_COMMENTS_CONTAINER_SELECTOR).first.scroll_into_view_if_needed(timeout=3000)
+            page.locator(_COMMENTS_CONTAINER_SELECTOR).first.scroll_into_view_if_needed(timeout=4000)
+            page.evaluate("window.scrollBy(0, 400)")
+            page.wait_for_timeout(400)
         except Exception:
             pass
 
+    # Phase 2: Wait for at least one comment node to appear. Use a longer
+    # timeout here because YouTube's comment loader fires asynchronously
+    # after the Intersection Observer triggers — this is the most common
+    # place where comments exist but 0 are collected.
     try:
-        page.wait_for_selector(_COMMENT_TEXT_SELECTOR, timeout=6000)
+        page.wait_for_selector(_COMMENT_TEXT_SELECTOR, timeout=9000)
     except Exception:
-        reason = _classify_comment_failure(page, time_left)
-        logger.info(
-            "Comment scroll: no comments collected for this video (reason=%s).",
-            reason,
-        )
-        return comments
+        # One final aggressive scroll attempt before giving up
+        try:
+            page.evaluate("window.scrollBy(0, 600)")
+            page.wait_for_timeout(800)
+            page.wait_for_selector(_COMMENT_TEXT_SELECTOR, timeout=4000)
+        except Exception:
+            reason = _classify_comment_failure(page, time_left)
+            logger.info(
+                "Comment scroll: no comments collected for this video (reason=%s).",
+                reason,
+            )
+            return comments
 
     iteration = 0
     idle = 0
@@ -728,9 +885,9 @@ def _scroll_comments_until_idle(page, time_left, remaining_budget: int) -> List[
             page.evaluate("window.scrollBy(0, 1400)")
         except Exception:
             break
-        _wait_for_more(page, _COMMENT_TEXT_SELECTOR, max(prev_count, 0), max_ms=500)
+        _wait_for_more(page, _COMMENT_TEXT_SELECTOR, max(prev_count, 0), max_ms=800)
 
-        if iteration % 2 == 0:
+        if iteration % 3 == 0:
             _expand_comment_extras(page, time_left)
 
         try:
@@ -763,7 +920,7 @@ def _scroll_comments_until_idle(page, time_left, remaining_budget: int) -> List[
     for loc in page.locator(_COMMENT_TEXT_SELECTOR).all()[:remaining_budget]:
         try:
             txt = loc.inner_text().strip()
-            if txt and len(txt.split()) >= 4:
+            if txt and len(txt.split()) >= 2:
                 comments.append(txt)
         except Exception:
             pass
@@ -788,7 +945,7 @@ def _run_sync(company_name: str, videos_url: str) -> List[str]:
     page = None
     try:
         page = context.new_page()
-        page.set_default_timeout(8000)
+        page.set_default_timeout(12000)
 
         # The internal time budget clock starts here, only AFTER browser
         # launch, context creation, and page creation have all finished -
@@ -810,7 +967,10 @@ def _run_sync(company_name: str, videos_url: str) -> List[str]:
             return deadline - time.monotonic()
 
         video_urls: List[str] = []
+        consent_page_appeared = False
+        video_grid_loaded = False
         if _goto_with_retry(page, videos_url, timeout=_adaptive_nav_timeout(time_left), time_left=time_left):
+            consent_page_appeared = _consent_dialog_present(page)
             _dismiss_consent(page)
             # Explicitly wait for at least one video tile before scrolling,
             # instead of a fixed sleep beforehand. The previous version
@@ -822,6 +982,7 @@ def _run_sync(company_name: str, videos_url: str) -> List[str]:
             # paying a blind sleep on fast ones.
             try:
                 page.wait_for_selector(_VIDEO_TILE_WAIT_SELECTOR, timeout=6000)
+                video_grid_loaded = True
             except Exception:
                 logger.info(
                     "YouTube scrape: no video tiles rendered on %s within 6s "
@@ -891,6 +1052,17 @@ def _run_sync(company_name: str, videos_url: str) -> List[str]:
             except Exception:
                 logger.exception("Failed scraping comments for video=%s.", video_url)
                 continue
+
+        if not results:
+            _save_debug_artifacts(
+                page, videos_url, "zero_comments",
+                extra={
+                    "consent_page_appeared": str(consent_page_appeared),
+                    "video_grid_loaded": str(video_grid_loaded),
+                    "videos_found": str(len(video_urls)),
+                    "diagnosis": _diagnose_blocking_state(page),
+                },
+            )
     finally:
         if page is not None:
             try:

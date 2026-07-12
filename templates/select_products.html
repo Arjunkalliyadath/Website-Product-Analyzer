@@ -254,14 +254,13 @@
 
     <div class="product-list" id="productList">
       {% for product in products %}
-      {%- set parts = product.split('|') -%}
-      <label class="product-card" data-name="{{ product|lower }}">
+      <label class="product-card" data-name="{{ product.name|lower }}" data-product="{{ product.json }}">
         <span class="selected-badge">✓</span>
-        <input type="checkbox" class="product-checkbox" name="selected_products" form="analyzeForm" value="{{ product }}">
+        <input type="checkbox" class="product-checkbox" form="analyzeForm">
         <div class="product-info">
-          <div class="product-name">{{ parts[0].strip() }}</div>
-          {% if parts|length > 1 and parts[1].strip() %}
-          <div class="product-category">{{ parts[1].strip() }}</div>
+          <div class="product-name">{{ product.name }}</div>
+          {% if product.category %}
+          <div class="product-category">{{ product.category }}</div>
           {% endif %}
         </div>
       </label>
@@ -282,6 +281,7 @@
   </div>
   <form id="analyzeForm" method="POST" action="/analyze_selected" style="margin: 0;">
     <input type="hidden" name="website" value="{{ website }}">
+    <input type="hidden" name="selected_products" id="selectedProductsInput" value="[]">
     <button type="submit" class="btn btn-primary" id="analyzeBtn">Analyze 0 Products</button>
   </form>
 </div>
@@ -396,15 +396,31 @@
     if (e.target === modalOverlay) hideModal();
   });
 
-  // Selection state is read directly from the checkboxes at submit time —
-  // no hidden inputs are created or rebuilt anywhere. Each checkbox carries
-  // form="analyzeForm", so the browser includes checked ones in the POST
-  // natively even though they live outside the <form> element in the DOM.
+  // On submit, the full Product object (name/url/brand/image/category) for
+  // each checked card — stored in that card's data-product attribute — is
+  // collected into a single JSON array and written into the hidden
+  // "selected_products" input. The backend (analyze_selected) now receives
+  // complete Product objects instead of bare product-name strings, while
+  // checkboxes themselves stay unnamed and are never submitted directly.
+  const selectedProductsInput = document.getElementById('selectedProductsInput');
+
   form.addEventListener('submit', function (e) {
     if (countChecked() === 0) {
       e.preventDefault();
       showModal();
+      return;
     }
+    const selected = [];
+    for (let i = 0; i < cards.length; i++) {
+      if (checkboxes[i].checked) {
+        try {
+          selected.push(JSON.parse(cards[i].dataset.product));
+        } catch (err) {
+          /* skip a malformed card rather than blocking submission */
+        }
+      }
+    }
+    selectedProductsInput.value = JSON.stringify(selected);
   });
 
   refresh();

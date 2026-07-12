@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>{{ (company.company_name | default("Company")) | title }} — ManobhavaAI</title>
+  <title>{{ (product_title | default(company.company_name) | default("Product")) | title }} — Product Intelligence — ManobhavaAI</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
@@ -422,8 +422,9 @@
   </nav>
 
   <div class="company-header">
-    <div class="company-eyebrow">Analysis Report{% if company.discovery_version %}<span class="discovery-badge">{{ company.discovery_version }}</span>{% endif %}</div>
-    <div class="company-name">{{ (company.company_name | default("Company")) | title }}</div>
+    <div class="company-eyebrow">Product Intelligence Report{% if company.discovery_version %}<span class="discovery-badge">{{ company.discovery_version }}</span>{% endif %}</div>
+    <div class="company-name">{{ (product_title | default(company.company_name) | default("Product")) | title }}</div>
+    <div class="card-sub" style="color:rgba(255,255,255,.68); margin:-.55rem 0 .85rem;">{{ (company.company_name | default("Company")) | title }}{% if company.website %} · {{ company.website }}{% endif %}</div>
     <div class="company-links">
       {% if company.website %}
       <a class="company-link" href="{{ company.website }}" target="_blank">
@@ -638,6 +639,60 @@
   </div>
   {% endif %}
 
+  {%- set brand_reputation = brand_reputation | default({}, true) -%}
+  {%- set brand_gmaps = brand_reputation.google_maps | default({}, true) -%}
+  <div class="card" style="margin-bottom:1.25rem;">
+    <div class="section-title">Brand Reputation</div>
+    <p class="card-sub" style="margin:-.35rem 0 1rem;">
+      Kept separate from product sentiment above — this covers Google Maps
+      reviews and general brand-wide social mentions that aren't tied to any
+      one selected product.
+    </p>
+    <div class="grid-2" style="margin-bottom:0;">
+      <div>
+        <div class="card-label">Overall Brand Reputation Score</div>
+        <div class="score-wrap">
+          <div class="score-value">{{ brand_reputation.score | default(0) }}</div>
+          <div class="score-max">/ 100</div>
+        </div>
+        <span class="score-label {{ (brand_reputation.score_label | default("No Data")) | lower | replace(' ', '-') }}">{{ brand_reputation.score_label | default("No Data") }}</span>
+        <div class="card-sub" style="margin-top:.5rem;">{{ brand_reputation.total | default(0) }} brand-wide mention(s) across all platforms</div>
+      </div>
+      <div>
+        <div class="card-label">Google Maps Reviews</div>
+        <div class="score-wrap">
+          <div class="score-value" style="font-size:1.6rem;">{{ brand_gmaps.score | default(0) }}</div>
+          <div class="score-max">/ 100</div>
+        </div>
+        <span class="score-label {{ (brand_gmaps.score_label | default("No Data")) | lower | replace(' ', '-') }}">{{ brand_gmaps.score_label | default("No Data") }}</span>
+        <div class="card-sub" style="margin-top:.5rem;">{{ brand_gmaps.total | default(0) }} Google Maps review(s)</div>
+      </div>
+    </div>
+    {% if brand_reputation.by_platform %}
+    <table class="sentiment-table" style="margin-top:1rem;">
+      <thead>
+        <tr><th>Platform</th><th>Comments</th><th>Distribution</th><th>Score</th></tr>
+      </thead>
+      <tbody>
+        {% for label, stats in brand_reputation.by_platform.items() %}
+        <tr>
+          <td>{{ label }}</td>
+          <td>{{ stats.total }}</td>
+          <td>
+            <div class="mini-bar">
+              <div style="flex:{{ stats.positive_pct }}; background:var(--positive);"></div>
+              <div style="flex:{{ stats.negative_pct }}; background:var(--negative);"></div>
+              <div style="flex:{{ stats.neutral_pct }}; background:var(--neutral);"></div>
+            </div>
+          </td>
+          <td>{{ stats.score }} <span class="card-sub">{{ stats.score_label }}</span></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+  </div>
+
   
   <div class="card" style="margin-bottom:1.25rem;">
     <div class="section-title">Platform-wise Sentiment</div>
@@ -710,6 +765,15 @@
         <div class="exec-value exec-value--sm">{{ summary.most_mentioned_feature | default("Not enough data") }}</div>
       </div>
     </div>
+
+    {% if summary.product_summaries %}
+    <div class="insight-heading">Product-by-Product Summary</div>
+    <div class="insight-list" style="margin-bottom:1.1rem;">
+      {% for item in summary.product_summaries %}
+      <div class="insight-item"><span class="insight-icon">•</span><span><strong>{{ item.product }}:</strong> {{ item.summary }}</span></div>
+      {% endfor %}
+    </div>
+    {% endif %}
 
     {% if summary.key_insights %}
     <div class="insight-heading">Key Insights</div>

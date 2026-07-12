@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import re
 import ssl
@@ -55,6 +56,8 @@ from reportlab.platypus import (
     TableStyle,
 )
 
+from dataclasses import dataclass, asdict
+
 import config
 from company_discovery import extract_website_metadata
 from product_discovery import discover_products
@@ -68,6 +71,67 @@ from scrapers.youtube_scraper import scrape_youtube_comments
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# Product-centric selection model
+# ----------------------------------------------------------------------------
+# Everything downstream of Product Discovery now revolves around this object
+# instead of a bare product-name string. select_products.html serializes one
+# of these (as JSON) per checked card; analyze_selected() parses them back
+# into SelectedProduct instances so every future scraper can be handed the
+# full object (name/url/brand/image/category) instead of just a name.
+# ============================================================================
+@dataclass
+class SelectedProduct:
+    name: str
+    url: str = ""
+    brand: str = ""
+    image: str = ""
+    category: str = ""
+
+    def as_dict(self) -> Dict[str, str]:
+        return asdict(self)
+
+
+def _parse_selected_products(raw: str) -> List[SelectedProduct]:
+    """Parse the JSON array of product objects posted by select_products.html.
+
+    Accepts a JSON list of objects shaped like:
+        {"name": "...", "url": "...", "brand": "...", "image": "...", "category": "..."}
+    De-duplicates by URL (falling back to name when a product has no URL) and
+    drops any entry without at least a name.
+    """
+    try:
+        parsed = json.loads(raw) if raw else []
+    except (TypeError, ValueError):
+        logger.warning("selected_products payload was not valid JSON; ignoring it.")
+        parsed = []
+
+    if not isinstance(parsed, list):
+        parsed = []
+
+    products: List[SelectedProduct] = []
+    seen: set = set()
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        name = (item.get("name") or "").strip()
+        if not name:
+            continue
+        url = (item.get("url") or "").strip()
+        dedupe_key = url.lower() if url else f"name:{name.lower()}"
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        products.append(SelectedProduct(
+            name=name,
+            url=url,
+            brand=(item.get("brand") or "").strip(),
+            image=(item.get("image") or "").strip(),
+            category=(item.get("category") or "").strip(),
+        ))
+    return products
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
@@ -268,6 +332,16 @@ async def analyze(request: Request, company_name: str = Form(...)):
                         job.get("label"), GOOGLE_JOB_TIMEOUT_SECONDS,
                     )
                     return []
+                except asyncio.CancelledError:
+                    # Defense-in-depth: scrape_google_reviews() already shields
+                    # the shared background scrape from any single caller's
+                    # cancellation and swallows this itself, but we catch it
+                    # here too so a CancelledError can never reach
+                    # asyncio.gather()'s results list below - it isn't an
+                    # Exception subclass, so isinstance(outcome, Exception)
+                    # would otherwise miss it and crash on list(outcome).
+                    logger.warning("Google Reviews job for %r was cancelled", job.get("label"))
+                    return []
                 except Exception:
                     logger.exception("Google Reviews job for %r failed", job.get("label"))
                     return []
@@ -300,7 +374,7 @@ async def analyze(request: Request, company_name: str = Form(...)):
         google_by_product: List[Dict[str, Any]] = []
         google_all_comments: List[str] = []
         for job, outcome in zip(google_jobs, google_results):
-            comments = list(outcome) if not isinstance(outcome, Exception) else []
+            comments = list(outcome) if not isinstance(outcome, BaseException) else []
 
             comments = comments[:config.MAX_COMMENTS_PER_PRODUCT]
             google_by_product.append({"product": job["label"], "comments": comments})
@@ -308,9 +382,9 @@ async def analyze(request: Request, company_name: str = Form(...)):
 
         platform_comments = {
             "Google":    google_all_comments,
-            "Twitter":   list(twitter_comments)   if not isinstance(twitter_comments,   Exception) else [],
-            "Instagram": list(instagram_comments) if not isinstance(instagram_comments, Exception) else [],
-            "YouTube":   list(youtube_comments)   if not isinstance(youtube_comments,   Exception) else [],
+            "Twitter":   list(twitter_comments)   if not isinstance(twitter_comments,   BaseException) else [],
+            "Instagram": list(instagram_comments) if not isinstance(instagram_comments, BaseException) else [],
+            "YouTube":   list(youtube_comments)   if not isinstance(youtube_comments,   BaseException) else [],
         }
 
         comment_product_lookup: Dict[str, str] = {}
@@ -357,19 +431,27 @@ async def analyze(request: Request, company_name: str = Form(...)):
         if df.empty:
             df = pd.DataFrame(columns=["comment", "platform", "sentiment", "product", "timestamp"])
 
-        positive = int((df["sentiment"] == "positive").sum()) if "sentiment" in df.columns else 0
-        negative = int((df["sentiment"] == "negative").sum()) if "sentiment" in df.columns else 0
-        neutral  = int((df["sentiment"] == "neutral").sum())  if "sentiment" in df.columns else 0
-        total    = len(df)
+        # --- Product Intelligence split -------------------------------
+        # product_rows: comments tied to one of the user's selected products.
+        # brand_rows: everything else (base Google Maps/business search +
+        # all Twitter/Instagram/YouTube comments, none of which are scraped
+        # per-product) — this becomes the separate Brand Reputation block
+        # instead of being blended into product-centric metrics.
+        product_rows, brand_rows = _split_product_and_brand_rows(comment_rows)
 
-        positive_pct = round((positive / total) * 100, 1) if total else 0.0
-        negative_pct = round((negative / total) * 100, 1) if total else 0.0
-        neutral_pct  = round((neutral  / total) * 100, 1) if total else 0.0
+        overall_stats = _compute_overall_stats(product_rows)
+        positive, negative, neutral, total = (
+            overall_stats["positive"], overall_stats["negative"],
+            overall_stats["neutral"], overall_stats["total"],
+        )
+        positive_pct, negative_pct, neutral_pct = (
+            overall_stats["positive_pct"], overall_stats["negative_pct"], overall_stats["neutral_pct"],
+        )
+        brand_score, brand_label = overall_stats["score"], overall_stats["score_label"]
 
-        brand_score, brand_label = _compute_brand_score(positive, negative, neutral, total)
-
-        product_sentiment = _aggregate_by_key(comment_rows, "product")
-        platform_sentiment = _aggregate_by_key(comment_rows, "platform")
+        product_sentiment = _aggregate_by_key(product_rows, "product")
+        platform_sentiment = _aggregate_by_key(product_rows, "platform")
+        brand_reputation = _aggregate_brand_reputation(brand_rows)
 
         real_products = {k: v for k, v in product_sentiment.items() if k != "General"}
         top_positive_product = (
@@ -388,7 +470,7 @@ async def analyze(request: Request, company_name: str = Form(...)):
 
         summary = generate_summary(
             company_name=company_name,
-            comment_rows=comment_rows,
+            comment_rows=product_rows,
             brand_score=brand_score,
             brand_label=brand_label,
             products_scraped=len(scrape_targets),
@@ -396,9 +478,16 @@ async def analyze(request: Request, company_name: str = Form(...)):
             most_discussed_product=most_discussed_product,
             top_positive_product=top_positive_product,
             top_negative_product=top_negative_product,
+            selected_products=scrape_targets,
+            product_sentiment=product_sentiment,
+            brand_reputation=brand_reputation,
         )
 
-        insight_tabs = _build_insight_tabs(comment_rows, platform_comments)
+        insight_tabs = _build_insight_tabs(product_rows, platform_comments)
+
+        # Title shown on the dashboard/PDF: the selected product names,
+        # not the company name (Product Intelligence, not Company Sentiment).
+        product_title = ", ".join(scrape_targets) if scrape_targets else company_name
 
         export_base = Path("downloads") / f"{re.sub(r'[^a-zA-Z0-9]+', '_', company_name).strip('_').lower()}"
         export_base.mkdir(parents=True, exist_ok=True)
@@ -434,6 +523,8 @@ async def analyze(request: Request, company_name: str = Form(...)):
                 products_scraped=len(scrape_targets),
                 report_generated=report_generated,
                 pdf_path=export_base / "report.pdf",
+                brand_reputation=brand_reputation,
+                product_title=product_title,
             )
             pdf_path_str = pdf_path.as_posix()
         except Exception:
@@ -445,6 +536,7 @@ async def analyze(request: Request, company_name: str = Form(...)):
             name="dashboard.html",
             context={
                 "company":          company_data,
+                "product_title":    product_title,
                 "products":         product_data.get("products", []),
                 "services":         product_data.get("services", []),
                 "products_found":   product_data.get("products_found", 0),
@@ -458,6 +550,7 @@ async def analyze(request: Request, company_name: str = Form(...)):
                 "brand_label":      brand_label,
                 "product_sentiment": product_sentiment,
                 "platform_sentiment": platform_sentiment,
+                "brand_reputation": brand_reputation,
                 "platform_comments": platform_comments,
                 "comments":         comment_rows,
                 "insight_tabs":     insight_tabs,
@@ -496,12 +589,24 @@ async def analyze(request: Request, company_name: str = Form(...)):
             "top_complaints":          [],
             "top_positive_topics":     [],
             "recommendations":         [],
+            "product_summaries":       [],
+            "brand_reputation_summary": "No brand-wide (non-product) reviews were collected for this run.",
+        }
+        _empty_brand_reputation = {
+            "positive": 0, "negative": 0, "neutral": 0, "total": 0,
+            "positive_pct": 0.0, "negative_pct": 0.0, "neutral_pct": 0.0,
+            "score": 0, "score_label": "No Data",
+            "by_platform": {},
+            "google_maps": {"positive": 0, "negative": 0, "neutral": 0, "total": 0,
+                             "positive_pct": 0.0, "negative_pct": 0.0, "neutral_pct": 0.0,
+                             "score": 0, "score_label": "No Data"},
         }
         return templates.TemplateResponse(
             request=request,
             name="dashboard.html",
             context={
                 "company":          {"company_name": company_name},
+                "product_title":    company_name,
                 "products": [], "services": [],
                 "products_found": 0, "services_found": 0, "products_scraped": 0,
                 "reviews_collected": 0,
@@ -509,6 +614,7 @@ async def analyze(request: Request, company_name: str = Form(...)):
                 "most_discussed_product": "",
                 "brand_score": 0, "brand_label": "No Data",
                 "product_sentiment": {}, "platform_sentiment": {},
+                "brand_reputation": _empty_brand_reputation,
                 "platform_comments": {"Google": [], "Twitter": [], "Instagram": [], "YouTube": []},
                 "comments":         [],
                 "insight_tabs":     {"top_positive": [], "top_negative": [], "by_platform": {}, "sample": []},
@@ -583,7 +689,33 @@ async def discover_products_endpoint(request: Request, company_name: str = Form(
         logger.info("Website metadata resolved (manual discovery): %s", company_data)
 
         product_data = await discover_products(company_data)
-        products = product_data.get("products", [])
+
+        # --- Product-URL-centric discovery output ------------------------
+        # discover_products() already builds a full catalogue (name, url,
+        # image, brand, category, ...) internally; previously only bare
+        # product-name strings were forwarded to select_products.html. Now
+        # each discovered product keeps its URL (and image/brand/category)
+        # all the way through to the selection screen, ranked the same way
+        # (by confidence, capped at config.MAX_PRODUCTS) as the old
+        # `products` name list was.
+        catalogue = product_data.get("catalogue", [])
+        products = []
+        for item in catalogue:
+            if item.get("is_service") or not item.get("name"):
+                continue
+            product_obj = {
+                "name": item.get("name", ""),
+                "url": item.get("url", ""),
+                "brand": item.get("brand", ""),
+                "image": item.get("image", ""),
+                "category": item.get("category", ""),
+            }
+            # Pre-serialized once here (plain Jinja2 has no built-in `tojson`
+            # filter) so select_products.html can drop it straight into a
+            # data-product="" attribute and JSON.parse it back on submit.
+            product_obj["json"] = json.dumps(product_obj, ensure_ascii=True)
+            products.append(product_obj)
+        products = products[: config.MAX_PRODUCTS]
 
         logger.info(
             "Manual product discovery: %d products, %d services found (method=%s)",
@@ -618,7 +750,7 @@ async def discover_products_endpoint(request: Request, company_name: str = Form(
 async def analyze_selected(
     request: Request,
     website: str = Form(...),
-    selected_products: List[str] = Form(...),
+    selected_products: str = Form(...),
 ):
     # === Performance profiling instrumentation (mirrors /analyze) =========
     pipeline_start = time.perf_counter()
@@ -665,14 +797,15 @@ async def analyze_selected(
     website = website.strip()
     company_name = website  # fallback label until metadata resolves below
 
-    # De-duplicate / clean the checkbox selections posted from select_products.html
-    scrape_targets: List[str] = []
-    seen = set()
-    for product in selected_products:
-        product = (product or "").strip()
-        if product and product not in seen:
-            seen.add(product)
-            scrape_targets.append(product)
+    # Parse the JSON array of Product objects posted by select_products.html
+    # (de-duplicated by URL, falling back to name — see _parse_selected_products).
+    selected_product_objects: List[SelectedProduct] = _parse_selected_products(selected_products)
+
+    # `scrape_targets` (plain product names) is kept as-is downstream so the
+    # existing scrape -> sentiment -> summary -> PDF -> dashboard pipeline
+    # (labels, lookups, template context) is untouched. It is now simply
+    # derived from the structured objects instead of being the primary input.
+    scrape_targets: List[str] = [p.name for p in selected_product_objects]
 
     if not website:
         return templates.TemplateResponse(
@@ -726,10 +859,16 @@ async def analyze_selected(
         # selected_products instead of an auto-discovered scrape_targets
         # list. No pipeline logic, function, or output shape is altered. ---
         google_jobs: List[Dict[str, Any]] = [{"label": "General", "data": company_data}]
-        for product in scrape_targets:
+        for product_obj in selected_product_objects:
             product_company_data = dict(company_data)
-            product_company_data["company_name"] = f"{company_data['company_name']} {product}"
-            google_jobs.append({"label": product, "data": product_company_data})
+            product_company_data["company_name"] = f"{company_data['company_name']} {product_obj.name}"
+            # Full Product object carried alongside company_data so future
+            # scrapers (per-product, URL-aware) can consume it directly
+            # instead of only a bare product-name string. Existing scrapers
+            # only read "company_name"/other pre-existing keys, so this is
+            # purely additive and does not change their behavior.
+            product_company_data["product"] = product_obj.as_dict()
+            google_jobs.append({"label": product_obj.name, "data": product_company_data})
 
         google_semaphore = asyncio.Semaphore(config.MAX_PARALLEL_TASKS)
 
@@ -752,6 +891,16 @@ async def analyze_selected(
                         "of blocking the pipeline.",
                         job.get("label"), GOOGLE_JOB_TIMEOUT_SECONDS,
                     )
+                    return []
+                except asyncio.CancelledError:
+                    # Defense-in-depth: scrape_google_reviews() already shields
+                    # the shared background scrape from any single caller's
+                    # cancellation and swallows this itself, but we catch it
+                    # here too so a CancelledError can never reach
+                    # asyncio.gather()'s results list below - it isn't an
+                    # Exception subclass, so isinstance(outcome, Exception)
+                    # would otherwise miss it and crash on list(outcome).
+                    logger.warning("Google Reviews job for %r was cancelled", job.get("label"))
                     return []
                 except Exception:
                     logger.exception("Google Reviews job for %r failed", job.get("label"))
@@ -781,16 +930,16 @@ async def analyze_selected(
         google_by_product: List[Dict[str, Any]] = []
         google_all_comments: List[str] = []
         for job, outcome in zip(google_jobs, google_results):
-            comments = list(outcome) if not isinstance(outcome, Exception) else []
+            comments = list(outcome) if not isinstance(outcome, BaseException) else []
             comments = comments[:config.MAX_COMMENTS_PER_PRODUCT]
             google_by_product.append({"product": job["label"], "comments": comments})
             google_all_comments.extend(comments)
 
         platform_comments = {
             "Google":    google_all_comments,
-            "Twitter":   list(twitter_comments)   if not isinstance(twitter_comments,   Exception) else [],
-            "Instagram": list(instagram_comments) if not isinstance(instagram_comments, Exception) else [],
-            "YouTube":   list(youtube_comments)   if not isinstance(youtube_comments,   Exception) else [],
+            "Twitter":   list(twitter_comments)   if not isinstance(twitter_comments,   BaseException) else [],
+            "Instagram": list(instagram_comments) if not isinstance(instagram_comments, BaseException) else [],
+            "YouTube":   list(youtube_comments)   if not isinstance(youtube_comments,   BaseException) else [],
         }
 
         comment_product_lookup: Dict[str, str] = {}
@@ -832,19 +981,22 @@ async def analyze_selected(
         if df.empty:
             df = pd.DataFrame(columns=["comment", "platform", "sentiment", "product", "timestamp"])
 
-        positive = int((df["sentiment"] == "positive").sum()) if "sentiment" in df.columns else 0
-        negative = int((df["sentiment"] == "negative").sum()) if "sentiment" in df.columns else 0
-        neutral  = int((df["sentiment"] == "neutral").sum())  if "sentiment" in df.columns else 0
-        total    = len(df)
+        # --- Product Intelligence split (mirrors /analyze) ---------------
+        product_rows, brand_rows = _split_product_and_brand_rows(comment_rows)
 
-        positive_pct = round((positive / total) * 100, 1) if total else 0.0
-        negative_pct = round((negative / total) * 100, 1) if total else 0.0
-        neutral_pct  = round((neutral  / total) * 100, 1) if total else 0.0
+        overall_stats = _compute_overall_stats(product_rows)
+        positive, negative, neutral, total = (
+            overall_stats["positive"], overall_stats["negative"],
+            overall_stats["neutral"], overall_stats["total"],
+        )
+        positive_pct, negative_pct, neutral_pct = (
+            overall_stats["positive_pct"], overall_stats["negative_pct"], overall_stats["neutral_pct"],
+        )
+        brand_score, brand_label = overall_stats["score"], overall_stats["score_label"]
 
-        brand_score, brand_label = _compute_brand_score(positive, negative, neutral, total)
-
-        product_sentiment = _aggregate_by_key(comment_rows, "product")
-        platform_sentiment = _aggregate_by_key(comment_rows, "platform")
+        product_sentiment = _aggregate_by_key(product_rows, "product")
+        platform_sentiment = _aggregate_by_key(product_rows, "platform")
+        brand_reputation = _aggregate_brand_reputation(brand_rows)
 
         real_products = {k: v for k, v in product_sentiment.items() if k != "General"}
         top_positive_product = (
@@ -862,7 +1014,7 @@ async def analyze_selected(
 
         summary = generate_summary(
             company_name=company_name,
-            comment_rows=comment_rows,
+            comment_rows=product_rows,
             brand_score=brand_score,
             brand_label=brand_label,
             products_scraped=len(scrape_targets),
@@ -870,9 +1022,14 @@ async def analyze_selected(
             most_discussed_product=most_discussed_product,
             top_positive_product=top_positive_product,
             top_negative_product=top_negative_product,
+            selected_products=scrape_targets,
+            product_sentiment=product_sentiment,
+            brand_reputation=brand_reputation,
         )
 
-        insight_tabs = _build_insight_tabs(comment_rows, platform_comments)
+        insight_tabs = _build_insight_tabs(product_rows, platform_comments)
+
+        product_title = ", ".join(scrape_targets) if scrape_targets else company_name
 
         export_base = Path("downloads") / f"{re.sub(r'[^a-zA-Z0-9]+', '_', company_name).strip('_').lower()}"
         export_base.mkdir(parents=True, exist_ok=True)
@@ -906,6 +1063,8 @@ async def analyze_selected(
                 products_scraped=len(scrape_targets),
                 report_generated=report_generated,
                 pdf_path=export_base / "report.pdf",
+                brand_reputation=brand_reputation,
+                product_title=product_title,
             )
             pdf_path_str = pdf_path.as_posix()
         except Exception:
@@ -917,6 +1076,7 @@ async def analyze_selected(
             name="dashboard.html",
             context={
                 "company":          company_data,
+                "product_title":    product_title,
                 "products":         scrape_targets,
                 "services":         [],
                 "products_found":   len(scrape_targets),
@@ -930,6 +1090,7 @@ async def analyze_selected(
                 "brand_label":      brand_label,
                 "product_sentiment": product_sentiment,
                 "platform_sentiment": platform_sentiment,
+                "brand_reputation": brand_reputation,
                 "platform_comments": platform_comments,
                 "comments":         comment_rows,
                 "insight_tabs":     insight_tabs,
@@ -968,12 +1129,24 @@ async def analyze_selected(
             "top_complaints":          [],
             "top_positive_topics":     [],
             "recommendations":         [],
+            "product_summaries":       [],
+            "brand_reputation_summary": "No brand-wide (non-product) reviews were collected for this run.",
+        }
+        _empty_brand_reputation = {
+            "positive": 0, "negative": 0, "neutral": 0, "total": 0,
+            "positive_pct": 0.0, "negative_pct": 0.0, "neutral_pct": 0.0,
+            "score": 0, "score_label": "No Data",
+            "by_platform": {},
+            "google_maps": {"positive": 0, "negative": 0, "neutral": 0, "total": 0,
+                             "positive_pct": 0.0, "negative_pct": 0.0, "neutral_pct": 0.0,
+                             "score": 0, "score_label": "No Data"},
         }
         return templates.TemplateResponse(
             request=request,
             name="dashboard.html",
             context={
                 "company":          {"company_name": company_name},
+                "product_title":    ", ".join(scrape_targets) if scrape_targets else company_name,
                 "products": scrape_targets, "services": [],
                 "products_found": len(scrape_targets), "services_found": 0,
                 "products_scraped": 0,
@@ -982,6 +1155,7 @@ async def analyze_selected(
                 "most_discussed_product": "",
                 "brand_score": 0, "brand_label": "No Data",
                 "product_sentiment": {}, "platform_sentiment": {},
+                "brand_reputation": _empty_brand_reputation,
                 "platform_comments": {"Google": [], "Twitter": [], "Instagram": [], "YouTube": []},
                 "comments":         [],
                 "insight_tabs":     {"top_positive": [], "top_negative": [], "by_platform": {}, "sample": []},
@@ -1063,6 +1237,59 @@ def _aggregate_by_key(comment_rows: List[Dict[str, Any]], key: str) -> Dict[str,
         }
     return aggregated
 
+# =============================================================================
+# Product Intelligence aggregation helpers
+# =============================================================================
+# These helpers implement the Company Sentiment -> Product Intelligence shift:
+# comments are split into (a) rows tied to a user-selected product, and
+# (b) rows that aren't tied to any specific product — the base/"General"
+# Google search plus all Twitter/Instagram/YouTube comments (those three
+# scrapers are brand-wide, not per-product). Group (b), which includes the
+# Google Maps/business reviews, is treated as Brand Reputation and kept out
+# of every product-centric metric, per the "don't mix Google Maps into
+# product sentiment" requirement.
+
+def _split_product_and_brand_rows(
+    comment_rows: List[Dict[str, Any]],
+) -> "tuple[List[Dict[str, Any]], List[Dict[str, Any]]]":
+    product_rows = [r for r in comment_rows if r.get("product") and r["product"] != "General"]
+    brand_rows = [r for r in comment_rows if not r.get("product") or r["product"] == "General"]
+    return product_rows, brand_rows
+
+def _compute_overall_stats(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    positive = sum(1 for r in rows if r.get("sentiment") == "positive")
+    negative = sum(1 for r in rows if r.get("sentiment") == "negative")
+    neutral  = sum(1 for r in rows if r.get("sentiment") == "neutral")
+    total    = len(rows)
+    positive_pct = round((positive / total) * 100, 1) if total else 0.0
+    negative_pct = round((negative / total) * 100, 1) if total else 0.0
+    neutral_pct  = round((neutral  / total) * 100, 1) if total else 0.0
+    score, label = _compute_brand_score(positive, negative, neutral, total)
+    return {
+        "positive": positive, "negative": negative, "neutral": neutral, "total": total,
+        "positive_pct": positive_pct, "negative_pct": negative_pct, "neutral_pct": neutral_pct,
+        "score": score, "score_label": label,
+    }
+
+def _aggregate_brand_reputation(brand_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Brand Reputation block: everything NOT attributable to a selected
+    product, broken out with Google Maps/business reviews called out
+    separately since those are the reviews users most associate with
+    overall brand reputation rather than any one product."""
+    overall = _compute_overall_stats(brand_rows)
+    by_platform = _aggregate_by_key(brand_rows, "platform")
+    google_maps_rows = [r for r in brand_rows if r.get("platform") == "Google"]
+    google_maps = _compute_overall_stats(google_maps_rows)
+    return {
+        "positive": overall["positive"], "negative": overall["negative"],
+        "neutral": overall["neutral"], "total": overall["total"],
+        "positive_pct": overall["positive_pct"], "negative_pct": overall["negative_pct"],
+        "neutral_pct": overall["neutral_pct"],
+        "score": overall["score"], "score_label": overall["score_label"],
+        "by_platform": by_platform,
+        "google_maps": google_maps,
+    }
+
 def _most_mentioned_feature(comments: List[str]) -> str:
     counts: Dict[str, int] = {}
     for comment in comments:
@@ -1127,7 +1354,13 @@ def generate_summary(
     most_discussed_product: str,
     top_positive_product: str,
     top_negative_product: str,
+    selected_products: "List[str] | None" = None,
+    product_sentiment: "Dict[str, Dict[str, Any]] | None" = None,
+    brand_reputation: "Dict[str, Any] | None" = None,
 ) -> Dict[str, Any]:
+    # NOTE: `comment_rows` here is expected to already be scoped to rows tied
+    # to a selected product (see _split_product_and_brand_rows), so every
+    # stat this function derives is product-centric by construction.
     sentiments = [item["sentiment"] for item in comment_rows]
     positive = sentiments.count("positive")
     negative = sentiments.count("negative")
@@ -1137,6 +1370,60 @@ def generate_summary(
     platforms_covered = [name for name, comments in platform_comments.items() if comments]
     all_comment_text = [row["comment"] for row in comment_rows]
     most_mentioned_feature = _most_mentioned_feature(all_comment_text)
+
+    selected_products = selected_products or []
+    product_sentiment = product_sentiment or {}
+
+    # ---- Per-product executive summaries -----------------------------
+    # One individual summary per user-selected product, built purely from
+    # figures already aggregated in product_sentiment — no new statistics.
+    product_summaries: List[Dict[str, Any]] = []
+    for product_name in selected_products:
+        stats = product_sentiment.get(product_name, {
+            "positive": 0, "negative": 0, "neutral": 0, "total": 0,
+            "positive_pct": 0.0, "negative_pct": 0.0, "neutral_pct": 0.0,
+            "score": 0, "score_label": "No Data",
+        })
+        if stats["total"]:
+            narrative = (
+                f"{product_name} collected {stats['total']} review(s) with a product "
+                f"score of {stats['score']}/100 ({stats['score_label']}) — "
+                f"{stats['positive_pct']}% positive, {stats['negative_pct']}% negative, "
+                f"{stats['neutral_pct']}% neutral."
+            )
+        else:
+            narrative = f"{product_name} had no attributable reviews collected for this run."
+        product_summaries.append({
+            "product": product_name,
+            "positive": stats["positive"], "negative": stats["negative"],
+            "neutral": stats["neutral"], "total": stats["total"],
+            "positive_pct": stats["positive_pct"], "negative_pct": stats["negative_pct"],
+            "neutral_pct": stats["neutral_pct"],
+            "score": stats["score"], "score_label": stats["score_label"],
+            "summary": narrative,
+        })
+
+    # ---- Brand Reputation narrative (Google Maps + brand-wide social) --
+    brand_reputation = brand_reputation or {
+        "positive": 0, "negative": 0, "neutral": 0, "total": 0,
+        "positive_pct": 0.0, "negative_pct": 0.0, "neutral_pct": 0.0,
+        "score": 0, "score_label": "No Data",
+        "google_maps": {"total": 0, "score": 0, "score_label": "No Data"},
+    }
+    if brand_reputation["total"]:
+        brand_reputation_summary = (
+            f"Outside the selected products, brand-wide reputation signals "
+            f"(Google Maps reviews plus general social mentions) reflect "
+            f"{brand_reputation['total']} comment(s) with a brand reputation "
+            f"score of {brand_reputation['score']}/100 "
+            f"({brand_reputation['score_label']}). Google Maps reviews alone "
+            f"account for {brand_reputation['google_maps']['total']} of those, "
+            f"scoring {brand_reputation['google_maps']['score']}/100."
+        )
+    else:
+        brand_reputation_summary = (
+            "No brand-wide (non-product) reviews were collected for this run."
+        )
 
     key_positive_insights = _top_snippets(comment_rows, "positive", limit=3) or [
         "Not enough positive feedback was collected to summarize."
@@ -1168,11 +1455,12 @@ def generate_summary(
     elif total and (negative / total) >= 0.4:
         key_insights.append("A significant portion of feedback is negative — attention needed.")
 
+    products_label = ", ".join(selected_products) if selected_products else "the selected product(s)"
     return {
         "executive_summary": (
-            f"{company_name} received {total} reviews across {len(platforms_covered)} platform(s) "
-            f"covering {products_scraped} product(s), with a brand score of {brand_score}/100 "
-            f"({brand_label})."
+            f"Product Intelligence for {products_label}: {total} product-attributed review(s) "
+            f"collected across {len(platforms_covered)} platform(s) covering {products_scraped} "
+            f"product(s), with an overall product score of {brand_score}/100 ({brand_label})."
         ),
         "overall_sentiment":      brand_label,
         "platforms_covered":      len(platforms_covered),
@@ -1186,6 +1474,11 @@ def generate_summary(
         "top_complaints":         key_complaints,
         "top_positive_topics":    key_positive_insights,
         "recommendations":        recommendations,
+
+        # --- Additive: Product Intelligence fields (new; existing keys
+        # above are all preserved for frontend/PDF compatibility) --------
+        "product_summaries":         product_summaries,
+        "brand_reputation_summary":  brand_reputation_summary,
     }
 
 # =============================================================================
@@ -1348,19 +1641,29 @@ def generate_pdf_report(
     products_scraped: int,
     report_generated: str,
     pdf_path: Path,
+    brand_reputation: "Dict[str, Any] | None" = None,
+    product_title: str = "",
 ) -> Path:
     """
-    Builds a professional multi-page PDF report from data the existing
-    pipeline has already computed (summary, brand score, sentiment
-    aggregates, platform counts, product sentiment, selected products).
-    No new statistics are calculated here — every figure below is read
-    directly from the arguments passed in.
+    Builds a professional multi-page Product Intelligence Report from data
+    the existing pipeline has already computed (summary, brand score,
+    sentiment aggregates, platform counts, product sentiment, selected
+    products, brand reputation). No new statistics are calculated here —
+    every figure below is read directly from the arguments passed in.
     """
     styles = _pdf_styles()
     story: List[Any] = []
 
     company_name = company_data.get("company_name") or "Unknown Company"
     website = company_data.get("website") or "—"
+    product_title = product_title or (", ".join(selected_products) if selected_products else company_name)
+    brand_reputation = brand_reputation or {
+        "positive": 0, "negative": 0, "neutral": 0, "total": 0,
+        "positive_pct": 0.0, "negative_pct": 0.0, "neutral_pct": 0.0,
+        "score": 0, "score_label": "No Data",
+        "by_platform": {},
+        "google_maps": {"total": 0, "score": 0, "score_label": "No Data"},
+    }
 
     # ---------------------------------------------------------------- Cover
     story.append(Spacer(1, 2.6 * cm))
@@ -1380,7 +1683,9 @@ def generate_pdf_report(
     story.append(Spacer(1, 1.6 * cm))
 
     detail_rows = [
-        [Paragraph("COMPANY NAME", styles["cover_field_label"])],
+        [Paragraph("PRODUCT(S) ANALYSED", styles["cover_field_label"])],
+        [Paragraph(product_title, styles["cover_field_value"])],
+        [Paragraph("COMPANY", styles["cover_field_label"])],
         [Paragraph(company_name, styles["cover_field_value"])],
         [Paragraph("WEBSITE", styles["cover_field_label"])],
         [Paragraph(website, styles["cover_field_value"])],
@@ -1407,14 +1712,14 @@ def generate_pdf_report(
     story.append(Spacer(1, 16))
 
     # ------------------------------------------------------- Overall Statistics
-    story.extend(_pdf_section_heading("Overall Statistics", styles))
+    story.extend(_pdf_section_heading("Overall Product Statistics", styles))
     stats_rows = [
-        ["Brand Score", f"{brand_score} / 100"],
-        ["Brand Label", brand_label],
+        ["Product Score", f"{brand_score} / 100"],
+        ["Product Sentiment Label", brand_label],
         ["Positive %", f"{positive_pct}%"],
         ["Negative %", f"{negative_pct}%"],
         ["Neutral %", f"{neutral_pct}%"],
-        ["Total Reviews", str(total)],
+        ["Total Product Reviews", str(total)],
         ["Platforms Covered", str(summary.get("platforms_covered", 0))],
         ["Products Analysed", str(products_scraped)],
     ]
@@ -1431,6 +1736,21 @@ def generate_pdf_report(
         empty_text="No products were selected for this analysis.",
     ))
     story.append(Spacer(1, 16))
+
+    # ------------------------------------------------------- Per-Product Summaries
+    story.extend(_pdf_section_heading("Product-by-Product Summary", styles))
+    product_summaries = summary.get("product_summaries") or []
+    if product_summaries:
+        for item in product_summaries:
+            story.append(Paragraph(f"<b>{item.get('product', '')}</b>", styles["body"]))
+            story.append(Paragraph(item.get("summary", ""), styles["body"]))
+            story.append(Spacer(1, 8))
+    else:
+        story.append(Paragraph(
+            "No individual product summaries are available for this run.",
+            styles["body"],
+        ))
+    story.append(Spacer(1, 8))
 
     # ------------------------------------------------------- Platform Summary
     story.extend(_pdf_section_heading("Platform Summary", styles))
@@ -1458,6 +1778,26 @@ def generate_pdf_report(
         ))
     else:
         story.append(Paragraph("No product-level sentiment data is available.", styles["body"]))
+    story.append(Spacer(1, 16))
+
+    # ------------------------------------------------------- Brand Reputation
+    # Kept separate from Product Sentiment: this covers Google Maps/business
+    # reviews plus general (non-product-attributable) social mentions, which
+    # reflect overall brand reputation rather than any single product.
+    story.extend(_pdf_section_heading("Brand Reputation (Google Maps & Social)", styles))
+    story.append(Paragraph(summary.get("brand_reputation_summary", ""), styles["body"]))
+    story.append(Spacer(1, 10))
+    brand_stats_rows = [
+        ["Brand Reputation Score", f"{brand_reputation.get('score', 0)} / 100"],
+        ["Brand Reputation Label", brand_reputation.get("score_label", "No Data")],
+        ["Total Brand Mentions", str(brand_reputation.get("total", 0))],
+        ["Google Maps Reviews", str(brand_reputation.get("google_maps", {}).get("total", 0))],
+        ["Google Maps Score", f"{brand_reputation.get('google_maps', {}).get('score', 0)} / 100"],
+    ]
+    story.append(_pdf_styled_table(
+        ["Metric", "Value"], brand_stats_rows, [8.5 * cm, 8.5 * cm], styles,
+        header_bg=_PDF_BLUE,
+    ))
     story.append(Spacer(1, 16))
 
     # ------------------------------------------------------- Top Positive Insights
@@ -1490,13 +1830,15 @@ def generate_pdf_report(
     story.extend(_pdf_section_heading("Final Conclusion", styles))
     platforms_covered = summary.get("platforms_covered", 0)
     conclusion = (
-        f"Based on {total} analysed review(s) across {platforms_covered} platform(s) and "
-        f"{products_scraped} product(s), {company_name} currently holds a brand score of "
-        f"{brand_score} out of 100, placing its overall sentiment in the '{brand_label}' "
-        f"category. Of the feedback collected, {positive_pct}% was positive, {negative_pct}% "
-        f"was negative, and {neutral_pct}% was neutral. These results, together with the "
-        f"insights and recommendations above, offer a data-driven view of current brand "
-        f"health and the areas most likely to benefit from continued attention."
+        f"Based on {total} product-attributed review(s) across {platforms_covered} platform(s) "
+        f"and {products_scraped} selected product(s) — {product_title} — the overall product "
+        f"score is {brand_score} out of 100, placing product sentiment in the '{brand_label}' "
+        f"category. Of the product-attributed feedback collected, {positive_pct}% was positive, "
+        f"{negative_pct}% was negative, and {neutral_pct}% was neutral. Brand-wide reputation "
+        f"signals (Google Maps and general social mentions), covered separately above, are not "
+        f"included in these product figures. These results, together with the insights and "
+        f"recommendations above, offer a data-driven view of current product health and the "
+        f"areas most likely to benefit from continued attention."
     )
     story.append(Paragraph(conclusion, styles["body"]))
 
@@ -1506,7 +1848,7 @@ def generate_pdf_report(
         pagesize=A4,
         leftMargin=2 * cm, rightMargin=2 * cm,
         topMargin=2 * cm, bottomMargin=2.2 * cm,
-        title=f"{company_name} — ManobhavaAI Report",
+        title=f"{product_title} — ManobhavaAI Product Intelligence Report",
     )
     doc.build(story, onFirstPage=_pdf_footer, onLaterPages=_pdf_footer)
     return pdf_path

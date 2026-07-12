@@ -6,6 +6,7 @@ import re
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 from scrapers.browser_utils import normalize_comments
@@ -389,6 +390,74 @@ def _looks_blocked(page) -> bool:
     return _diagnose_page_state(page) != "ok"
 
 
+# Evidence directory for zero-result debug captures. Lives at
+# <project_root>/debug (sibling of app.py's DOWNLOADS_DIR), since this file
+# is itself at <project_root>/scrapers/instagram_scraper.py.
+_DEBUG_DIR = Path(__file__).resolve().parent.parent / "debug"
+
+
+def _save_debug_artifacts(page, identifier: str, reason: str, extra: Dict[str, str] = None) -> None:
+    """Save HTML/screenshot/context ONLY on failure/zero-results for
+    debugging. Never on the success path.
+
+    Writes three files under ``_DEBUG_DIR``, all sharing one base name
+    stamped with date-time + milliseconds + thread id so concurrent or
+    rapid-fire failures never overwrite each other:
+      * <base>.png - screenshot
+      * <base>.html - full page HTML
+      * <base>.txt  - final URL, page title, reason, and whatever the
+        caller passes in ``extra`` (e.g. embed/profile page load status,
+        login-wall presence).
+    """
+    try:
+        _DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+        safe_id = re.sub(r'[^a-zA-Z0-9]', '_', identifier)[:50].strip('_') or "unknown"
+        stamp = f"{time.strftime('%Y%m%d_%H%M%S')}_{int(time.time() * 1000) % 1000:03d}_{threading.get_ident()}"
+        base = _DEBUG_DIR / f"instagram_{safe_id}_{stamp}"
+
+        try:
+            final_url = page.url or ""
+        except Exception:
+            final_url = "<unavailable>"
+        try:
+            title = page.title()
+        except Exception:
+            title = "<unavailable>"
+
+        try:
+            page.screenshot(path=f"{base}.png", timeout=3000, full_page=True)
+        except Exception:
+            logger.warning("[INSTAGRAM_DEBUG] could not capture screenshot for %s", identifier)
+
+        try:
+            with open(f"{base}.html", "w", encoding="utf-8") as f:
+                f.write(page.content())
+        except Exception:
+            logger.warning("[INSTAGRAM_DEBUG] could not capture HTML for %s", identifier)
+
+        info = {
+            "reason": reason,
+            "identifier": identifier,
+            "final_url": final_url,
+            "page_title": title,
+        }
+        if extra:
+            info.update(extra)
+        try:
+            with open(f"{base}.txt", "w", encoding="utf-8") as f:
+                for k, v in info.items():
+                    f.write(f"{k}: {v}\n")
+        except Exception:
+            pass
+
+        logger.warning(
+            "[INSTAGRAM_DEBUG] saved zero-result evidence for %s reason=%s: %s.{png,html,txt}",
+            identifier, reason, base,
+        )
+    except Exception:
+        logger.exception("[INSTAGRAM_DEBUG] failed to save debug artifacts for %s", identifier)
+
+
 def _find_scroll_container(page):
     """Find the element that actually holds the scrollable comments feed,
     instead of assuming either "the whole page" or a blindly-supplied
@@ -436,24 +505,57 @@ def _adaptive_nav_timeout(time_left) -> int:
 
 
 def _goto_with_retry(page, url: str, *, timeout: int, time_left, retries: int = NAVIGATION_RETRIES) -> bool:
-    """Navigate with retries, logging, and a short backoff between attempts."""
+    """Navigate with retries, logging, and a short backoff between attempts.
+
+    ``timeout`` is accepted for call-site compatibility but is intentionally
+    ignored: we recompute an adaptive timeout before every attempt so that
+    retries never ask for more time than the scraper actually has left.
+    """
     last_exc = None
-    for attempt in range(retries + 1):
-        if time_left() <= 3:
-            logger.warning("Skipping navigation to %s: out of time budget.", url)
+    total_attempts = retries + 1
+    for attempt in range(total_attempts):
+        remaining = time_left()
+        if remaining <= 3:
+            logger.warning(
+                "Skipping navigation to %s: out of time budget "
+                "(attempt=%d/%d remaining=%.1fs).",
+                url, attempt + 1, total_attempts, remaining,
+            )
             return False
+        # Recompute adaptive timeout against the *current* remaining budget,
+        # not the value frozen at call time.  This is the core fix: a failed
+        # attempt burns real wall-clock time, so each retry must recalculate
+        # rather than reuse a stale number that can now exceed what is left.
+        attempt_timeout = _adaptive_nav_timeout(time_left)
+        if attempt > 0:
+            logger.info(
+                "Instagram nav retry attempt=%d/%d url=%s remaining=%.1fs chosen_timeout=%dms",
+                attempt + 1, total_attempts, url, remaining, attempt_timeout,
+            )
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+            page.goto(url, wait_until="domcontentloaded", timeout=attempt_timeout)
             return True
         except Exception as exc:
             last_exc = exc
             logger.warning(
                 "Instagram nav attempt %d/%d to %s failed: %s",
-                attempt + 1, retries + 1, url, exc,
+                attempt + 1, total_attempts, url, exc,
             )
-            if attempt < retries and time_left() > 3:
-                time.sleep(min(NAV_RETRY_BACKOFF_SECONDS * (attempt + 1), max(time_left() - 3, 0)))
-    logger.error("Giving up on %s after %d attempts: %s", url, retries + 1, last_exc)
+            if attempt < retries:
+                # Cap the backoff sleep to what is actually left minus the
+                # minimum guard (3 s) so we never sleep past the deadline.
+                backoff = min(
+                    NAV_RETRY_BACKOFF_SECONDS * (attempt + 1),
+                    max(0.0, time_left() - 3),
+                )
+                if backoff <= 0:
+                    logger.warning(
+                        "No time left for backoff before retry %d/%d to %s; aborting.",
+                        attempt + 2, total_attempts, url,
+                    )
+                    break
+                time.sleep(backoff)
+    logger.error("Giving up on %s after %d attempts: %s", url, total_attempts, last_exc)
     return False
 
 
@@ -623,7 +725,9 @@ async def scrape_instagram_comments(company_data: Dict[str, str]) -> List[str]:
             # --- Primary attempt: public embed page (no login wall) -------
             embed_url = profile_url.rstrip("/") + "/embed/"
             post_links: List[str] = []
-            if _goto_with_retry(page, embed_url, timeout=_adaptive_nav_timeout(time_left), time_left=time_left):
+            profile_page_loaded = None  # None = fallback never attempted
+            embed_page_loaded = _goto_with_retry(page, embed_url, timeout=_adaptive_nav_timeout(time_left), time_left=time_left)
+            if embed_page_loaded:
                 # Readiness-based wait: wait for actual content to show up
                 # rather than sleeping a fixed amount of time regardless of
                 # whether the page is ready sooner or slower than that.
@@ -677,7 +781,8 @@ async def scrape_instagram_comments(company_data: Dict[str, str]) -> List[str]:
             # --- Fallback: direct profile page, skipped instantly if it
             # redirects to a login/checkpoint wall ------------------------
             if len(results) < MIN_RESULTS_BEFORE_FALLBACK and time_left() > 4:
-                if _goto_with_retry(page, profile_url, timeout=_adaptive_nav_timeout(time_left), time_left=time_left):
+                profile_page_loaded = _goto_with_retry(page, profile_url, timeout=_adaptive_nav_timeout(time_left), time_left=time_left)
+                if profile_page_loaded:
                     try:
                         page.wait_for_selector(
                             "h1, span._aacl, div._aacl, [role='main']", timeout=3000,
@@ -767,6 +872,17 @@ async def scrape_instagram_comments(company_data: Dict[str, str]) -> List[str]:
                                 _add(loc.inner_text())
                             except Exception:
                                 pass
+
+            if not results:
+                _save_debug_artifacts(
+                    page, profile_url, "zero_comments",
+                    extra={
+                        "embed_page_loaded": str(embed_page_loaded),
+                        "profile_page_loaded": str(profile_page_loaded),
+                        "login_wall_present": str(_looks_blocked(page)),
+                        "diagnosis": _diagnose_page_state(page),
+                    },
+                )
         except Exception:
             logger.exception("Instagram scrape failed for %r.", profile_url)
         finally:

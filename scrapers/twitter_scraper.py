@@ -6,6 +6,7 @@ import re
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Dict, List
 
 from scrapers.browser_utils import normalize_comments
@@ -363,6 +364,74 @@ def _diagnose_empty_page(page) -> str:
     return "no_tweets"
 
 
+# Evidence directory for zero-result debug captures. Lives at
+# <project_root>/debug (sibling of app.py's DOWNLOADS_DIR), since this file
+# is itself at <project_root>/scrapers/twitter_scraper.py.
+_DEBUG_DIR = Path(__file__).resolve().parent.parent / "debug"
+
+
+def _save_debug_artifacts(page, url: str, reason: str, extra: Dict[str, str] = None) -> None:
+    """Save HTML/screenshot/context ONLY on failure/zero-results for
+    debugging. Never on the success path.
+
+    Writes three files under ``_DEBUG_DIR``, all sharing one base name
+    stamped with date-time + milliseconds + thread id so concurrent or
+    rapid-fire failures never overwrite each other:
+      * <base>.png - screenshot
+      * <base>.html - full page HTML
+      * <base>.txt  - final URL, page title, reason, and whatever the
+        caller passes in ``extra`` (e.g. login-wall / article-existence
+        checks).
+    """
+    try:
+        _DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+        safe_url = re.sub(r'[^a-zA-Z0-9]', '_', url)[:50].strip('_') or "unknown"
+        stamp = f"{time.strftime('%Y%m%d_%H%M%S')}_{int(time.time() * 1000) % 1000:03d}_{threading.get_ident()}"
+        base = _DEBUG_DIR / f"twitter_{safe_url}_{stamp}"
+
+        try:
+            final_url = page.url or ""
+        except Exception:
+            final_url = "<unavailable>"
+        try:
+            title = page.title()
+        except Exception:
+            title = "<unavailable>"
+
+        try:
+            page.screenshot(path=f"{base}.png", timeout=3000, full_page=True)
+        except Exception:
+            logger.warning("[TWITTER_DEBUG] could not capture screenshot for %s", url)
+
+        try:
+            with open(f"{base}.html", "w", encoding="utf-8") as f:
+                f.write(page.content())
+        except Exception:
+            logger.warning("[TWITTER_DEBUG] could not capture HTML for %s", url)
+
+        info = {
+            "reason": reason,
+            "target_url": url,
+            "final_url": final_url,
+            "page_title": title,
+        }
+        if extra:
+            info.update(extra)
+        try:
+            with open(f"{base}.txt", "w", encoding="utf-8") as f:
+                for k, v in info.items():
+                    f.write(f"{k}: {v}\n")
+        except Exception:
+            pass
+
+        logger.warning(
+            "[TWITTER_DEBUG] saved zero-result evidence for %s reason=%s: %s.{png,html,txt}",
+            url, reason, base,
+        )
+    except Exception:
+        logger.exception("[TWITTER_DEBUG] failed to save debug artifacts for %s", url)
+
+
 def _adaptive_nav_timeout(time_left) -> int:
     """Scale the navigation timeout to how much of the internal time
     budget is actually left, instead of a fixed 5000ms for every attempt.
@@ -385,27 +454,58 @@ def _adaptive_nav_timeout(time_left) -> int:
 def _goto_with_retry(page, url: str, *, timeout: int, time_left, retries: int = NAVIGATION_RETRIES) -> bool:
     """Navigate with retries, logging, and a short backoff between attempts.
 
-    The backoff (mirrored from the Google scraper) gives transient network
-    blips or momentary rate-limiting a moment to clear instead of hammering
-    X with back-to-back retries.
+    The backoff gives transient network blips or momentary rate-limiting a
+    moment to clear instead of hammering X with back-to-back retries.
+
+    ``timeout`` is accepted for call-site compatibility but is intentionally
+    ignored: we recompute an adaptive timeout before every attempt so that
+    retries never ask for more time than the scraper actually has left.
     """
     last_exc = None
-    for attempt in range(retries + 1):
-        if time_left() <= 3:
-            logger.warning("Skipping navigation to %s: out of time budget.", url)
+    total_attempts = retries + 1
+    for attempt in range(total_attempts):
+        remaining = time_left()
+        if remaining <= 3:
+            logger.warning(
+                "Skipping navigation to %s: out of time budget "
+                "(attempt=%d/%d remaining=%.1fs).",
+                url, attempt + 1, total_attempts, remaining,
+            )
             return False
+        # Recompute adaptive timeout against the *current* remaining budget,
+        # not the value frozen at call time.  This is the core fix: a failed
+        # attempt burns real wall-clock time, so each retry must recalculate
+        # rather than reuse a stale number that can now exceed what is left.
+        attempt_timeout = _adaptive_nav_timeout(time_left)
+        if attempt > 0:
+            logger.info(
+                "Twitter/X nav retry attempt=%d/%d url=%s remaining=%.1fs chosen_timeout=%dms",
+                attempt + 1, total_attempts, url, remaining, attempt_timeout,
+            )
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+            page.goto(url, wait_until="domcontentloaded", timeout=attempt_timeout)
             return True
         except Exception as exc:
             last_exc = exc
             logger.warning(
                 "Twitter/X nav attempt %d/%d to %s failed: %s",
-                attempt + 1, retries + 1, url, exc,
+                attempt + 1, total_attempts, url, exc,
             )
-            if attempt < retries and time_left() > 3:
-                time.sleep(min(NAV_RETRY_BACKOFF_SECONDS * (attempt + 1), max(time_left() - 3, 0)))
-    logger.error("Giving up on %s after %d attempts: %s", url, retries + 1, last_exc)
+            if attempt < retries:
+                # Cap the backoff sleep to what is actually left minus the
+                # minimum guard (3 s) so we never sleep past the deadline.
+                backoff = min(
+                    NAV_RETRY_BACKOFF_SECONDS * (attempt + 1),
+                    max(0.0, time_left() - 3),
+                )
+                if backoff <= 0:
+                    logger.warning(
+                        "No time left for backoff before retry %d/%d to %s; aborting.",
+                        attempt + 2, total_attempts, url,
+                    )
+                    break
+                time.sleep(backoff)
+    logger.error("Giving up on %s after %d attempts: %s", url, total_attempts, last_exc)
     return False
 
 
@@ -626,6 +726,7 @@ async def scrape_twitter_comments(company_data: Dict[str, str]) -> List[str]:
             if not _goto_with_retry(
                 page, url, timeout=_adaptive_nav_timeout(time_left), time_left=time_left
             ):
+                _save_debug_artifacts(page, url, "nav_failure")
                 return normalize_comments(results)
 
             if _looks_blocked(page):
@@ -633,6 +734,7 @@ async def scrape_twitter_comments(company_data: Dict[str, str]) -> List[str]:
                     "Twitter/X scrape: redirected to a login wall for %s — "
                     "stopping immediately instead of waiting it out.", url,
                 )
+                _save_debug_artifacts(page, url, "login_wall", extra={"login_wall_present": "True"})
                 return normalize_comments(results)
 
             got_articles = True
@@ -706,6 +808,16 @@ async def scrape_twitter_comments(company_data: Dict[str, str]) -> List[str]:
                     )
                 except Exception:
                     continue
+
+            if not results:
+                _save_debug_artifacts(
+                    page, url, "zero_tweets",
+                    extra={
+                        "login_wall_present": str(_looks_blocked(page)),
+                        "articles_exist": str(len(_get_articles(page)) > 0),
+                        "diagnosis": _diagnose_empty_page(page),
+                    },
+                )
 
         finally:
             if page is not None:

@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import json
 import logging
 import re
@@ -61,13 +62,17 @@ from dataclasses import dataclass, asdict
 import config
 from company_discovery import extract_website_metadata
 from product_discovery import discover_products
+from product_intelligence import build_product_intelligence_batch
+from aspect_intelligence import build_aspect_intelligence_by_product
 from sentiment import analyze_sentiment, analyze_sentiment_batch, get_sentiment_pipeline
 from url_utils import derive_company_name, is_url, normalize_url
 from utils import clean_comment, normalize_text, remove_links, unique_comments
 from scrapers.google_scraper import scrape_google_reviews
 from scrapers.twitter_scraper import scrape_twitter_comments
 from scrapers.instagram_scraper import scrape_instagram_comments
-from scrapers.youtube_scraper import scrape_youtube_comments
+from scrapers.youtube_scraper import scrape_youtube_comments, MAX_BROWSER_WORKERS
+from scrapers.reddit_scraper import scrape_reddit_comments, MAX_REDDIT_WORKERS
+from scrapers.website_review_scraper import scrape_website_reviews, MAX_WORKERS as MAX_WEBSITE_REVIEW_WORKERS
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -156,6 +161,60 @@ templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 # network — now lives exclusively in sentiment.py and is imported above.
 # See sentiment.get_sentiment_pipeline() for the loading logic itself.
 
+# ============================================================================
+# Sentiment pipeline: startup preload + off-event-loop execution
+# ----------------------------------------------------------------------------
+# get_sentiment_pipeline()/analyze_sentiment_batch() are unchanged (still
+# imported from sentiment.py, same signatures, same behavior). What changes
+# here is WHEN the pipeline is first loaded and WHERE both calls run:
+#
+#   - Previously, get_sentiment_pipeline() was only ever called from inside
+#     an /analyze or /analyze_selected request, synchronously, directly on
+#     the asyncio event loop. The very first analysis after every process
+#     start (or every --reload restart in dev) therefore paid the full
+#     model-load cost (~24s observed) as part of that user's request, and
+#     did so while blocking the event loop - no other request of any kind
+#     (including a second, unrelated user's request) could be served for
+#     that entire window.
+#
+#   - Now: (1) a startup event eagerly calls the existing loader once,
+#     before any request arrives, so the first real request never pays
+#     that cost; and (2) both call sites hand the (already-imported,
+#     unmodified) get_sentiment_pipeline/analyze_sentiment_batch functions
+#     to a dedicated single-worker ThreadPoolExecutor via
+#     loop.run_in_executor() instead of calling them directly. A
+#     single-worker pool keeps sentiment access serialized across
+#     concurrent requests - the same access pattern the pipeline already
+#     had when every call ran on the one event loop thread - while moving
+#     the blocking work off the event loop, so unrelated request handling
+#     (routing, static files, other in-flight scrapers) is never frozen by
+#     it.
+_SENTIMENT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="sentiment_pipeline"
+)
+
+
+@app.on_event("startup")
+async def _preload_sentiment_pipeline() -> None:
+    loop = asyncio.get_running_loop()
+    _start = time.perf_counter()
+    try:
+        await loop.run_in_executor(_SENTIMENT_EXECUTOR, get_sentiment_pipeline)
+    except Exception:
+        # Preloading is a pure optimization - if it fails for any reason,
+        # fall back silently to the existing behavior (lazy load on first
+        # request), rather than preventing the app from starting.
+        logger.exception(
+            "Sentiment pipeline preload failed at startup; it will be "
+            "loaded lazily on the first request instead."
+        )
+        return
+    logger.info(
+        "Sentiment pipeline preloaded at startup in %.2fs — the first "
+        "analysis request will not pay the model-load cost.",
+        time.perf_counter() - _start,
+    )
+
 
 @app.get("/")
 def index(request: Request):
@@ -178,10 +237,15 @@ async def analyze(request: Request, company_name: str = Form(...)):
 
     async def _timed(name: str, coro, timeout: float = None):
         # Hard per-scraper cutoff (requirement: no platform may block the
-        # whole pipeline). Each scraper already carries its own internal
-        # time budget and returns whatever it collected before this fires,
-        # so this asyncio.wait_for is a safety-net backstop, not the
-        # primary mechanism for getting partial results.
+        # whole pipeline). Each scraper carries its own internal time
+        # budget and is *intended* to return gracefully with partial
+        # results before this fires - but if this outer timeout fires
+        # first, asyncio.wait_for() cancels the awaited coroutine and we
+        # return [] here; nothing partial is retrieved from it. This is a
+        # true last-resort backstop, not a mechanism for getting partial
+        # results - see GOOGLE_JOB_TIMEOUT_SECONDS etc. above for why each
+        # value is now sized to comfortably exceed setup_time + that
+        # scraper's own internal budget.
         _start = time.perf_counter()
         try:
             if timeout is not None:
@@ -189,8 +253,10 @@ async def analyze(request: Request, company_name: str = Form(...)):
                     return await asyncio.wait_for(coro, timeout=timeout)
                 except asyncio.TimeoutError:
                     logger.warning(
-                        "%s exceeded its %.0fs hard timeout — returning "
-                        "whatever was collected instead of blocking the pipeline.",
+                        "%s exceeded its %.0fs hard timeout — returning [] "
+                        "(no partial results are recoverable from a "
+                        "cancelled coroutine; any underlying background "
+                        "work may keep running unseen after this point).",
                         name, timeout,
                     )
                     return []
@@ -306,16 +372,70 @@ async def analyze(request: Request, company_name: str = Form(...)):
             product_company_data["company_name"] = f"{company_data['company_name']} {product}"
             google_jobs.append({"label": product, "data": product_company_data})
 
+        # YouTube jobs mirror google_jobs' "General + one per product"
+        # shape, but keep `company_name` un-concatenated (it doubles as the
+        # brand term for the scraper's "<brand> <product> review" search
+        # tier) and instead pass the bare product name separately via
+        # `product_name`, which the scraper reads to drive its
+        # product-centric search priority order. A job with no
+        # `product_name` (the "General" entry) gets exactly today's
+        # behavior from the scraper: straight to the official channel.
+        youtube_jobs: List[Dict[str, Any]] = [{"label": "General", "data": company_data}]
+        for product in scrape_targets:
+            yt_product_data = dict(company_data)
+            yt_product_data["product_name"] = product
+            youtube_jobs.append({"label": product, "data": yt_product_data})
+
+        # Reddit jobs mirror youtube_jobs' "General + one per product"
+        # shape and the same "bare company_name + separate product_name"
+        # data contract, since reddit_scraper.py's product-centric search
+        # priority order (Product -> Brand+Product -> Company+Product) is
+        # driven by exactly those two fields. A job with no `product_name`
+        # (the "General" entry) gets the scraper's plain company-name
+        # search instead of the product-tiered one.
+        reddit_jobs: List[Dict[str, Any]] = [{"label": "General", "data": company_data}]
+        for product in scrape_targets:
+            reddit_product_data = dict(company_data)
+            reddit_product_data["product_name"] = product
+            reddit_jobs.append({"label": product, "data": reddit_product_data})
+
         google_semaphore = asyncio.Semaphore(config.MAX_PARALLEL_TASKS)
+        # Bounded to the YouTube scraper's own browser-pool size rather than
+        # config.MAX_PARALLEL_TASKS: that pool (not this semaphore) is the
+        # real concurrency limit, so sizing the semaphore to match keeps
+        # every job's asyncio.wait_for clock from starting before a browser
+        # worker is actually available to run it.
+        youtube_semaphore = asyncio.Semaphore(MAX_BROWSER_WORKERS)
+        # Same reasoning as youtube_semaphore above, sized to Reddit's own
+        # (deliberately small) worker pool instead of config.MAX_PARALLEL_TASKS,
+        # since Reddit's public JSON endpoints rate-limit unauthenticated
+        # clients more aggressively than a generic concurrency cap would allow for.
+        reddit_semaphore = asyncio.Semaphore(MAX_REDDIT_WORKERS)
 
         # Hard per-platform ceilings. Each scraper's own internal time
         # budget is set a few seconds below these so it returns naturally
         # with partial results; these are the outer safety-net cutoffs
         # that guarantee no single platform can block the whole request.
-        GOOGLE_JOB_TIMEOUT_SECONDS = 30
-        TWITTER_TIMEOUT_SECONDS = 20
-        INSTAGRAM_TIMEOUT_SECONDS = 20
-        YOUTUBE_TIMEOUT_SECONDS = 20
+        #
+        # ROOT-CAUSE FIX: each scraper's internal TIME_BUDGET_SECONDS clock
+        # only starts AFTER browser/context/page setup finishes (setup is
+        # commonly 6-8s, observed up to 7.8s in production logs), but this
+        # asyncio.wait_for's clock starts the instant the coroutine is
+        # scheduled - i.e. it includes setup time. The previous values
+        # (30/20/20/20) were below setup_time + internal_budget for every
+        # browser scraper, so this outer timeout fired first on essentially
+        # every real run, before the scraper's own graceful tier-fallback
+        # logic ever got a chance to finish - guaranteeing empty results
+        # regardless of whether the platform actually had data available.
+        # Each value below is sized to setup_time + that scraper's own
+        # TIME_BUDGET_SECONDS + a margin for post-timeout exception/logging
+        # overhead. Revisit if setup time grows further (e.g. more
+        # concurrent Chromium instances competing for CPU).
+        GOOGLE_JOB_TIMEOUT_SECONDS = 48
+        TWITTER_TIMEOUT_SECONDS = 26
+        INSTAGRAM_TIMEOUT_SECONDS = 26
+        YOUTUBE_TIMEOUT_SECONDS = 30
+        REDDIT_TIMEOUT_SECONDS = 20
 
         async def _scrape_google_job(job: Dict[str, Any]) -> List[str]:
             async with google_semaphore:
@@ -327,8 +447,12 @@ async def analyze(request: Request, company_name: str = Form(...)):
                 except asyncio.TimeoutError:
                     logger.warning(
                         "Google Reviews job for %r exceeded its %.0fs hard "
-                        "timeout — returning whatever was collected instead "
-                        "of blocking the pipeline.",
+                        "timeout — no partial results are recoverable here "
+                        "(asyncio.wait_for cancels the awaited coroutine on "
+                        "timeout and this returns []); any in-progress "
+                        "background scrape may still finish and populate "
+                        "the cache for a later request, see "
+                        "scrape_google_reviews()'s own logging for that.",
                         job.get("label"), GOOGLE_JOB_TIMEOUT_SECONDS,
                     )
                     return []
@@ -360,16 +484,118 @@ async def analyze(request: Request, company_name: str = Form(...)):
             finally:
                 _log_stage("Google Review Collection", time.perf_counter() - _group_start)
 
+        async def _scrape_youtube_job(job: Dict[str, Any]) -> List[str]:
+            async with youtube_semaphore:
+                try:
+                    return await asyncio.wait_for(
+                        scrape_youtube_comments(job["data"]),
+                        timeout=YOUTUBE_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "YouTube Scraper job for %r exceeded its %.0fs hard "
+                        "timeout — returning [] (no partial results are "
+                        "recoverable: asyncio.wait_for cancels the awaiting "
+                        "coroutine, but the underlying executor thread's "
+                        "synchronous Playwright work keeps running to "
+                        "completion in the background, unseen, holding a "
+                        "browser-worker slot until it finishes on its own).",
+                        job.get("label"), YOUTUBE_TIMEOUT_SECONDS,
+                    )
+                    return []
+                except asyncio.CancelledError:
+                    logger.warning("YouTube Scraper job for %r was cancelled", job.get("label"))
+                    return []
+                except Exception:
+                    logger.exception("YouTube Scraper job for %r failed", job.get("label"))
+                    return []
+
+        async def _scrape_youtube_jobs_group() -> List[str]:
+            # Same "General + one per product" job pattern as Google above,
+            # but merged (deduplicated) back into a single flat comment
+            # list here, since downstream (sentiment/dashboard/PDF) still
+            # expects one "YouTube" comment list, not a per-product
+            # breakdown - identical output shape to before this change.
+            _group_start = time.perf_counter()
+            try:
+                per_job_results = await asyncio.gather(
+                    *(_scrape_youtube_job(job) for job in youtube_jobs),
+                    return_exceptions=True,
+                )
+            finally:
+                _log_stage("YouTube Scraper", time.perf_counter() - _group_start)
+            merged: List[str] = []
+            seen_keys: set = set()
+            for outcome in per_job_results:
+                comments = list(outcome) if not isinstance(outcome, BaseException) else []
+                for c in comments:
+                    key = c.strip().lower()
+                    if not key or key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    merged.append(c)
+            return merged
+
+        async def _scrape_reddit_job(job: Dict[str, Any]) -> List[str]:
+            async with reddit_semaphore:
+                try:
+                    return await asyncio.wait_for(
+                        scrape_reddit_comments(job["data"]),
+                        timeout=REDDIT_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Reddit Scraper job for %r exceeded its %.0fs hard "
+                        "timeout — returning [] (no partial results are "
+                        "recoverable here).",
+                        job.get("label"), REDDIT_TIMEOUT_SECONDS,
+                    )
+                    return []
+                except asyncio.CancelledError:
+                    logger.warning("Reddit Scraper job for %r was cancelled", job.get("label"))
+                    return []
+                except Exception:
+                    logger.exception("Reddit Scraper job for %r failed", job.get("label"))
+                    return []
+
+        async def _scrape_reddit_jobs_group() -> List[str]:
+            # Same "General + one per product" job pattern as Google/YouTube
+            # above, merged (deduplicated) back into a single flat comment
+            # list here, since downstream (sentiment/dashboard/PDF) expects
+            # one "Reddit" comment list, not a per-product breakdown.
+            _group_start = time.perf_counter()
+            try:
+                per_job_results = await asyncio.gather(
+                    *(_scrape_reddit_job(job) for job in reddit_jobs),
+                    return_exceptions=True,
+                )
+            finally:
+                _log_stage("Reddit Scraper", time.perf_counter() - _group_start)
+            merged: List[str] = []
+            seen_keys: set = set()
+            for outcome in per_job_results:
+                comments = list(outcome) if not isinstance(outcome, BaseException) else []
+                for c in comments:
+                    key = c.strip().lower()
+                    if not key or key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    merged.append(c)
+            return merged
+
         results = await asyncio.gather(
             _scrape_google_jobs_group(),
             _timed("Twitter Scraper", scrape_twitter_comments(company_data), timeout=TWITTER_TIMEOUT_SECONDS),
             _timed("Instagram Scraper", scrape_instagram_comments(company_data), timeout=INSTAGRAM_TIMEOUT_SECONDS),
-            _timed("YouTube Scraper", scrape_youtube_comments(company_data), timeout=YOUTUBE_TIMEOUT_SECONDS),
+            _scrape_youtube_jobs_group(),
+            _scrape_reddit_jobs_group(),
             return_exceptions=True,
         )
 
         google_results = results[0]
-        twitter_comments, instagram_comments, youtube_comments = results[1], results[2], results[3]
+        twitter_comments, instagram_comments, youtube_comments, reddit_comments = (
+            results[1], results[2], results[3], results[4],
+        )
 
         google_by_product: List[Dict[str, Any]] = []
         google_all_comments: List[str] = []
@@ -385,6 +611,7 @@ async def analyze(request: Request, company_name: str = Form(...)):
             "Twitter":   list(twitter_comments)   if not isinstance(twitter_comments,   BaseException) else [],
             "Instagram": list(instagram_comments) if not isinstance(instagram_comments, BaseException) else [],
             "YouTube":   list(youtube_comments)   if not isinstance(youtube_comments,   BaseException) else [],
+            "Reddit":    list(reddit_comments)    if not isinstance(reddit_comments,    BaseException) else [],
         }
 
         comment_product_lookup: Dict[str, str] = {}
@@ -405,14 +632,20 @@ async def analyze(request: Request, company_name: str = Form(...)):
         product_lookup_by_key = {(p, c.lower()): prod for p, c, prod in combined}
 
         _stage_start = time.perf_counter()
-        pipe = get_sentiment_pipeline()
+        _sentiment_loop = asyncio.get_running_loop()
+        pipe = await _sentiment_loop.run_in_executor(_SENTIMENT_EXECUTOR, get_sentiment_pipeline)
 
         # Batched sentiment call: one (chunked) pass over all unique comments
         # instead of one pipeline call per comment. analyze_sentiment_batch()
         # returns sentiments in the same order as `unique`, with identical
         # label mapping / keyword fallback semantics to analyze_sentiment().
+        # Run via the same dedicated executor as the preload above, so this
+        # (still synchronous, still unmodified) call runs off the event
+        # loop instead of blocking it.
         comment_texts = [comment for _, comment in unique]
-        sentiments = analyze_sentiment_batch(pipe, comment_texts)
+        sentiments = await _sentiment_loop.run_in_executor(
+            _SENTIMENT_EXECUTOR, analyze_sentiment_batch, pipe, comment_texts
+        )
 
         comment_rows: List[Dict[str, Any]] = []
         for (platform, comment), sentiment in zip(unique, sentiments):
@@ -453,6 +686,75 @@ async def analyze(request: Request, company_name: str = Form(...)):
         platform_sentiment = _aggregate_by_key(product_rows, "platform")
         brand_reputation = _aggregate_brand_reputation(brand_rows)
 
+        # --- Aspect Intelligence (Phase 1) --------------------------------
+        # Per-product aspect extraction + per-aspect sentiment + aspect
+        # score/frequency/importance, computed only over product_rows
+        # (never brand_rows) so Brand Reputation stays completely separate
+        # from product-level aspect data, mirroring the existing
+        # product_sentiment/brand_reputation split above. Purely additive -
+        # never raises, never alters comment_rows/product_sentiment/
+        # brand_reputation/summary/PDF below.
+        try:
+            aspect_intelligence = build_aspect_intelligence_by_product(product_rows, pipe=pipe)
+        except Exception:
+            logger.exception("Aspect intelligence build failed for %s", company_name)
+            aspect_intelligence = {}
+
+        # --- Confidence Score + Buying Recommendation (additive) ----------
+        # Reads only what's already been computed above (product_sentiment,
+        # platform_sentiment, aspect_intelligence). Never recomputes
+        # sentiment/aspects; degrades to "No Data"/"Not Enough Data" rather
+        # than raising, mirroring the try/except around aspect_intelligence
+        # just above. Does not alter product_sentiment/platform_sentiment/
+        # aspect_intelligence themselves.
+        try:
+            platforms_covered_count = len([p for p, c in platform_comments.items() if c])
+            overall_platform_agreement = _platform_agreement(platform_sentiment)
+            overall_aspect_consistency = _aspect_consistency(
+                [a for aspects in aspect_intelligence.values() for a in aspects]
+            )
+            confidence_score = _compute_confidence_score(
+                review_count=total,
+                platforms_covered=platforms_covered_count,
+                platform_agreement=overall_platform_agreement,
+                aspect_consistency=overall_aspect_consistency,
+            )
+
+            product_recommendations: Dict[str, Any] = {}
+            for product_name in scrape_targets:
+                p_stats = product_sentiment.get(product_name, {})
+                p_aspects = aspect_intelligence.get(product_name, [])
+                p_confidence = _compute_confidence_score(
+                    review_count=p_stats.get("total", 0),
+                    platforms_covered=platforms_covered_count,
+                    platform_agreement=overall_platform_agreement,
+                    aspect_consistency=_aspect_consistency(p_aspects),
+                )
+                product_recommendations[product_name] = _compute_buying_recommendation(
+                    product_score=p_stats.get("score", 0),
+                    aspects=p_aspects,
+                    review_count=p_stats.get("total", 0),
+                    confidence=p_confidence,
+                )
+
+            overall_buying_recommendation = _compute_buying_recommendation(
+                product_score=brand_score,
+                aspects=[a for aspects in aspect_intelligence.values() for a in aspects],
+                review_count=total,
+                confidence=confidence_score,
+            )
+        except Exception:
+            logger.exception(
+                "Confidence score / buying recommendation computation failed for %s",
+                company_name,
+            )
+            confidence_score = {"score": 0, "label": "No Data", "css_class": "no-data"}
+            product_recommendations = {}
+            overall_buying_recommendation = {
+                "label": "No Data", "css_class": "no-data",
+                "explanation": "Not enough data to generate a recommendation.",
+            }
+
         real_products = {k: v for k, v in product_sentiment.items() if k != "General"}
         top_positive_product = (
             max(real_products.items(), key=lambda kv: kv[1]["positive_pct"])[0]
@@ -481,6 +783,10 @@ async def analyze(request: Request, company_name: str = Form(...)):
             selected_products=scrape_targets,
             product_sentiment=product_sentiment,
             brand_reputation=brand_reputation,
+            aspect_intelligence=aspect_intelligence,
+            confidence_score=confidence_score,
+            buying_recommendation=overall_buying_recommendation,
+            product_recommendations=product_recommendations,
         )
 
         insight_tabs = _build_insight_tabs(product_rows, platform_comments)
@@ -551,6 +857,17 @@ async def analyze(request: Request, company_name: str = Form(...)):
                 "product_sentiment": product_sentiment,
                 "platform_sentiment": platform_sentiment,
                 "brand_reputation": brand_reputation,
+                # Additive (Phase 1): per-product aspect extraction +
+                # per-aspect sentiment + aspect score/frequency/importance,
+                # derived from product_rows only. Existing keys above/below
+                # are all unchanged.
+                "aspect_intelligence": aspect_intelligence,
+                # --- Additive (Phase 2): Confidence Score + Buying
+                # Recommendation (overall + per selected product). All
+                # existing keys above/below are unchanged.
+                "confidence_score":     confidence_score,
+                "buying_recommendation": overall_buying_recommendation,
+                "product_recommendations": product_recommendations,
                 "platform_comments": platform_comments,
                 "comments":         comment_rows,
                 "insight_tabs":     insight_tabs,
@@ -591,6 +908,14 @@ async def analyze(request: Request, company_name: str = Form(...)):
             "recommendations":         [],
             "product_summaries":       [],
             "brand_reputation_summary": "No brand-wide (non-product) reviews were collected for this run.",
+            # --- Additive (Phase 2) defaults for error path -------------
+            "best_aspects": [], "worst_aspects": [],
+            "confidence_score": {"score": 0, "label": "No Data", "css_class": "no-data"},
+            "buying_recommendation": {
+                "label": "No Data", "css_class": "no-data",
+                "explanation": "Analysis unavailable due to an error.",
+            },
+            "product_recommendations": {},
         }
         _empty_brand_reputation = {
             "positive": 0, "negative": 0, "neutral": 0, "total": 0,
@@ -615,7 +940,14 @@ async def analyze(request: Request, company_name: str = Form(...)):
                 "brand_score": 0, "brand_label": "No Data",
                 "product_sentiment": {}, "platform_sentiment": {},
                 "brand_reputation": _empty_brand_reputation,
-                "platform_comments": {"Google": [], "Twitter": [], "Instagram": [], "YouTube": []},
+                "aspect_intelligence": {},
+                "confidence_score": {"score": 0, "label": "No Data", "css_class": "no-data"},
+                "buying_recommendation": {
+                    "label": "No Data", "css_class": "no-data",
+                    "explanation": "Analysis unavailable due to an error.",
+                },
+                "product_recommendations": {},
+                "platform_comments": {"Google": [], "Twitter": [], "Instagram": [], "YouTube": [], "Reddit": []},
                 "comments":         [],
                 "insight_tabs":     {"top_positive": [], "top_negative": [], "by_platform": {}, "sample": []},
                 "positive": 0, "negative": 0, "neutral": 0, "total": 0,
@@ -764,6 +1096,9 @@ async def analyze_selected(
         )
 
     async def _timed(name: str, coro, timeout: float = None):
+        # See the first _timed() helper (analyze_website route) for the
+        # full rationale - this is the identical duplicate used by
+        # analyze_selected(). Kept in sync intentionally.
         _start = time.perf_counter()
         try:
             if timeout is not None:
@@ -771,8 +1106,10 @@ async def analyze_selected(
                     return await asyncio.wait_for(coro, timeout=timeout)
                 except asyncio.TimeoutError:
                     logger.warning(
-                        "%s exceeded its %.0fs hard timeout — returning "
-                        "whatever was collected instead of blocking the pipeline.",
+                        "%s exceeded its %.0fs hard timeout — returning [] "
+                        "(no partial results are recoverable from a "
+                        "cancelled coroutine; any underlying background "
+                        "work may keep running unseen after this point).",
                         name, timeout,
                     )
                     return []
@@ -870,12 +1207,74 @@ async def analyze_selected(
             product_company_data["product"] = product_obj.as_dict()
             google_jobs.append({"label": product_obj.name, "data": product_company_data})
 
-        google_semaphore = asyncio.Semaphore(config.MAX_PARALLEL_TASKS)
+        # YouTube jobs mirror google_jobs' "General + one per product" shape,
+        # but keep `company_name` un-concatenated (it doubles as the brand
+        # fallback for the scraper's "<brand> <product> review" search tier
+        # when a product has no brand of its own) and pass the product's
+        # name/brand separately via `product_name`/`product_brand`, which the
+        # scraper reads to drive its product-centric search priority order.
+        # The "General" entry carries neither key, so it gets exactly
+        # today's behavior from the scraper: straight to the official
+        # channel logic.
+        youtube_jobs: List[Dict[str, Any]] = [{"label": "General", "data": company_data}]
+        for product_obj in selected_product_objects:
+            yt_product_data = dict(company_data)
+            yt_product_data["product_name"] = product_obj.name
+            yt_product_data["product_brand"] = product_obj.brand
+            youtube_jobs.append({"label": product_obj.name, "data": yt_product_data})
 
-        GOOGLE_JOB_TIMEOUT_SECONDS = 30
-        TWITTER_TIMEOUT_SECONDS = 20
-        INSTAGRAM_TIMEOUT_SECONDS = 20
-        YOUTUBE_TIMEOUT_SECONDS = 20
+        # Reddit jobs mirror youtube_jobs' shape and data contract exactly
+        # (bare company_name + separate product_name/product_brand), since
+        # reddit_scraper.py's product-centric search priority order
+        # (Product -> Brand+Product -> Company+Product) is driven by those
+        # same fields.
+        reddit_jobs: List[Dict[str, Any]] = [{"label": "General", "data": company_data}]
+        for product_obj in selected_product_objects:
+            reddit_product_data = dict(company_data)
+            reddit_product_data["product_name"] = product_obj.name
+            reddit_product_data["product_brand"] = product_obj.brand
+            reddit_jobs.append({"label": product_obj.name, "data": reddit_product_data})
+
+        # Website Review jobs: one per selected product only (no "General"
+        # entry) - scrape_website_reviews() reads company_data["product_url"]
+        # and its own docstring is explicit that a specific product page is
+        # the reliable source (JSON-LD/review-app data lives there), not the
+        # site root, so there's nothing useful for a company-wide job to do.
+        website_review_jobs: List[Dict[str, Any]] = []
+        for product_obj in selected_product_objects:
+            website_review_data = dict(company_data)
+            website_review_data["product_url"] = product_obj.url
+            website_review_data["product_name"] = product_obj.name
+            website_review_jobs.append({"label": product_obj.name, "data": website_review_data})
+
+        google_semaphore = asyncio.Semaphore(config.MAX_PARALLEL_TASKS)
+        # Bounded to the YouTube scraper's own browser-pool size rather than
+        # config.MAX_PARALLEL_TASKS: that pool (not this semaphore) is the
+        # real concurrency limit, so sizing the semaphore to match keeps
+        # every job's asyncio.wait_for clock from starting before a browser
+        # worker is actually available to run it.
+        youtube_semaphore = asyncio.Semaphore(MAX_BROWSER_WORKERS)
+        # Same reasoning as youtube_semaphore above, sized to Reddit's own
+        # (deliberately small) worker pool instead of config.MAX_PARALLEL_TASKS,
+        # since Reddit's public JSON endpoints rate-limit unauthenticated
+        # clients more aggressively than a generic concurrency cap would allow for.
+        reddit_semaphore = asyncio.Semaphore(MAX_REDDIT_WORKERS)
+        # Sized to website_review_scraper.py's own ThreadPoolExecutor
+        # (MAX_WORKERS), same reasoning as youtube_semaphore/reddit_semaphore
+        # above - it's plain httpx (no browser), so this is a much smaller,
+        # cheaper pool than the browser-based scrapers'.
+        website_review_semaphore = asyncio.Semaphore(MAX_WEBSITE_REVIEW_WORKERS)
+
+        GOOGLE_JOB_TIMEOUT_SECONDS = 48
+        TWITTER_TIMEOUT_SECONDS = 26
+        INSTAGRAM_TIMEOUT_SECONDS = 26
+        YOUTUBE_TIMEOUT_SECONDS = 30
+        REDDIT_TIMEOUT_SECONDS = 20
+        # website_review_scraper.py's own internal TIME_BUDGET_SECONDS is 15s
+        # and it never launches a browser, so this only needs a small margin
+        # on top of that (unlike the browser-scraper timeouts above, which
+        # also have to absorb several seconds of Chromium setup time).
+        WEBSITE_REVIEW_TIMEOUT_SECONDS = 20
 
         async def _scrape_google_job(job: Dict[str, Any]) -> List[str]:
             async with google_semaphore:
@@ -887,8 +1286,12 @@ async def analyze_selected(
                 except asyncio.TimeoutError:
                     logger.warning(
                         "Google Reviews job for %r exceeded its %.0fs hard "
-                        "timeout — returning whatever was collected instead "
-                        "of blocking the pipeline.",
+                        "timeout — no partial results are recoverable here "
+                        "(asyncio.wait_for cancels the awaited coroutine on "
+                        "timeout and this returns []); any in-progress "
+                        "background scrape may still finish and populate "
+                        "the cache for a later request, see "
+                        "scrape_google_reviews()'s own logging for that.",
                         job.get("label"), GOOGLE_JOB_TIMEOUT_SECONDS,
                     )
                     return []
@@ -916,16 +1319,177 @@ async def analyze_selected(
             finally:
                 _log_stage("Google Review Collection", time.perf_counter() - _group_start)
 
+        async def _scrape_youtube_job(job: Dict[str, Any]) -> List[str]:
+            async with youtube_semaphore:
+                try:
+                    return await asyncio.wait_for(
+                        scrape_youtube_comments(job["data"]),
+                        timeout=YOUTUBE_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "YouTube Scraper job for %r exceeded its %.0fs hard "
+                        "timeout — returning [] (no partial results are "
+                        "recoverable: asyncio.wait_for cancels the awaiting "
+                        "coroutine, but the underlying executor thread's "
+                        "synchronous Playwright work keeps running to "
+                        "completion in the background, unseen, holding a "
+                        "browser-worker slot until it finishes on its own).",
+                        job.get("label"), YOUTUBE_TIMEOUT_SECONDS,
+                    )
+                    return []
+                except asyncio.CancelledError:
+                    logger.warning("YouTube Scraper job for %r was cancelled", job.get("label"))
+                    return []
+                except Exception:
+                    logger.exception("YouTube Scraper job for %r failed", job.get("label"))
+                    return []
+
+        async def _scrape_youtube_jobs_group() -> List[str]:
+            # Same "General + one per product" job pattern as Google above,
+            # but merged (deduplicated) back into a single flat comment
+            # list here, since downstream (sentiment/dashboard/PDF) still
+            # expects one "YouTube" comment list, not a per-product
+            # breakdown - identical output shape to before this change.
+            _group_start = time.perf_counter()
+            try:
+                per_job_results = await asyncio.gather(
+                    *(_scrape_youtube_job(job) for job in youtube_jobs),
+                    return_exceptions=True,
+                )
+            finally:
+                _log_stage("YouTube Scraper", time.perf_counter() - _group_start)
+            merged: List[str] = []
+            seen_keys: set = set()
+            for outcome in per_job_results:
+                comments = list(outcome) if not isinstance(outcome, BaseException) else []
+                for c in comments:
+                    key = c.strip().lower()
+                    if not key or key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    merged.append(c)
+            return merged
+
+        async def _scrape_reddit_job(job: Dict[str, Any]) -> List[str]:
+            async with reddit_semaphore:
+                try:
+                    return await asyncio.wait_for(
+                        scrape_reddit_comments(job["data"]),
+                        timeout=REDDIT_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Reddit Scraper job for %r exceeded its %.0fs hard "
+                        "timeout — returning [] (no partial results are "
+                        "recoverable here).",
+                        job.get("label"), REDDIT_TIMEOUT_SECONDS,
+                    )
+                    return []
+                except asyncio.CancelledError:
+                    logger.warning("Reddit Scraper job for %r was cancelled", job.get("label"))
+                    return []
+                except Exception:
+                    logger.exception("Reddit Scraper job for %r failed", job.get("label"))
+                    return []
+
+        async def _scrape_reddit_jobs_group() -> List[str]:
+            # Same "General + one per product" job pattern as Google/YouTube
+            # above, merged (deduplicated) back into a single flat comment
+            # list here, since downstream (sentiment/dashboard/PDF) expects
+            # one "Reddit" comment list, not a per-product breakdown.
+            _group_start = time.perf_counter()
+            try:
+                per_job_results = await asyncio.gather(
+                    *(_scrape_reddit_job(job) for job in reddit_jobs),
+                    return_exceptions=True,
+                )
+            finally:
+                _log_stage("Reddit Scraper", time.perf_counter() - _group_start)
+            merged: List[str] = []
+            seen_keys: set = set()
+            for outcome in per_job_results:
+                comments = list(outcome) if not isinstance(outcome, BaseException) else []
+                for c in comments:
+                    key = c.strip().lower()
+                    if not key or key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    merged.append(c)
+            return merged
+
+        async def _scrape_website_review_job(job: Dict[str, Any]) -> List[str]:
+            async with website_review_semaphore:
+                try:
+                    return await asyncio.wait_for(
+                        scrape_website_reviews(job["data"]),
+                        timeout=WEBSITE_REVIEW_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Website Review job for %r exceeded its %.0fs hard "
+                        "timeout — returning [] (no partial results are "
+                        "recoverable here).",
+                        job.get("label"), WEBSITE_REVIEW_TIMEOUT_SECONDS,
+                    )
+                    return []
+                except asyncio.CancelledError:
+                    logger.warning("Website Review job for %r was cancelled", job.get("label"))
+                    return []
+                except Exception:
+                    logger.exception("Website Review job for %r failed", job.get("label"))
+                    return []
+
+        async def _scrape_website_review_jobs_group() -> List[Any]:
+            # Kept per-job (like Google above), NOT merged into one flat
+            # list like YouTube/Reddit - every website review must stay
+            # attributed to the specific product page it was scraped from.
+            _group_start = time.perf_counter()
+            try:
+                return await asyncio.gather(
+                    *(_scrape_website_review_job(job) for job in website_review_jobs),
+                    return_exceptions=True,
+                )
+            finally:
+                _log_stage("Website Review Scraper", time.perf_counter() - _group_start)
+
+        # Product Intelligence Engine (Phase 3A): for every selected product,
+        # fetch that product's own page HTML exactly once and derive name/
+        # brand/category/image/price/availability/specifications/FAQ/
+        # aggregate rating/rating count/website reviews from that single
+        # fetch. Runs as its own branch of this same gather() so it adds no
+        # serial latency on top of the existing Google/Twitter/Instagram/
+        # YouTube/Reddit collection - build_product_intelligence_batch()
+        # carries its own internal concurrency cap and per-product timeout,
+        # so a slow/blocked product page can never block this branch either.
         results = await asyncio.gather(
             _scrape_google_jobs_group(),
             _timed("Twitter Scraper", scrape_twitter_comments(company_data), timeout=TWITTER_TIMEOUT_SECONDS),
             _timed("Instagram Scraper", scrape_instagram_comments(company_data), timeout=INSTAGRAM_TIMEOUT_SECONDS),
-            _timed("YouTube Scraper", scrape_youtube_comments(company_data), timeout=YOUTUBE_TIMEOUT_SECONDS),
+            _scrape_youtube_jobs_group(),
+            _scrape_reddit_jobs_group(),
+            _timed(
+                "Product Intelligence Enrichment",
+                build_product_intelligence_batch([p.as_dict() for p in selected_product_objects]),
+            ),
+            _scrape_website_review_jobs_group(),
             return_exceptions=True,
         )
 
         google_results = results[0]
-        twitter_comments, instagram_comments, youtube_comments = results[1], results[2], results[3]
+        twitter_comments, instagram_comments, youtube_comments, reddit_comments = (
+            results[1], results[2], results[3], results[4],
+        )
+        product_intelligence_results = results[5] if not isinstance(results[5], BaseException) else []
+        # Additive, product-centric enrichment payload - one entry per
+        # selected product, in the same order as scrape_targets/products.
+        # Never referenced by the existing scrape -> sentiment -> PDF
+        # pipeline above/below; it is purely extra context for dashboard.html.
+        product_intelligence: List[Dict[str, Any]] = [
+            pi.as_dict() if hasattr(pi, "as_dict") else pi
+            for pi in (product_intelligence_results or [])
+        ]
+        website_review_job_results = results[6] if not isinstance(results[6], BaseException) else []
 
         google_by_product: List[Dict[str, Any]] = []
         google_all_comments: List[str] = []
@@ -935,11 +1499,61 @@ async def analyze_selected(
             google_by_product.append({"product": job["label"], "comments": comments})
             google_all_comments.extend(comments)
 
+        # --- Website Reviews (Product Intelligence) -----------------------
+        # Two sources, both scoped to a single selected product's own page,
+        # merged into one list:
+        #   1) product_intelligence.py's website_reviews field (JSON-LD ->
+        #      structured provider -> generic HTML), already computed above
+        #      via build_product_intelligence_batch().
+        #   2) scrapers/website_review_scraper.py's scrape_website_reviews()
+        #      - previously written but never called anywhere in app.py -
+        #      run as its own per-product job (website_review_jobs, above).
+        # Both extractors use the same JSON-LD-first detection order against
+        # the same product page, so the same review can legitimately surface
+        # from both sources. Deduped here by normalized (whitespace-
+        # collapsed, case-insensitive) text before either one reaches
+        # `platform_comments`/`combined`, on top of (not instead of) the
+        # existing clean -> unique_comments() dedupe pipeline below - so a
+        # duplicate can never inflate Website review counts even before
+        # sentiment analysis runs. Unlike Google comments, which are matched
+        # to a product heuristically, every one of these is already known to
+        # belong to exactly the right product - making Website Reviews the
+        # highest-confidence product sentiment source available. Folding
+        # them into `platform_comments`/`combined` here is the only change
+        # needed to put them through the existing clean -> dedupe ->
+        # sentiment-batch -> aspect/confidence pipeline below, completely
+        # unchanged. Product Discovery, the Dashboard, the PDF, and every
+        # route/API shape are untouched by this.
+        website_review_texts: List["tuple[str, str]"] = []
+        _seen_website_review_keys: set = set()
+
+        def _add_website_review(product_name: str, text: str) -> None:
+            text = (text or "").strip()
+            if not text:
+                return
+            key = re.sub(r"\s+", " ", text).strip().lower()
+            if key in _seen_website_review_keys:
+                return
+            _seen_website_review_keys.add(key)
+            website_review_texts.append((product_name, text))
+
+        for product_obj, pi in zip(selected_product_objects, product_intelligence):
+            for review in (pi.get("website_reviews") or []):
+                _add_website_review(product_obj.name, review.get("text") or "")
+
+        for job, outcome in zip(website_review_jobs, website_review_job_results):
+            comments = list(outcome) if not isinstance(outcome, BaseException) else []
+            comments = comments[:config.MAX_COMMENTS_PER_PRODUCT]
+            for text in comments:
+                _add_website_review(job["label"], text)
+
         platform_comments = {
             "Google":    google_all_comments,
             "Twitter":   list(twitter_comments)   if not isinstance(twitter_comments,   BaseException) else [],
             "Instagram": list(instagram_comments) if not isinstance(instagram_comments, BaseException) else [],
             "YouTube":   list(youtube_comments)   if not isinstance(youtube_comments,   BaseException) else [],
+            "Reddit":    list(reddit_comments)    if not isinstance(reddit_comments,    BaseException) else [],
+            "Website":   [text for _, text in website_review_texts],
         }
 
         comment_product_lookup: Dict[str, str] = {}
@@ -947,10 +1561,19 @@ async def analyze_selected(
             for comment in entry["comments"]:
                 comment_product_lookup.setdefault(comment, entry["product"])
 
+        website_product_lookup: Dict[str, str] = {}
+        for product_name, text in website_review_texts:
+            website_product_lookup.setdefault(text, product_name)
+
         combined = []
         for platform, comments in platform_comments.items():
             for comment in comments:
-                product_label = comment_product_lookup.get(comment, "General") if platform == "Google" else "General"
+                if platform == "Google":
+                    product_label = comment_product_lookup.get(comment, "General")
+                elif platform == "Website":
+                    product_label = website_product_lookup.get(comment, "General")
+                else:
+                    product_label = "General"
                 cleaned = normalize_text(remove_links(clean_comment(comment)))
                 if cleaned:
                     combined.append((platform, cleaned, product_label))
@@ -959,10 +1582,13 @@ async def analyze_selected(
         product_lookup_by_key = {(p, c.lower()): prod for p, c, prod in combined}
 
         _stage_start = time.perf_counter()
-        pipe = get_sentiment_pipeline()
+        _sentiment_loop = asyncio.get_running_loop()
+        pipe = await _sentiment_loop.run_in_executor(_SENTIMENT_EXECUTOR, get_sentiment_pipeline)
 
         comment_texts = [comment for _, comment in unique]
-        sentiments = analyze_sentiment_batch(pipe, comment_texts)
+        sentiments = await _sentiment_loop.run_in_executor(
+            _SENTIMENT_EXECUTOR, analyze_sentiment_batch, pipe, comment_texts
+        )
 
         comment_rows: List[Dict[str, Any]] = []
         for (platform, comment), sentiment in zip(unique, sentiments):
@@ -998,6 +1624,66 @@ async def analyze_selected(
         platform_sentiment = _aggregate_by_key(product_rows, "platform")
         brand_reputation = _aggregate_brand_reputation(brand_rows)
 
+        # --- Aspect Intelligence (Phase 1, mirrors /analyze) --------------
+        # Scoped to product_rows only - never brand_rows - so Brand
+        # Reputation stays completely separate from product-level aspect
+        # data. Purely additive; never alters anything above/below it.
+        try:
+            aspect_intelligence = build_aspect_intelligence_by_product(product_rows, pipe=pipe)
+        except Exception:
+            logger.exception("Aspect intelligence build failed for %s", company_name)
+            aspect_intelligence = {}
+
+        # --- Confidence Score + Buying Recommendation (additive, mirrors
+        # /analyze) -----------------------------------------------------
+        try:
+            platforms_covered_count = len([p for p, c in platform_comments.items() if c])
+            overall_platform_agreement = _platform_agreement(platform_sentiment)
+            overall_aspect_consistency = _aspect_consistency(
+                [a for aspects in aspect_intelligence.values() for a in aspects]
+            )
+            confidence_score = _compute_confidence_score(
+                review_count=total,
+                platforms_covered=platforms_covered_count,
+                platform_agreement=overall_platform_agreement,
+                aspect_consistency=overall_aspect_consistency,
+            )
+
+            product_recommendations: Dict[str, Any] = {}
+            for product_name in scrape_targets:
+                p_stats = product_sentiment.get(product_name, {})
+                p_aspects = aspect_intelligence.get(product_name, [])
+                p_confidence = _compute_confidence_score(
+                    review_count=p_stats.get("total", 0),
+                    platforms_covered=platforms_covered_count,
+                    platform_agreement=overall_platform_agreement,
+                    aspect_consistency=_aspect_consistency(p_aspects),
+                )
+                product_recommendations[product_name] = _compute_buying_recommendation(
+                    product_score=p_stats.get("score", 0),
+                    aspects=p_aspects,
+                    review_count=p_stats.get("total", 0),
+                    confidence=p_confidence,
+                )
+
+            overall_buying_recommendation = _compute_buying_recommendation(
+                product_score=brand_score,
+                aspects=[a for aspects in aspect_intelligence.values() for a in aspects],
+                review_count=total,
+                confidence=confidence_score,
+            )
+        except Exception:
+            logger.exception(
+                "Confidence score / buying recommendation computation failed for %s",
+                company_name,
+            )
+            confidence_score = {"score": 0, "label": "No Data", "css_class": "no-data"}
+            product_recommendations = {}
+            overall_buying_recommendation = {
+                "label": "No Data", "css_class": "no-data",
+                "explanation": "Not enough data to generate a recommendation.",
+            }
+
         real_products = {k: v for k, v in product_sentiment.items() if k != "General"}
         top_positive_product = (
             max(real_products.items(), key=lambda kv: kv[1]["positive_pct"])[0]
@@ -1025,6 +1711,10 @@ async def analyze_selected(
             selected_products=scrape_targets,
             product_sentiment=product_sentiment,
             brand_reputation=brand_reputation,
+            aspect_intelligence=aspect_intelligence,
+            confidence_score=confidence_score,
+            buying_recommendation=overall_buying_recommendation,
+            product_recommendations=product_recommendations,
         )
 
         insight_tabs = _build_insight_tabs(product_rows, platform_comments)
@@ -1107,6 +1797,24 @@ async def analyze_selected(
                     "values": [positive, negative, neutral],
                 },
                 "summary":        summary,
+                # Additive (Phase 3A): one structured Product Intelligence
+                # object per selected product - name/brand/category/url/
+                # image/price/availability/specifications/faq/aggregate
+                # rating/rating count/website reviews. Existing template
+                # keys above are all unchanged.
+                "product_intelligence": product_intelligence,
+                # Additive (Phase 1): per-product aspect extraction +
+                # per-aspect sentiment + aspect score/frequency/importance,
+                # derived from product_rows only - distinct from
+                # product_intelligence above (that's catalog/page data;
+                # this is review-derived aspect sentiment).
+                "aspect_intelligence": aspect_intelligence,
+                # --- Additive (Phase 2): Confidence Score + Buying
+                # Recommendation (overall + per selected product). All
+                # existing keys above/below are unchanged.
+                "confidence_score":     confidence_score,
+                "buying_recommendation": overall_buying_recommendation,
+                "product_recommendations": product_recommendations,
                 "pdf_path":       pdf_path_str,
                 "download_dir":   str(export_base).replace("\\", "/"),
                 "report_generated": report_generated,
@@ -1131,6 +1839,14 @@ async def analyze_selected(
             "recommendations":         [],
             "product_summaries":       [],
             "brand_reputation_summary": "No brand-wide (non-product) reviews were collected for this run.",
+            # --- Additive (Phase 2) defaults for error path -------------
+            "best_aspects": [], "worst_aspects": [],
+            "confidence_score": {"score": 0, "label": "No Data", "css_class": "no-data"},
+            "buying_recommendation": {
+                "label": "No Data", "css_class": "no-data",
+                "explanation": "Analysis unavailable due to an error.",
+            },
+            "product_recommendations": {},
         }
         _empty_brand_reputation = {
             "positive": 0, "negative": 0, "neutral": 0, "total": 0,
@@ -1156,7 +1872,7 @@ async def analyze_selected(
                 "brand_score": 0, "brand_label": "No Data",
                 "product_sentiment": {}, "platform_sentiment": {},
                 "brand_reputation": _empty_brand_reputation,
-                "platform_comments": {"Google": [], "Twitter": [], "Instagram": [], "YouTube": []},
+                "platform_comments": {"Google": [], "Twitter": [], "Instagram": [], "YouTube": [], "Reddit": [], "Website": []},
                 "comments":         [],
                 "insight_tabs":     {"top_positive": [], "top_negative": [], "by_platform": {}, "sample": []},
                 "positive": 0, "negative": 0, "neutral": 0, "total": 0,
@@ -1164,6 +1880,14 @@ async def analyze_selected(
                 "platform_counts": {"Google": 0, "Twitter": 0, "Instagram": 0, "YouTube": 0},
                 "chart_payload": {"labels": ["Positive", "Negative", "Neutral"], "values": [0, 0, 0]},
                 "summary":     _empty_summary,
+                "product_intelligence": [],
+                "aspect_intelligence": {},
+                "confidence_score": {"score": 0, "label": "No Data", "css_class": "no-data"},
+                "buying_recommendation": {
+                    "label": "No Data", "css_class": "no-data",
+                    "explanation": "Analysis unavailable due to an error.",
+                },
+                "product_recommendations": {},
                 "pdf_path": "",
                 "download_dir": "downloads",
                 "report_generated": datetime.utcnow().strftime("%B %d, %Y at %H:%M UTC"),
@@ -1344,6 +2068,192 @@ def _build_insight_tabs(
         "by_platform":  by_platform,
     }
 
+# ============================================================================
+# Confidence Score + Buying Recommendation (additive integration layer)
+# ----------------------------------------------------------------------------
+# These helpers ONLY read data that's already computed elsewhere in this
+# file (product_sentiment, platform_sentiment, aspect_intelligence output
+# from aspect_intelligence.py). None of them re-run sentiment analysis,
+# re-extract aspects, or touch aspect_intelligence.py / product_intelligence.py
+# / sentiment.py / the scrapers / routes / PDF generation. Every call site
+# below degrades to a "No Data" / "Not Enough Data" result rather than
+# raising, mirroring the try/except already wrapped around
+# build_aspect_intelligence_by_product() in /analyze.
+# ============================================================================
+
+def _score_spread_to_consistency(scores: List[float]) -> float:
+    """Shared 0-100 'consistency' helper: low spread (std-dev) across a set
+    of 0-100 scores maps to high consistency. Reused for both aspect-level
+    consistency (spread across one product's aspect scores) and
+    cross-platform agreement (spread across per-platform scores)."""
+    if len(scores) < 2:
+        # Nothing to disagree with - treat single-score/no-score sets as
+        # fully consistent; sparse data is already penalized separately by
+        # the review-volume component of the confidence score below.
+        return 100.0 if scores else 0.0
+    mean = sum(scores) / len(scores)
+    variance = sum((s - mean) ** 2 for s in scores) / len(scores)
+    std_dev = variance ** 0.5
+    return round(max(0.0, 100.0 - (std_dev * 2)), 1)
+
+
+def _aspect_consistency(aspects: "List[Dict[str, Any]] | None") -> float:
+    """0-100: how consistent a product's aspect scores are with each other
+    (e.g. Sound Quality=90, Build Quality=85, Comfort=88 -> high
+    consistency; Sound Quality=95, Battery=20 -> low consistency, a "mixed
+    bag" product). Reads aspect_intelligence output only; never mutates it."""
+    scores = [a.get("score", 0) for a in (aspects or []) if a.get("total")]
+    return _score_spread_to_consistency(scores)
+
+
+def _platform_agreement(platform_sentiment: "Dict[str, Dict[str, Any]] | None") -> float:
+    """0-100: how much the platforms that returned data agree with each
+    other on sentiment score. Reads platform_sentiment (already built by
+    _aggregate_by_key) only."""
+    scores = [v.get("score", 0) for v in (platform_sentiment or {}).values() if v.get("total")]
+    return _score_spread_to_consistency(scores)
+
+
+def _compute_confidence_score(
+    review_count: int,
+    platforms_covered: int,
+    platform_agreement: float,
+    aspect_consistency: float,
+) -> Dict[str, Any]:
+    """Confidence Score (0-100): combines review volume, number of
+    platforms, agreement between platforms, and consistency, per
+    requirement. Weights (volume 30% / platform diversity 20% / platform
+    agreement 25% / aspect consistency 25%) are a transparent arithmetic
+    blend of figures already computed elsewhere in this file - not a new
+    sentiment model."""
+    volume_score = min(100.0, (review_count / 50.0) * 100.0) if review_count else 0.0
+    platform_score = min(100.0, (platforms_covered / 4.0) * 100.0)
+
+    confidence = (
+        volume_score * 0.30
+        + platform_score * 0.20
+        + platform_agreement * 0.25
+        + aspect_consistency * 0.25
+    )
+    confidence = round(max(0.0, min(100.0, confidence)))
+
+    if confidence >= 80:
+        label, css_class = "Very High", "very-positive"
+    elif confidence >= 60:
+        label, css_class = "High", "positive"
+    elif confidence >= 40:
+        label, css_class = "Moderate", "mixed"
+    elif confidence >= 20:
+        label, css_class = "Low", "negative"
+    else:
+        label, css_class = "Very Low", "very-negative"
+
+    return {
+        "score": confidence,
+        "label": label,
+        "css_class": css_class,
+        "review_count": review_count,
+        "platforms_covered": platforms_covered,
+        "volume_score": round(volume_score, 1),
+        "platform_score": round(platform_score, 1),
+        "platform_agreement": platform_agreement,
+        "aspect_consistency": aspect_consistency,
+    }
+
+
+_RECOMMENDATION_CSS_CLASS = {
+    "Highly Recommended": "very-positive",
+    "Recommended":        "positive",
+    "Mixed":              "mixed",
+    "Buy with Caution":   "negative",
+    "Not Recommended":    "very-negative",
+    "Not Enough Data":    "no-data",
+}
+
+
+def _compute_buying_recommendation(
+    product_score: float,
+    aspects: "List[Dict[str, Any]] | None",
+    review_count: int,
+    confidence: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Buying Recommendation - combines overall sentiment score, per-aspect
+    scores, review volume, and the confidence/consistency figures above,
+    instead of using overall sentiment alone (per requirement). Reads
+    already-computed product_sentiment/aspect_intelligence figures only;
+    never recomputes sentiment or aspect extraction itself."""
+    aspects = aspects or []
+    scored_aspects = [a for a in aspects if a.get("total")]
+    aspect_scores = [a["score"] for a in scored_aspects]
+    avg_aspect_score = round(sum(aspect_scores) / len(aspect_scores), 1) if aspect_scores else product_score
+
+    # Blend overall sentiment score with the aspect-level average so a
+    # product that "sounds fine overall" but scores badly on the specific
+    # things reviewers complain about doesn't get an inflated recommendation.
+    blended_score = round((product_score * 0.5) + (avg_aspect_score * 0.5), 1)
+    confidence_score = confidence.get("score", 0)
+
+    best_aspect = max(scored_aspects, key=lambda a: a["score"]) if scored_aspects else None
+    worst_aspect = min(scored_aspects, key=lambda a: a["score"]) if scored_aspects else None
+
+    if review_count < 5 or confidence_score < 30:
+        label = "Not Enough Data"
+        explanation = (
+            f"Only {review_count} review(s) collected with {confidence_score}/100 confidence "
+            "- not enough evidence yet for a reliable recommendation."
+        )
+    elif blended_score >= 80 and confidence_score >= 60:
+        label = "Highly Recommended"
+        explanation = (
+            f"Strong sentiment ({blended_score}/100 blended score) backed by "
+            f"{confidence_score}/100 confidence across {review_count} review(s)."
+        )
+    elif blended_score >= 65 and confidence_score >= 40:
+        label = "Recommended"
+        explanation = (
+            f"Generally positive feedback ({blended_score}/100 blended score) with "
+            f"{confidence_score}/100 confidence across {review_count} review(s)."
+        )
+    elif blended_score >= 45:
+        label = "Mixed"
+        explanation = (
+            f"Feedback is mixed ({blended_score}/100 blended score) - some aspects "
+            "perform well, others don't."
+        )
+    elif blended_score >= 30:
+        label = "Buy with Caution"
+        explanation = (
+            f"Below-average feedback ({blended_score}/100 blended score) - review the "
+            "specific complaints below before purchasing."
+        )
+    else:
+        label = "Not Recommended"
+        explanation = (
+            f"Weak feedback ({blended_score}/100 blended score) across "
+            f"{review_count} review(s)."
+        )
+
+    if label != "Not Enough Data":
+        if worst_aspect:
+            explanation += f" Weakest area: {worst_aspect['aspect']} ({worst_aspect['score']}/100)."
+        if best_aspect:
+            explanation += f" Strongest area: {best_aspect['aspect']} ({best_aspect['score']}/100)."
+
+    return {
+        "label": label,
+        "css_class": _RECOMMENDATION_CSS_CLASS.get(label, "no-data"),
+        "blended_score": blended_score,
+        "product_score": product_score,
+        "avg_aspect_score": avg_aspect_score,
+        "explanation": explanation,
+        "best_aspect": best_aspect.get("aspect") if best_aspect else None,
+        "worst_aspect": worst_aspect.get("aspect") if worst_aspect else None,
+        "confidence_score": confidence_score,
+        "confidence_label": confidence.get("label", "No Data"),
+        "review_count": review_count,
+    }
+
+
 def generate_summary(
     company_name: str,
     comment_rows: List[Dict[str, Any]],
@@ -1357,6 +2267,12 @@ def generate_summary(
     selected_products: "List[str] | None" = None,
     product_sentiment: "Dict[str, Dict[str, Any]] | None" = None,
     brand_reputation: "Dict[str, Any] | None" = None,
+    # --- Additive (Phase 2): all optional, all default to None/{} so any
+    # existing caller of generate_summary() keeps working unchanged. -------
+    aspect_intelligence: "Dict[str, List[Dict[str, Any]]] | None" = None,
+    confidence_score: "Dict[str, Any] | None" = None,
+    buying_recommendation: "Dict[str, Any] | None" = None,
+    product_recommendations: "Dict[str, Dict[str, Any]] | None" = None,
 ) -> Dict[str, Any]:
     # NOTE: `comment_rows` here is expected to already be scoped to rows tied
     # to a selected product (see _split_product_and_brand_rows), so every
@@ -1373,6 +2289,17 @@ def generate_summary(
 
     selected_products = selected_products or []
     product_sentiment = product_sentiment or {}
+
+    # --- Additive (Phase 2) inputs, all optional -----------------------
+    aspect_intelligence = aspect_intelligence or {}
+    confidence_score = confidence_score or {
+        "score": 0, "label": "No Data", "css_class": "no-data",
+    }
+    buying_recommendation = buying_recommendation or {
+        "label": "No Data", "css_class": "no-data",
+        "explanation": "Not enough data to generate a recommendation.",
+    }
+    product_recommendations = product_recommendations or {}
 
     # ---- Per-product executive summaries -----------------------------
     # One individual summary per user-selected product, built purely from
@@ -1401,7 +2328,22 @@ def generate_summary(
             "neutral_pct": stats["neutral_pct"],
             "score": stats["score"], "score_label": stats["score_label"],
             "summary": narrative,
+            # --- Additive: per-product Buying Recommendation, if computed
+            # by the caller. Absent/None -> template degrades gracefully.
+            "recommendation": product_recommendations.get(product_name),
         })
+
+    # ---- Best / worst aspects across all selected products (additive) --
+    # Purely derived from aspect_intelligence's already-computed per-aspect
+    # scores; used only to enrich the executive summary text and dashboard,
+    # never fed back into any score/label computed elsewhere.
+    all_scored_aspects: List[Dict[str, Any]] = []
+    for product_name, aspects in aspect_intelligence.items():
+        for a in aspects:
+            if a.get("total"):
+                all_scored_aspects.append({**a, "product": product_name})
+    best_aspects = sorted(all_scored_aspects, key=lambda a: a["score"], reverse=True)[:3]
+    worst_aspects = sorted(all_scored_aspects, key=lambda a: a["score"])[:3]
 
     # ---- Brand Reputation narrative (Google Maps + brand-wide social) --
     brand_reputation = brand_reputation or {
@@ -1456,11 +2398,30 @@ def generate_summary(
         key_insights.append("A significant portion of feedback is negative — attention needed.")
 
     products_label = ", ".join(selected_products) if selected_products else "the selected product(s)"
+
+    # ---- Additive: best/worst-aspect + recommendation/confidence clause -
+    # Appended to the existing executive_summary sentence rather than
+    # replacing it, so every existing consumer of this field keeps getting
+    # its original leading sentence unchanged.
+    if best_aspects or worst_aspects:
+        best_names = ", ".join(a["aspect"] for a in best_aspects) if best_aspects else "not enough data"
+        worst_names = ", ".join(a["aspect"] for a in worst_aspects) if worst_aspects else "not enough data"
+        aspect_clause = (
+            f" Best-performing aspect(s): {best_names}. Areas needing attention: {worst_names}."
+        )
+    else:
+        aspect_clause = ""
+    recommendation_clause = (
+        f" Overall buying recommendation: {buying_recommendation['label']} "
+        f"(confidence: {confidence_score['score']}/100, {confidence_score['label']})."
+    )
+
     return {
         "executive_summary": (
             f"Product Intelligence for {products_label}: {total} product-attributed review(s) "
             f"collected across {len(platforms_covered)} platform(s) covering {products_scraped} "
             f"product(s), with an overall product score of {brand_score}/100 ({brand_label})."
+            f"{aspect_clause}{recommendation_clause}"
         ),
         "overall_sentiment":      brand_label,
         "platforms_covered":      len(platforms_covered),
@@ -1479,6 +2440,14 @@ def generate_summary(
         # above are all preserved for frontend/PDF compatibility) --------
         "product_summaries":         product_summaries,
         "brand_reputation_summary":  brand_reputation_summary,
+
+        # --- Additive (Phase 2): Aspect summary / Confidence / Buying
+        # Recommendation fields. Existing keys above are all unchanged. ---
+        "best_aspects":              best_aspects,
+        "worst_aspects":             worst_aspects,
+        "confidence_score":          confidence_score,
+        "buying_recommendation":     buying_recommendation,
+        "product_recommendations":  product_recommendations,
     }
 
 # =============================================================================

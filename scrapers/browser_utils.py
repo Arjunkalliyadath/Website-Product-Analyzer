@@ -1,10 +1,61 @@
 import asyncio
 import concurrent.futures
 import sys
+import threading
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Awaitable, Callable, List, TypeVar
+from typing import Awaitable, Callable, Iterator, List, TypeVar
 
 _T = TypeVar("_T")
+
+# ---------------------------------------------------------------------------
+# Cross-module browser-launch throttle
+# ---------------------------------------------------------------------------
+# google_scraper.py / youtube_scraper.py / twitter_scraper.py /
+# instagram_scraper.py each maintain their own independent worker pool and
+# their own thread-local browser (see each module's `_ensure_context()`).
+# That per-module pooling/reuse logic is unchanged by this addition.
+#
+# What was missing is any coordination *across* those four modules. Because
+# app.py fires Google/Twitter/Instagram/YouTube from the same asyncio.gather(),
+# a cold start (or a simultaneous recycle) can launch several Chromium
+# processes in the very same instant - observed as 6 concurrent launches,
+# each taking ~16s instead of the normal ~2-4s, because they're all
+# contending for the same CPU cores at once.
+#
+# `browser_launch_slot()` is a small, shared gate that every module wraps
+# around its own (otherwise-unchanged) `pw.chromium.launch(...)` call. It
+# only limits how many Chromium processes may be *launching* at the same
+# moment; it has no effect on an already-warm thread reusing its existing
+# context (that code path returns before ever reaching the launch call), and
+# no effect on how many browsers may be open at once (still each module's
+# own MAX_BROWSER_WORKERS). This is purely a launch-time stagger to reduce
+# CPU contention during simultaneous cold starts.
+MAX_CONCURRENT_BROWSER_LAUNCHES = 2
+
+_browser_launch_semaphore = threading.Semaphore(MAX_CONCURRENT_BROWSER_LAUNCHES)
+
+
+@contextmanager
+def browser_launch_slot() -> Iterator[None]:
+    """Acquire one of the shared browser-launch slots.
+
+    Usage (inside a scraper module's `_ensure_context()`, wrapping only the
+    existing launch line):
+
+        with browser_launch_slot():
+            browser = pw.chromium.launch(headless=True, args=_LAUNCH_ARGS)
+
+    Blocks (on the calling worker thread only - never the asyncio event
+    loop, since this is always invoked from inside a ThreadPoolExecutor
+    worker) until a launch slot is free, then releases it as soon as
+    `chromium.launch()` returns.
+    """
+    _browser_launch_semaphore.acquire()
+    try:
+        yield
+    finally:
+        _browser_launch_semaphore.release()
 
 def get_storage_dir() -> Path:
     path = Path("downloads") / ".playwright"

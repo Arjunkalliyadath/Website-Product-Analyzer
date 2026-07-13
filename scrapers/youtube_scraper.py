@@ -1,15 +1,19 @@
 import asyncio
 import atexit
 import concurrent.futures
+import json
 import logging
 import re
 import sys
 import threading
 import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
+from urllib.parse import quote_plus
 
-from scrapers.browser_utils import normalize_comments
+import httpx
+
+from scrapers.browser_utils import browser_launch_slot, normalize_comments
 from config import (
     MAX_YOUTUBE_COMMENTS,
     MAX_SCROLL_ITERATIONS,
@@ -24,11 +28,18 @@ logger = logging.getLogger(__name__)
 
 # --- Hard internal time budget -----------------------------------------
 # Kept a few seconds under the outer asyncio.wait_for() cap applied in
-# app.py (20s) so this scraper almost always returns on its own, with
-# whatever it has collected so far, instead of being cut off cold by the
-# outer timeout and losing partial results. Lowered from 16 -> 12 now that
-# navigation itself fails fast (NAV_TIMEOUT_MS, NAVIGATION_RETRIES in
-# config.py).
+# app.py (30s, widened from 20s - the old value was below observed
+# setup_time (~7.7-7.8s) + this budget (17s), so the outer timeout fired
+# before this scraper's own tier-fallback logic ever finished) so this
+# scraper almost always returns on its own, with whatever it has
+# collected so far, instead of being cut off cold by the outer timeout
+# and losing partial results. NOTE: this budget is shared
+# across all 3 product-centric search tiers (see "Product-centric
+# discovery tiers" below) — a run that falls through 1-2 dead tiers has
+# meaningfully less time left for the tier that finally succeeds than a
+# single-tier flow would. Revisit this value if logs show later tiers
+# frequently being skipped due to time (`_MIN_TIME_FOR_ANOTHER_TIER_SECONDS`
+# below) even on runs that started with a full budget.
 TIME_BUDGET_SECONDS = 17
 
 # How many candidate video URLs to gather from the channel/search page
@@ -42,6 +53,27 @@ VIDEO_CANDIDATES_TO_COLLECT = 15
 # all videos for one company/channel, sourced from config so it can be
 # tuned without touching this file.
 MAX_TOTAL_COMMENTS = MAX_YOUTUBE_COMMENTS
+
+# --- Product-centric discovery tiers ---------------------------------------
+# When a product name is supplied, discovery/scraping proceeds through
+# search tiers in priority order instead of going straight to the official
+# company channel:
+#   1. "<product name> review"
+#   2. "<brand> <product name> review"   (brand = product_brand, or the
+#      company name if no product-specific brand was supplied)
+#   3. the official company channel, then (as today) a plain company-name
+#      search if the channel itself has no videos.
+#
+# A tier only counts as successful once its videos have actually been
+# visited and yielded at least one usable comment - not merely once a
+# search has returned candidate video URLs. A tier whose videos all turn
+# out to have comments disabled, be bot-walled, etc. is treated as a dead
+# end and the next tier is tried automatically. This makes "stop at the
+# first successful tier" cost more time in the worst case (a product with
+# no scrapable comments anywhere may burn through all 3-4 tiers before
+# giving up), which the existing time-budget checks below already bound
+# gracefully - see TIME_BUDGET_SECONDS above.
+_MIN_TIME_FOR_ANOTHER_TIER_SECONDS = 4
 
 _VIDEO_ID_RE = re.compile(r'"videoId":"([\w-]{11})"')
 # Shorts entries embed their video ID under a distinct "reelWatchEndpoint"
@@ -303,7 +335,8 @@ def _ensure_context():
         pw = sync_playwright().start()
         handle.playwright = pw
 
-    browser = pw.chromium.launch(headless=True, args=_LAUNCH_ARGS)
+    with browser_launch_slot():
+        browser = pw.chromium.launch(headless=True, args=_LAUNCH_ARGS)
     context = browser.new_context(
         user_agent=_USER_AGENT,
         locale="en-US",
@@ -531,6 +564,28 @@ def _adaptive_nav_timeout(time_left) -> int:
     return int(min(NAV_TIMEOUT_MS_MAX, max(NAV_TIMEOUT_MS_MIN, remaining_ms * 0.5)))
 
 
+def _capped_timeout(time_left, requested_ms: int, floor_ms: int = 500) -> int:
+    """Cap a fixed wait/timeout value to what's actually left in the
+    overall scraper time budget.
+
+    Several ``wait_for_selector`` / ``scroll_into_view_if_needed`` /
+    ``wait_for_timeout`` calls downstream used hardcoded millisecond
+    values (5000/6000/9000/etc.) with no awareness of ``time_left()`` -
+    unlike navigation, which already goes through
+    ``_adaptive_nav_timeout``. A single one of those fixed waits could
+    silently consume most or all of the remaining budget on a slow-
+    rendering page, starving later search tiers even when the run
+    started with plenty of time. This never asks for more than
+    ``requested_ms``, but scales down as the budget runs low instead of
+    blocking past it; ``floor_ms`` keeps it from asking Playwright for a
+    near-zero/negative timeout.
+    """
+    remaining_ms = max(0.0, time_left()) * 1000
+    if remaining_ms <= floor_ms:
+        return floor_ms
+    return int(min(requested_ms, remaining_ms))
+
+
 _YT_NAV_RETRY_BACKOFF_SECONDS = 0.75
 
 
@@ -664,6 +719,313 @@ def _collect_video_urls(page, limit: int) -> List[str]:
         logger.info("Video discovery: skipped %d Shorts entr(y/ies).", shorts_skipped)
 
     return urls[:limit]
+
+
+
+# ============================================================================
+# HTTP/InnerTube path — no browser required.
+# ----------------------------------------------------------------------------
+# The production log shows youtube.com/results navigations timing out on
+# BOTH attempts every time ("Timeout 8491ms exceeded" / "Timeout 7062ms
+# exceeded"), and a channel /videos page that DID render (video_grid_loaded
+# = True, videos_found = 15) still yielding 0 comments, because the
+# subsequent comment-scroll phase needed several more seconds of budget
+# that had already been spent on Chromium contention before it started.
+#
+# youtube.com/results and youtube.com/watch are still plain server-rendered
+# HTML - the video list and the first page of comments are embedded in the
+# initial response as a JSON blob (`ytInitialData`), the same data the
+# client-side JS reads to paint the DOM tiles we were otherwise scrolling
+# for. Fetching that HTML with httpx and reading the JSON directly:
+#   * needs no Chromium process at all, so it isn't affected by browser-
+#     launch contention or subject to MAX_CONCURRENT_BROWSER_LAUNCHES,
+#   * doesn't need to wait for lazy-loading/Intersection-Observer hydration,
+#   * typically completes in well under a second per request.
+#
+# Comment *pages* beyond the first are fetched via the same InnerTube
+# endpoint (`/youtubei/v1/next`) the page's own JS calls when you scroll -
+# this is the same technique used by the widely-used
+# `youtube-comment-downloader` tool. The API key and client version needed
+# to call it are themselves public values embedded in every watch page's
+# HTML (`INNERTUBE_API_KEY` / `clientVersion`), not a secret.
+#
+# This is tried FIRST for both search and comments. The existing
+# Playwright DOM-scrape logic below is left completely intact as the
+# fallback for the (hopefully rare) case where YouTube changes this JSON
+# shape or blocks the plain-HTTP path specifically.
+# ============================================================================
+
+_YT_HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
+_YT_INITIAL_DATA_RE = re.compile(r'var ytInitialData\s*=\s*(\{.*?\});</script>', re.DOTALL)
+_YT_INITIAL_DATA_RE_ALT = re.compile(r'ytInitialData"\]\s*=\s*(\{.*?\});', re.DOTALL)
+_YT_INNERTUBE_KEY_RE = re.compile(r'"INNERTUBE_API_KEY":"([^"]+)"')
+_YT_CLIENT_VERSION_RE = re.compile(r'"clientVersion":"([\d.]+)"')
+_INNERTUBE_URL = "https://www.youtube.com/youtubei/v1/next"
+
+
+def _fetch_yt_html(url: str, timeout: float = 6.0) -> Optional[str]:
+    try:
+        with httpx.Client(follow_redirects=True, headers=_YT_HTTP_HEADERS) as client:
+            resp = client.get(url, timeout=timeout)
+            if resp.status_code >= 400:
+                return None
+            return resp.text
+    except Exception as exc:
+        logger.info("YouTube httpx fetch failed for %s: %s", url, exc)
+        return None
+
+
+def _extract_yt_initial_data(html: str) -> Optional[dict]:
+    for pattern in (_YT_INITIAL_DATA_RE, _YT_INITIAL_DATA_RE_ALT):
+        m = pattern.search(html)
+        if not m:
+            continue
+        try:
+            return json.loads(m.group(1))
+        except Exception:
+            continue
+    return None
+
+
+def _video_ids_from_initial_data(data: dict, limit: int) -> List[str]:
+    ids: List[str] = []
+    seen = set()
+
+    def _walk(node) -> None:
+        if len(ids) >= limit:
+            return
+        if isinstance(node, dict):
+            renderer = node.get("videoRenderer")
+            if isinstance(renderer, dict):
+                vid = renderer.get("videoId")
+                if vid and vid not in seen:
+                    seen.add(vid)
+                    ids.append(vid)
+            for value in node.values():
+                if len(ids) >= limit:
+                    return
+                _walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                if len(ids) >= limit:
+                    return
+                _walk(item)
+
+    _walk(data)
+    return ids[:limit]
+
+
+def _httpx_video_urls(page_url: str, limit: int) -> List[str]:
+    html = _fetch_yt_html(page_url)
+    if not html:
+        return []
+    data = _extract_yt_initial_data(html)
+    if not data:
+        return []
+    ids = _video_ids_from_initial_data(data, limit)
+    return [f"https://www.youtube.com/watch?v={vid}" for vid in ids]
+
+
+def _extract_innertube_context(html: str) -> Optional[Tuple[str, str]]:
+    key_match = _YT_INNERTUBE_KEY_RE.search(html)
+    if not key_match:
+        return None
+    version_match = _YT_CLIENT_VERSION_RE.search(html)
+    client_version = version_match.group(1) if version_match else "2.20240101.00.00"
+    return key_match.group(1), client_version
+
+
+def _find_comments_continuation(data: dict) -> Optional[str]:
+    """Locate the continuation token that opens the comments feed, scoped
+    specifically to the comments engagement panel (rather than a blind
+    full-tree walk) so this can't accidentally grab an unrelated
+    continuation (e.g. related-videos pagination) that happens to share
+    the same shape."""
+    for panel in data.get("engagementPanels") or []:
+        renderer = panel.get("engagementPanelSectionListRenderer", {}) or {}
+        panel_id = (renderer.get("panelIdentifier") or "").lower()
+        if "comment" not in panel_id:
+            continue
+        try:
+            contents = renderer["content"]["sectionListRenderer"]["contents"]
+        except Exception:
+            continue
+        for c in contents:
+            item_section = (c or {}).get("itemSectionRenderer", {}) or {}
+            for ic in item_section.get("contents", []):
+                token = (
+                    (ic.get("continuationItemRenderer") or {})
+                    .get("continuationEndpoint", {})
+                    .get("continuationCommand", {})
+                    .get("token")
+                )
+                if token:
+                    return token
+    return None
+
+
+def _innertube_comments_page(api_key: str, client_version: str, continuation: str, timeout: float) -> Optional[dict]:
+    body = {
+        "context": {"client": {"clientName": "WEB", "clientVersion": client_version}},
+        "continuation": continuation,
+    }
+    try:
+        with httpx.Client(headers=_YT_HTTP_HEADERS) as client:
+            resp = client.post(
+                f"{_INNERTUBE_URL}?key={api_key}",
+                json=body,
+                headers={"Content-Type": "application/json"},
+                timeout=timeout,
+            )
+            if resp.status_code >= 400:
+                return None
+            return resp.json()
+    except Exception as exc:
+        logger.info("YouTube InnerTube comments request failed: %s", exc)
+        return None
+
+
+def _comment_texts_and_next(payload: dict) -> Tuple[List[str], Optional[str]]:
+    texts: List[str] = []
+    next_token: Optional[str] = None
+
+    # --- Current InnerTube format ---------------------------------------
+    # YouTube no longer inlines comment text in each commentThreadRenderer;
+    # it's stored separately in a parallel frameworkUpdates.entityBatchUpdate
+    # .mutations array as commentEntityPayload entries, correlated back to
+    # a thread only by an opaque key. Since this function only needs a flat
+    # bag of comment text (not threaded structure/authorship), every
+    # commentEntityPayload found here is taken directly - no key
+    # correlation with commentThreadRenderer below is needed. Videos still
+    # served in the legacy shape (handled below) simply have no
+    # frameworkUpdates.entityBatchUpdate.mutations, so this contributes
+    # nothing for them - no double-counting either way.
+    mutations = (
+        (payload.get("frameworkUpdates") or {})
+        .get("entityBatchUpdate", {})
+        .get("mutations", [])
+        or []
+    )
+    for mutation in mutations:
+        entity_payload = (mutation or {}).get("payload", {}).get("commentEntityPayload")
+        if not entity_payload:
+            continue
+        content = (entity_payload.get("properties") or {}).get("content") or {}
+        text = (content.get("content") or "").strip()
+        if text:
+            texts.append(text)
+
+    # --- Legacy InnerTube format (kept intact) --------------------------
+    for ep in payload.get("onResponseReceivedEndpoints") or []:
+        action = ep.get("appendContinuationItemsAction") or ep.get("reloadContinuationItemsCommand")
+        if not action:
+            continue
+        for item in action.get("continuationItems", []):
+            thread = item.get("commentThreadRenderer")
+            if thread:
+                comment = thread.get("comment", {}).get("commentRenderer", {})
+                runs = comment.get("contentText", {}).get("runs", []) or []
+                text = "".join(r.get("text", "") for r in runs).strip()
+                if text:
+                    texts.append(text)
+                continue
+            cont = item.get("continuationItemRenderer")
+            if cont:
+                next_token = (
+                    cont.get("continuationEndpoint", {})
+                    .get("continuationCommand", {})
+                    .get("token")
+                )
+    return texts, next_token
+
+
+def _fetch_comments_via_innertube(video_url: str, limit: int, time_left) -> List[str]:
+    """Pull top-level comments for ``video_url`` directly from YouTube's own
+    InnerTube JSON API - no browser, no DOM scrolling. Returns [] on any
+    failure (unrecognized page shape, blocked request, no continuation
+    found, comments disabled, etc.) so the caller can fall back to the
+    existing Playwright scroll-based path without special-casing."""
+    if time_left() <= 2:
+        return []
+    html = _fetch_yt_html(video_url)
+    if not html:
+        return []
+    ctx = _extract_innertube_context(html)
+    data = _extract_yt_initial_data(html)
+    if not ctx or not data:
+        return []
+    api_key, client_version = ctx
+    continuation = _find_comments_continuation(data)
+    if not continuation:
+        return []
+
+    comments: List[str] = []
+    pages = 0
+    while continuation and len(comments) < limit and pages < 5 and time_left() > 2:
+        payload = _innertube_comments_page(
+            api_key, client_version, continuation, timeout=min(6.0, max(2.0, time_left())),
+        )
+        pages += 1
+        if not payload:
+            break
+        texts, continuation = _comment_texts_and_next(payload)
+        comments.extend(texts)
+    return comments[:limit]
+
+
+def _search_youtube(page, query: str, time_left) -> List[str]:
+    """Run one YouTube search for ``query`` and return candidate video URLs.
+
+    Shared by every search-based discovery tier - the product-review and
+    brand-product-review priority searches, as well as the plain
+    company-name search that already existed as the fallback for a channel
+    with 0 videos. Navigation, the search-results wait selector, and result
+    collection are identical in every case; only the query string changes.
+
+    Tries the plain-HTTP InnerTube path first (see the block above) - this
+    is what actually fixes the repeated "Timeout 8491ms exceeded" /
+    "Timeout 7062ms exceeded" search-navigation failures in the log, since
+    it doesn't touch Chromium at all. Falls back to the existing
+    Playwright-based search only if that path comes back empty.
+    """
+    try:
+        video_urls = _httpx_video_urls(
+            f"https://www.youtube.com/results?search_query={quote_plus(query)}",
+            VIDEO_CANDIDATES_TO_COLLECT,
+        )
+    except Exception:
+        logger.exception("YouTube httpx search failed for query=%r.", query)
+        video_urls = []
+    if video_urls:
+        logger.info(
+            "YouTube scrape: httpx search for %r found %d video(s) (no browser needed).",
+            query, len(video_urls),
+        )
+        return video_urls
+
+    logger.info(
+        "YouTube scrape: httpx search found nothing for %r; falling back to "
+        "browser-based search.", query,
+    )
+    search_url = f"https://www.youtube.com/results?search_query={quote_plus(query)}"
+    if not _goto_with_retry(page, search_url, timeout=_adaptive_nav_timeout(time_left), time_left=time_left):
+        return []
+    _dismiss_consent(page)
+    wait_ms = _capped_timeout(time_left, 5000)
+    try:
+        page.wait_for_selector(_SEARCH_RESULT_WAIT_SELECTOR, timeout=wait_ms)
+    except Exception:
+        logger.info(
+            "YouTube scrape: no search results rendered for query=%r within "
+            "%dms (reason=%s).", query, wait_ms, _diagnose_blocking_state(page),
+        )
+    return _collect_video_urls(page, VIDEO_CANDIDATES_TO_COLLECT)
 
 
 def _expand_comment_extras(page, time_left, limit: int = 60) -> int:
@@ -803,6 +1165,14 @@ def _scroll_comments_until_idle(page, time_left, remaining_budget: int) -> List[
     comments: List[str] = []
     if remaining_budget <= 0:
         return comments
+    if time_left() <= 2:
+        # Matches _classify_comment_failure's own "timeout" threshold.
+        # Entering the scroll/expand sequence below with essentially no
+        # budget left just means burning the last of it on fixed waits
+        # that can't complete anyway - bail out now so the caller (and
+        # any later search tier) gets an accurate "out of time" signal
+        # instead of a silent, budget-exhausting stall.
+        return comments
 
     _dismiss_consent(page)
 
@@ -815,36 +1185,42 @@ def _scroll_comments_until_idle(page, time_left, remaining_budget: int) -> List[
     try:
         # Quick scroll past the video description to where comments live
         page.evaluate("window.scrollTo(0, document.documentElement.scrollHeight * 0.3)")
-        page.wait_for_timeout(600)
+        page.wait_for_timeout(_capped_timeout(time_left, 600, floor_ms=100))
         page.evaluate("window.scrollTo(0, document.documentElement.scrollHeight * 0.5)")
-        page.wait_for_timeout(600)
+        page.wait_for_timeout(_capped_timeout(time_left, 600, floor_ms=100))
     except Exception:
         pass
 
     container_found = True
     try:
-        page.locator(_COMMENTS_CONTAINER_SELECTOR).first.scroll_into_view_if_needed(timeout=5000)
+        page.locator(_COMMENTS_CONTAINER_SELECTOR).first.scroll_into_view_if_needed(
+            timeout=_capped_timeout(time_left, 5000)
+        )
         # Nudge a little further so the container sits clearly inside the
         # viewport rather than right at its edge — YouTube's lazy comment
         # loader is keyed off actual visibility, and landing exactly on
         # the boundary has been observed to leave it un-triggered.
         page.evaluate("window.scrollBy(0, 400)")
-        page.wait_for_timeout(400)
+        page.wait_for_timeout(_capped_timeout(time_left, 400, floor_ms=100))
     except Exception:
         container_found = False
 
     if not container_found:
         # Container hasn't attached yet — blind scrolls to coax the lazy loader
         for step in (1200, 1500, 1800, 2000):
+            if time_left() <= 2:
+                break
             try:
                 page.evaluate(f"window.scrollBy(0, {step})")
             except Exception:
                 break
-            page.wait_for_timeout(400)
+            page.wait_for_timeout(_capped_timeout(time_left, 400, floor_ms=100))
         try:
-            page.locator(_COMMENTS_CONTAINER_SELECTOR).first.scroll_into_view_if_needed(timeout=4000)
+            page.locator(_COMMENTS_CONTAINER_SELECTOR).first.scroll_into_view_if_needed(
+                timeout=_capped_timeout(time_left, 4000)
+            )
             page.evaluate("window.scrollBy(0, 400)")
-            page.wait_for_timeout(400)
+            page.wait_for_timeout(_capped_timeout(time_left, 400, floor_ms=100))
         except Exception:
             pass
 
@@ -853,13 +1229,13 @@ def _scroll_comments_until_idle(page, time_left, remaining_budget: int) -> List[
     # after the Intersection Observer triggers — this is the most common
     # place where comments exist but 0 are collected.
     try:
-        page.wait_for_selector(_COMMENT_TEXT_SELECTOR, timeout=9000)
+        page.wait_for_selector(_COMMENT_TEXT_SELECTOR, timeout=_capped_timeout(time_left, 9000))
     except Exception:
         # One final aggressive scroll attempt before giving up
         try:
             page.evaluate("window.scrollBy(0, 600)")
-            page.wait_for_timeout(800)
-            page.wait_for_selector(_COMMENT_TEXT_SELECTOR, timeout=4000)
+            page.wait_for_timeout(_capped_timeout(time_left, 800, floor_ms=100))
+            page.wait_for_selector(_COMMENT_TEXT_SELECTOR, timeout=_capped_timeout(time_left, 4000))
         except Exception:
             reason = _classify_comment_failure(page, time_left)
             logger.info(
@@ -927,7 +1303,7 @@ def _scroll_comments_until_idle(page, time_left, remaining_budget: int) -> List[
     return comments
 
 
-def _run_sync(company_name: str, videos_url: str) -> List[str]:
+def _run_sync(company_name: str, videos_url: str, product_name: str = "", product_brand: str = "") -> List[str]:
     if sys.platform.startswith("win"):
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
@@ -943,6 +1319,11 @@ def _run_sync(company_name: str, videos_url: str) -> List[str]:
     seen_keys = set()
     duplicates_removed = 0
     page = None
+    source = "none"
+    consent_page_appeared = False
+    video_grid_loaded = False
+    videos_attempted = 0
+    last_videos_found = 0
     try:
         page = context.new_page()
         page.set_default_timeout(12000)
@@ -966,92 +1347,188 @@ def _run_sync(company_name: str, videos_url: str) -> List[str]:
         def time_left() -> float:
             return deadline - time.monotonic()
 
-        video_urls: List[str] = []
-        consent_page_appeared = False
-        video_grid_loaded = False
-        if _goto_with_retry(page, videos_url, timeout=_adaptive_nav_timeout(time_left), time_left=time_left):
-            consent_page_appeared = _consent_dialog_present(page)
-            _dismiss_consent(page)
-            # Explicitly wait for at least one video tile before scrolling,
-            # instead of a fixed sleep beforehand. The previous version
-            # went straight into scrolling/collecting behind only a fixed
-            # 1500ms sleep, which on a slow-rendering channel page reads 0
-            # videos before the grid has actually painted — the same class
-            # of readiness bug the comment loop had. This gives slow
-            # channels a real chance to render before we give up, without
-            # paying a blind sleep on fast ones.
-            try:
-                page.wait_for_selector(_VIDEO_TILE_WAIT_SELECTOR, timeout=6000)
-                video_grid_loaded = True
-            except Exception:
-                logger.info(
-                    "YouTube scrape: no video tiles rendered on %s within 6s "
-                    "(reason=%s).", videos_url, _diagnose_blocking_state(page),
-                )
-            tile_count = 0
-            for _ in range(2):
-                page.evaluate("window.scrollBy(0, 1200)")
-                tile_count = _wait_for_more(page, _VIDEO_TILE_WAIT_SELECTOR, tile_count, max_ms=500)
-            video_urls = _collect_video_urls(page, VIDEO_CANDIDATES_TO_COLLECT)
+        def scrape_tier(label: str, video_urls: List[str]) -> bool:
+            """Visit each of ``video_urls`` (skipping any a previous tier
+            already tried) and merge any comments found into ``results``.
 
-        if not video_urls and time_left() > 4:
-            logger.info(
-                "YouTube scrape: channel page %s yielded 0 videos — falling back "
-                "to a single general YouTube search for %r.",
-                videos_url, company_name,
-            )
-            search_url = (
-                f"https://www.youtube.com/results?search_query="
-                f"{company_name.replace(' ', '+')}"
-            )
-            if _goto_with_retry(page, search_url, timeout=_adaptive_nav_timeout(time_left), time_left=time_left):
-                _dismiss_consent(page)
+            Returns True iff this tier contributed at least one usable
+            comment - the actual "stop here" signal - and False if it's a
+            dead end (comments disabled, bot wall, no public comments,
+            etc.), in which case the caller moves on to try the next tier.
+            """
+            nonlocal duplicates_removed, videos_attempted
+            # Scoped to THIS tier only (not shared across tiers): if an
+            # earlier tier already visited a URL and it yielded zero
+            # comments, that outcome may have been transient (slow
+            # render, one-off nav hiccup) rather than a real dead end
+            # (comments disabled, bot wall). A later, more targeted tier
+            # gets its own fresh attempt at the same URL instead of being
+            # silently blocked from ever revisiting it. This can never
+            # duplicate a *successful* visit: any tier that lands even
+            # one usable comment sets `succeeded = True` and halts the
+            # whole search immediately (see the tier loops below), so a
+            # URL only becomes eligible for a retry here after a prior
+            # tier's attempt was already a zero-comment outcome.
+            attempted_this_tier: set = set()
+            count_before = len(results)
+            for video_url in video_urls:
+                if video_url in attempted_this_tier:
+                    continue
+                if len(results) >= MAX_TOTAL_COMMENTS or time_left() <= 3:
+                    break
+                attempted_this_tier.add(video_url)
+                videos_attempted += 1
+                remaining_budget = MAX_TOTAL_COMMENTS - len(results)
                 try:
-                    page.wait_for_selector(_SEARCH_RESULT_WAIT_SELECTOR, timeout=5000)
+                    # Primary: InnerTube JSON path - no browser page.goto,
+                    # no scroll/hydration wait. Only falls through to the
+                    # existing Playwright scroll logic if this comes back
+                    # empty (unrecognized page shape, comments disabled,
+                    # or the request itself failed).
+                    video_comments = _fetch_comments_via_innertube(video_url, remaining_budget, time_left)
+                    if not video_comments:
+                        if not _goto_with_retry(page, video_url, timeout=_adaptive_nav_timeout(time_left), time_left=time_left):
+                            continue
+                        video_comments = _scroll_comments_until_idle(page, time_left, remaining_budget)
+                    before = len(results)
+                    for c in video_comments:
+                        # Normalized (stripped + lowercased) key, matching
+                        # normalize_comments()'s own dedup rule exactly, so a
+                        # comment isn't double-counted against the running
+                        # budget here only to be merged away by that final
+                        # pass anyway. A set lookup also replaces the previous
+                        # O(n) "c in results" scan with an O(1) check.
+                        key = c.strip().lower()
+                        if not key or key in seen_keys:
+                            duplicates_removed += 1
+                            continue
+                        seen_keys.add(key)
+                        results.append(c)
+                    logger.info(
+                        "YouTube scrape [%s]: video=%s contributed %d new comment(s); "
+                        "running total=%d/%d.",
+                        label, video_url, len(results) - before, len(results), MAX_TOTAL_COMMENTS,
+                    )
+                except Exception:
+                    logger.exception("Failed scraping comments for video=%s.", video_url)
+                    continue
+            return len(results) > count_before
+
+        # --- Priority 1 & 2: product-centric review search ------------------
+        # Search YouTube directly for review content about this specific
+        # product before ever looking at the official company channel (the
+        # channel is the brand's own uploads, not third-party reviews - the
+        # "often returns zero comments" complaint this whole change
+        # addresses). A tier is only abandoned - moving on to the next one -
+        # once its videos have actually been visited and yielded zero
+        # usable comments; a search simply returning candidate URLs is not
+        # by itself enough to stop on.
+        succeeded = False
+        search_tiers = []
+        if product_name:
+            search_tiers.append(("product_review", f"{product_name} review"))
+            brand = (product_brand or company_name or "").strip()
+            if brand and brand.lower() != product_name.strip().lower():
+                search_tiers.append(("brand_product_review", f"{brand} {product_name} review"))
+
+        for label, query in search_tiers:
+            if time_left() <= _MIN_TIME_FOR_ANOTHER_TIER_SECONDS:
+                logger.info("YouTube scrape: skipping tier %r — out of time budget.", label)
+                break
+            video_urls = _search_youtube(page, query, time_left)
+            last_videos_found = len(video_urls) or last_videos_found
+            if not video_urls:
+                logger.info("YouTube scrape: tier %r search (%r) found 0 videos.", label, query)
+                continue
+            logger.info(
+                "YouTube scrape: tier %r search (%r) found %d candidate video(s); "
+                "scraping them for comments.", label, query, len(video_urls),
+            )
+            if scrape_tier(label, video_urls):
+                source = label
+                succeeded = True
+                break
+            logger.info(
+                "YouTube scrape: tier %r yielded videos but 0 usable comments; "
+                "trying next tier.", label,
+            )
+
+        # --- Priority 3: existing official-channel logic, then (as before)
+        # a plain company-name search - only reached if the tiers above
+        # never landed a single usable comment.
+        if not succeeded and time_left() > _MIN_TIME_FOR_ANOTHER_TIER_SECONDS:
+            video_urls: List[str] = []
+            try:
+                video_urls = _httpx_video_urls(videos_url, VIDEO_CANDIDATES_TO_COLLECT)
+            except Exception:
+                video_urls = []
+            if video_urls:
+                video_grid_loaded = True
+                logger.info(
+                    "YouTube scrape: httpx fetch of official channel %s found %d "
+                    "video(s) (no browser needed).", videos_url, len(video_urls),
+                )
+            elif _goto_with_retry(page, videos_url, timeout=_adaptive_nav_timeout(time_left), time_left=time_left):
+                consent_page_appeared = _consent_dialog_present(page)
+                _dismiss_consent(page)
+                # Explicitly wait for at least one video tile before scrolling,
+                # instead of a fixed sleep beforehand. The previous version
+                # went straight into scrolling/collecting behind only a fixed
+                # 1500ms sleep, which on a slow-rendering channel page reads 0
+                # videos before the grid has actually painted — the same class
+                # of readiness bug the comment loop had. This gives slow
+                # channels a real chance to render before we give up, without
+                # paying a blind sleep on fast ones.
+                _tile_wait_ms = _capped_timeout(time_left, 6000)
+                try:
+                    page.wait_for_selector(_VIDEO_TILE_WAIT_SELECTOR, timeout=_tile_wait_ms)
+                    video_grid_loaded = True
                 except Exception:
                     logger.info(
-                        "YouTube scrape: no search results rendered for %r within "
-                        "5s (reason=%s).", company_name, _diagnose_blocking_state(page),
+                        "YouTube scrape: no video tiles rendered on %s within %dms "
+                        "(reason=%s).", videos_url, _tile_wait_ms, _diagnose_blocking_state(page),
                     )
+                tile_count = 0
+                for _ in range(2):
+                    page.evaluate("window.scrollBy(0, 1200)")
+                    tile_count = _wait_for_more(page, _VIDEO_TILE_WAIT_SELECTOR, tile_count, max_ms=500)
                 video_urls = _collect_video_urls(page, VIDEO_CANDIDATES_TO_COLLECT)
-            if not video_urls:
-                logger.info(
-                    "YouTube scrape: search fallback also yielded 0 videos for %r "
-                    "(reason=%s) — reliable YouTube coverage needs an "
-                    "authenticated session or the official YouTube Data API.",
-                    company_name, _diagnose_blocking_state(page),
-                )
+            last_videos_found = len(video_urls) or last_videos_found
 
-        for video_url in video_urls:
-            if len(results) >= MAX_TOTAL_COMMENTS or time_left() <= 3:
-                break
-            remaining_budget = MAX_TOTAL_COMMENTS - len(results)
-            try:
-                if not _goto_with_retry(page, video_url, timeout=_adaptive_nav_timeout(time_left), time_left=time_left):
-                    continue
-                video_comments = _scroll_comments_until_idle(page, time_left, remaining_budget)
-                before = len(results)
-                for c in video_comments:
-                    # Normalized (stripped + lowercased) key, matching
-                    # normalize_comments()'s own dedup rule exactly, so a
-                    # comment isn't double-counted against the running
-                    # budget here only to be merged away by that final
-                    # pass anyway. A set lookup also replaces the previous
-                    # O(n) "c in results" scan with an O(1) check.
-                    key = c.strip().lower()
-                    if not key or key in seen_keys:
-                        duplicates_removed += 1
-                        continue
-                    seen_keys.add(key)
-                    results.append(c)
+            if video_urls:
                 logger.info(
-                    "YouTube scrape: video=%s contributed %d new comment(s); "
-                    "running total=%d/%d.",
-                    video_url, len(results) - before, len(results), MAX_TOTAL_COMMENTS,
+                    "YouTube scrape: tier 'official_channel' found %d candidate "
+                    "video(s); scraping them for comments.", len(video_urls),
                 )
-            except Exception:
-                logger.exception("Failed scraping comments for video=%s.", video_url)
-                continue
+                if scrape_tier("official_channel", video_urls):
+                    source = "official_channel"
+                    succeeded = True
+
+            if not succeeded and time_left() > _MIN_TIME_FOR_ANOTHER_TIER_SECONDS:
+                logger.info(
+                    "YouTube scrape: official channel yielded no usable comments — "
+                    "falling back to a single general YouTube search for %r.",
+                    company_name,
+                )
+                video_urls = _search_youtube(page, company_name, time_left)
+                last_videos_found = len(video_urls) or last_videos_found
+                if video_urls:
+                    if scrape_tier("channel_name_search", video_urls):
+                        source = "channel_name_search"
+                        succeeded = True
+                    else:
+                        logger.info(
+                            "YouTube scrape: search fallback also yielded 0 usable "
+                            "comments for %r (reason=%s).",
+                            company_name, _diagnose_blocking_state(page),
+                        )
+                else:
+                    logger.info(
+                        "YouTube scrape: search fallback also yielded 0 videos for %r "
+                        "(reason=%s) — reliable YouTube coverage needs an "
+                        "authenticated session or the official YouTube Data API.",
+                        company_name, _diagnose_blocking_state(page),
+                    )
 
         if not results:
             _save_debug_artifacts(
@@ -1059,7 +1536,9 @@ def _run_sync(company_name: str, videos_url: str) -> List[str]:
                 extra={
                     "consent_page_appeared": str(consent_page_appeared),
                     "video_grid_loaded": str(video_grid_loaded),
-                    "videos_found": str(len(video_urls)),
+                    "videos_found": str(last_videos_found),
+                    "videos_attempted": str(videos_attempted),
+                    "video_source": source,
                     "diagnosis": _diagnose_blocking_state(page),
                 },
             )
@@ -1073,10 +1552,10 @@ def _run_sync(company_name: str, videos_url: str) -> List[str]:
     final = normalize_comments(results)[:MAX_TOTAL_COMMENTS]
     elapsed = time.monotonic() - start
     logger.info(
-        "YouTube comments for %r: raw=%d duplicates_removed=%d final=%d "
-        "elapsed=%.1fs (cap=%d).",
-        company_name, len(results), duplicates_removed, len(final), elapsed,
-        MAX_TOTAL_COMMENTS,
+        "YouTube comments for %r (product=%r, source=%s): raw=%d "
+        "duplicates_removed=%d final=%d elapsed=%.1fs (cap=%d).",
+        company_name, product_name, source, len(results), duplicates_removed,
+        len(final), elapsed, MAX_TOTAL_COMMENTS,
     )
     logger.info("YouTube returned %d comments", len(final))
     return final
@@ -1093,10 +1572,17 @@ async def scrape_youtube_comments(company_data: Dict[str, str]) -> List[str]:
 
     videos_url = _channel_url(target).rstrip("/") + "/videos"
     company_name = company_data.get("company_name", target)
+    # Both optional and purely additive: any existing caller that doesn't
+    # set these (e.g. a plain company-wide job) gets exactly today's
+    # behavior - discovery goes straight to the official channel logic.
+    product_name = (company_data.get("product_name") or "").strip()
+    product_brand = (company_data.get("product_brand") or "").strip()
 
     loop = asyncio.get_event_loop()
     try:
-        return await loop.run_in_executor(_EXECUTOR, _run_sync, company_name, videos_url)
+        return await loop.run_in_executor(
+            _EXECUTOR, _run_sync, company_name, videos_url, product_name, product_brand,
+        )
     except Exception:
         logger.exception("Unhandled error scraping YouTube comments for %r.", company_name)
         return []

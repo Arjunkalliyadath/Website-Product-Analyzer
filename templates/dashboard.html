@@ -522,6 +522,95 @@
     {% endif %}
   </div>
   {% endif %}
+
+  
+  {%- set product_intelligence = product_intelligence | default([], true) -%}
+  {% if product_intelligence %}
+  <div class="card" style="margin-bottom:1.25rem;">
+    <div class="section-title">Product Intelligence</div>
+    <p class="card-sub" style="margin:-.35rem 0 1rem;">
+      Structured details pulled directly from each selected product's own page —
+      one fetch per product, covering name, brand, pricing, specifications, FAQs,
+      and on-site rating/reviews.
+    </p>
+    <div class="grid-2" style="margin-bottom:0;">
+      {% for p in product_intelligence %}
+      <div class="card" style="background:var(--bg);">
+        <div style="display:flex; gap:.9rem; align-items:flex-start;">
+          {% if p.image %}
+          <img src="{{ p.image }}" alt="{{ p.name | default('Product') }}"
+               style="width:64px; height:64px; object-fit:cover; border-radius:12px; border:1px solid var(--border); flex-shrink:0;" />
+          {% endif %}
+          <div style="flex:1; min-width:0;">
+            {% if p.brand %}<div class="card-label" style="margin-bottom:.15rem;">{{ p.brand }}</div>{% endif %}
+            <div style="font-weight:700; font-size:.95rem;">{{ p.name | default("Untitled Product") }}</div>
+            {% if p.category %}<div class="card-sub">{{ p.category }}</div>{% endif %}
+          </div>
+        </div>
+
+        {% if p.price or p.availability or p.aggregate_rating %}
+        <div class="chip-list">
+          {% if p.price %}<span class="chip">{{ p.price }}</span>{% endif %}
+          {% if p.availability %}<span class="chip">{{ p.availability }}</span>{% endif %}
+          {% if p.aggregate_rating %}<span class="chip">★ {{ p.aggregate_rating }}{% if p.rating_count %} ({{ p.rating_count }}){% endif %}</span>{% endif %}
+        </div>
+        {% endif %}
+
+        {% if p.specifications %}
+        <div style="margin-top:.9rem;">
+          <div class="card-sub" style="font-weight:600; text-transform:uppercase; letter-spacing:.05em; font-size:.68rem; margin-bottom:.4rem;">Specifications</div>
+          <table class="sentiment-table" style="margin-top:0;">
+            {% for key, value in p.specifications.items() %}
+            <tr><td style="font-weight:600; width:40%;">{{ key }}</td><td>{{ value }}</td></tr>
+            {% endfor %}
+          </table>
+        </div>
+        {% endif %}
+
+        {% if p.faq %}
+        <div style="margin-top:.9rem;">
+          <div class="card-sub" style="font-weight:600; text-transform:uppercase; letter-spacing:.05em; font-size:.68rem; margin-bottom:.4rem;">FAQ</div>
+          <div class="insight-list">
+            {% for item in p.faq %}
+            <div class="insight-item">
+              <span class="insight-icon">Q</span>
+              <div><strong>{{ item.question }}</strong><br>{{ item.answer }}</div>
+            </div>
+            {% endfor %}
+          </div>
+        </div>
+        {% endif %}
+
+        {% if p.website_reviews %}
+        <div style="margin-top:.9rem;">
+          <div class="card-sub" style="font-weight:600; text-transform:uppercase; letter-spacing:.05em; font-size:.68rem; margin-bottom:.4rem;">Website Reviews</div>
+          <div class="comments-list">
+            {% for r in p.website_reviews %}
+            <div class="comment-card">
+              <div class="comment-body">
+                <div class="comment-text">{{ r.text }}</div>
+                <div class="comment-meta">
+                  <span>{{ r.author }}</span>
+                  {% if r.rating %}<span>★ {{ r.rating }}</span>{% endif %}
+                  {% if r.date %}<span>{{ r.date }}</span>{% endif %}
+                </div>
+              </div>
+            </div>
+            {% endfor %}
+          </div>
+        </div>
+        {% endif %}
+
+        {% if p.url %}
+        <div class="download-row">
+          <a class="dl-btn" href="{{ p.url }}" target="_blank">View product page →</a>
+        </div>
+        {% endif %}
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+  {% endif %}
   
   <div class="grid-4">
     <div class="card card--total">
@@ -638,6 +727,112 @@
     </table>
   </div>
   {% endif %}
+
+  
+  {%- set aspect_intelligence = aspect_intelligence | default({}, true) -%}
+  {% if aspect_intelligence %}
+  <div class="card" style="margin-bottom:1.25rem;">
+    <div class="section-title">Aspect-Based Sentiment</div>
+    <p class="card-sub" style="margin:-.35rem 0 1rem;">
+      What reviewers actually say, broken down by product feature —
+      extracted directly from collected reviews (Google, Twitter,
+      Instagram, YouTube). Kept separate from Brand Reputation below and
+      from the catalog details above.
+    </p>
+    {% for product, aspects in aspect_intelligence.items() %}
+      {% if (aspect_intelligence.keys() | list | length) > 1 %}
+      <div class="card-label" style="margin-top:1rem;">{{ product }}</div>
+      {% endif %}
+      <table class="sentiment-table" style="margin-top:.5rem;">
+        <thead>
+          <tr>
+            <th>Aspect</th><th>Mentions</th><th>Distribution</th><th>Score</th><th>Importance</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for a in aspects %}
+          <tr>
+            <td>{{ a.aspect }}</td>
+            <td>{{ a.total }} <span class="card-sub">({{ a.frequency_pct }}% of reviews)</span></td>
+            <td>
+              <div class="mini-bar">
+                <div style="flex:{{ a.positive_pct }}; background:var(--positive);"></div>
+                <div style="flex:{{ a.negative_pct }}; background:var(--negative);"></div>
+                <div style="flex:{{ a.neutral_pct }}; background:var(--neutral);"></div>
+              </div>
+              <div class="card-sub" style="margin-top:.3rem;">
+                <span style="color:var(--positive)">{{ a.positive }} pos</span> ·
+                <span style="color:var(--negative)">{{ a.negative }} neg</span> ·
+                <span style="color:var(--neutral)">{{ a.neutral }} neu</span>
+              </div>
+            </td>
+            <td>{{ a.score }} <span class="card-sub">{{ a.score_label }}</span></td>
+            <td>{{ a.importance_pct }}%</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  {%- set confidence_score = confidence_score | default({}, true) -%}
+  {%- set buying_recommendation = buying_recommendation | default({}, true) -%}
+  {%- set product_recommendations = product_recommendations | default({}, true) -%}
+  <div class="card" style="margin-bottom:1.25rem;">
+    <div class="section-title">Buying Recommendation &amp; Confidence</div>
+    <p class="card-sub" style="margin:-.35rem 0 1rem;">
+      Combines overall sentiment, per-aspect scores, review volume, and
+      confidence/consistency across platforms — instead of relying on
+      overall sentiment alone.
+    </p>
+    <div class="grid-2" style="margin-bottom:0;">
+      <div>
+        <div class="card-label">Overall Buying Recommendation</div>
+        <span class="score-label {{ (buying_recommendation.css_class | default('no-data')) }}" style="font-size:.95rem; padding:.3rem .8rem;">
+          {{ buying_recommendation.label | default("No Data") }}
+        </span>
+        <div class="card-sub" style="margin-top:.6rem; line-height:1.6;">
+          {{ buying_recommendation.explanation | default("Not enough data to generate a recommendation.") }}
+        </div>
+      </div>
+      <div>
+        <div class="card-label">Confidence Score</div>
+        <div class="score-wrap">
+          <div class="score-value" style="font-size:1.8rem;">{{ confidence_score.score | default(0) }}</div>
+          <div class="score-max">/ 100</div>
+        </div>
+        <span class="score-label {{ confidence_score.css_class | default('no-data') }}">{{ confidence_score.label | default("No Data") }}</span>
+        <div class="card-sub" style="margin-top:.5rem;">
+          Based on {{ confidence_score.review_count | default(0) }} review(s) across
+          {{ confidence_score.platforms_covered | default(0) }} platform(s) ·
+          platform agreement {{ confidence_score.platform_agreement | default(0) }}% ·
+          aspect consistency {{ confidence_score.aspect_consistency | default(0) }}%
+        </div>
+      </div>
+    </div>
+
+    {% if product_recommendations %}
+    <div class="insight-heading" style="margin-top:1.3rem;">Per-Product Recommendation</div>
+    <table class="sentiment-table" style="margin-top:.5rem;">
+      <thead>
+        <tr>
+          <th>Product</th><th>Recommendation</th><th>Blended Score</th><th>Confidence</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for product, rec in product_recommendations.items() %}
+        <tr>
+          <td>{{ product }}</td>
+          <td><span class="score-label {{ rec.css_class | default('no-data') }}">{{ rec.label | default("No Data") }}</span></td>
+          <td>{{ rec.blended_score | default(0) }} <span class="card-sub">/ 100</span></td>
+          <td>{{ rec.confidence_score | default(0) }} <span class="card-sub">{{ rec.confidence_label | default("No Data") }}</span></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+  </div>
 
   {%- set brand_reputation = brand_reputation | default({}, true) -%}
   {%- set brand_gmaps = brand_reputation.google_maps | default({}, true) -%}
@@ -764,13 +959,29 @@
         <div class="exec-label">Most Mentioned Feature</div>
         <div class="exec-value exec-value--sm">{{ summary.most_mentioned_feature | default("Not enough data") }}</div>
       </div>
+      <div class="exec-stat">
+        <div class="exec-label">Buying Recommendation</div>
+        <div class="exec-value exec-value--sm">{{ (summary.buying_recommendation | default({}, true)).label | default("No Data") }}</div>
+      </div>
+      <div class="exec-stat">
+        <div class="exec-label">Confidence Score</div>
+        <div class="exec-value">{{ (summary.confidence_score | default({}, true)).score | default(0) }} <span class="exec-unit">/ 100</span></div>
+      </div>
     </div>
 
     {% if summary.product_summaries %}
     <div class="insight-heading">Product-by-Product Summary</div>
     <div class="insight-list" style="margin-bottom:1.1rem;">
       {% for item in summary.product_summaries %}
-      <div class="insight-item"><span class="insight-icon">•</span><span><strong>{{ item.product }}:</strong> {{ item.summary }}</span></div>
+      <div class="insight-item">
+        <span class="insight-icon">•</span>
+        <span>
+          <strong>{{ item.product }}:</strong> {{ item.summary }}
+          {% if item.recommendation %}
+          <span class="score-label {{ item.recommendation.css_class | default('no-data') }}" style="margin-left:.4rem; margin-top:0; vertical-align:middle;">{{ item.recommendation.label }}</span>
+          {% endif %}
+        </span>
+      </div>
       {% endfor %}
     </div>
     {% endif %}
@@ -802,6 +1013,31 @@
         </div>
       </div>
     </div>
+
+    {% if summary.best_aspects or summary.worst_aspects %}
+    <div class="insight-columns" style="margin-top:1.1rem;">
+      <div>
+        <div class="insight-heading">Best-Performing Aspects</div>
+        <div class="insight-list">
+          {% for a in summary.best_aspects | default([], true) %}
+          <div class="insight-item"><span class="insight-icon" style="color:var(--positive)">✓</span><span><strong>{{ a.aspect }}</strong> ({{ a.product }}) — {{ a.score }}/100</span></div>
+          {% else %}
+          <div class="insight-item"><span>Not enough aspect data collected yet.</span></div>
+          {% endfor %}
+        </div>
+      </div>
+      <div>
+        <div class="insight-heading">Aspects Needing Attention</div>
+        <div class="insight-list">
+          {% for a in summary.worst_aspects | default([], true) %}
+          <div class="insight-item"><span class="insight-icon" style="color:var(--negative)">!</span><span><strong>{{ a.aspect }}</strong> ({{ a.product }}) — {{ a.score }}/100</span></div>
+          {% else %}
+          <div class="insight-item"><span>Not enough aspect data collected yet.</span></div>
+          {% endfor %}
+        </div>
+      </div>
+    </div>
+    {% endif %}
 
     <div class="insight-heading" style="margin-top:1.1rem;">Suggested Improvements</div>
     <div class="insight-list">

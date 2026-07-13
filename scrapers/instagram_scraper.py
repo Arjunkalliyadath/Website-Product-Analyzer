@@ -9,7 +9,9 @@ import time
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-from scrapers.browser_utils import normalize_comments
+import httpx
+
+from scrapers.browser_utils import browser_launch_slot, normalize_comments
 from config import (
     MAX_INSTAGRAM_COMMENTS,
     MAX_SCROLL_ITERATIONS,
@@ -34,9 +36,13 @@ MAX_POSTS_TO_VISIT = 20
 
 # --- Hard internal time budget -----------------------------------------
 # Kept a few seconds under the outer asyncio.wait_for() cap applied in
-# app.py (20s) so this scraper almost always returns on its own, with
-# whatever it has collected so far, instead of being cut off cold by the
-# outer timeout and losing partial results. Lowered from 16 -> 12 now that
+# app.py (26s, widened from 20s - the old value was below observed
+# setup_time (~7.4s) + this budget (12s), leaving only ~0.6s of margin
+# before debug-artifact/screenshot capture on a failure path could push
+# the outer timeout past its own cap) so this scraper almost always
+# returns on its own, with whatever it has collected so far, instead of
+# being cut off cold by the outer timeout and losing partial results.
+# Lowered from 16 -> 12 now that
 # navigation itself fails fast (NAV_TIMEOUT_MS, NAVIGATION_RETRIES in
 # config.py).
 TIME_BUDGET_SECONDS = 12
@@ -274,7 +280,8 @@ def _ensure_context():
         pw = sync_playwright().start()
         handle.playwright = pw
 
-    browser = pw.chromium.launch(headless=True, args=_LAUNCH_ARGS)
+    with browser_launch_slot():
+        browser = pw.chromium.launch(headless=True, args=_LAUNCH_ARGS)
     context = browser.new_context(
         user_agent=_USER_AGENT,
         locale="en-US",
@@ -382,6 +389,52 @@ def _diagnose_page_state(page) -> str:
         return "no_public_comments"
 
     return "ok"
+
+
+# --- Browser-free preflight ------------------------------------------------
+# The log shows Instagram's embed page (the existing code's own
+# login-wall-avoidance attempt) still landing on login_wall_present=True
+# for every profile in this run - Instagram has tightened the embed
+# endpoint enough that it's no longer a reliable dodge. Instagram is
+# optional per the pipeline's priority order, so checking for that same
+# login wall with one plain HTTP GET, BEFORE ever calling _ensure_context(),
+# means a blocked profile never consumes one of the shared browser-launch
+# slots (browser_launch_slot()) - freeing that capacity for Google/YouTube
+# instead, without touching MAX_CONCURRENT_BROWSER_LAUNCHES or any timeout
+# constant.
+_PREFLIGHT_TIMEOUT_SECONDS = 4.0
+_IG_LOGIN_MARKERS = ("/accounts/login", "/challenge")
+_IG_LOGIN_TEXT_MARKERS = (
+    "log in • instagram", "login • instagram", "loginform",
+    "log in to see photos and videos",
+)
+
+
+def _httpx_preflight_blocked(url: str) -> bool:
+    """One plain GET, no retry: True if the response is already an
+    unambiguous login-wall/redirect, False if it looks navigable (or if
+    the check itself is inconclusive - in which case the existing
+    Playwright path decides, unchanged)."""
+    try:
+        with httpx.Client(follow_redirects=True) as client:
+            resp = client.get(
+                url,
+                timeout=_PREFLIGHT_TIMEOUT_SECONDS,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+                    ),
+                },
+            )
+    except Exception:
+        return False  # inconclusive - let the browser path try properly
+
+    final_url = str(resp.url)
+    if any(marker in final_url for marker in _IG_LOGIN_MARKERS):
+        return True
+    body_sample = resp.text[:20000].lower()
+    return any(marker in body_sample for marker in _IG_LOGIN_TEXT_MARKERS)
 
 
 def _looks_blocked(page) -> bool:
@@ -582,6 +635,33 @@ def _expand_more_comments(page, time_left, limit: int = 20) -> int:
     return clicked
 
 
+def _wait_for_more(page, count_fn, prev_count: int, max_ms: int = 500) -> int:
+    """Poll ``count_fn()`` in short steps until it exceeds ``prev_count`` or
+    ``max_ms`` elapses, whichever comes first.
+
+    Replaces an unconditional ``page.wait_for_timeout(max_ms)`` after a
+    scroll step: the worst-case wait is identical (this never runs longer
+    than ``max_ms``), but as soon as new items attach - which is most of
+    the time when content is actually available - this returns immediately
+    instead of always sitting out the full window, leaving more of the
+    scraper's time budget for additional scroll iterations. Mirrors the
+    same helper in youtube_scraper.py / google_scraper.py / twitter_scraper.py,
+    adapted here to reuse the ``count_fn`` already threaded through this
+    function's caller instead of a fixed selector.
+    """
+    deadline = time.monotonic() + (max_ms / 1000)
+    count = prev_count
+    while time.monotonic() < deadline:
+        try:
+            count = count_fn()
+        except Exception:
+            return count
+        if count > prev_count:
+            return count
+        page.wait_for_timeout(80)
+    return count
+
+
 def _scroll_until_idle(page, time_left, count_fn, max_items: int, scroll_target=None) -> int:
     """Generic idle-bounded scroll loop shared by the profile/post passes.
 
@@ -640,7 +720,10 @@ def _scroll_until_idle(page, time_left, count_fn, max_items: int, scroll_target=
                 page.mouse.wheel(0, 1200)
         except Exception:
             break
-        page.wait_for_timeout(450)
+        # Readiness-based wait: return as soon as new items attach instead
+        # of always sitting out the full 450ms window. Same worst-case
+        # bound as the previous fixed sleep.
+        _wait_for_more(page, count_fn, prev_count, max_ms=450)
 
     return max(prev_count, 0)
 
@@ -662,6 +745,20 @@ async def scrape_instagram_comments(company_data: Dict[str, str]) -> List[str]:
 
     profile_url = _profile_url(handle)
     company_name = company_data.get("company_name", handle)
+
+    loop = asyncio.get_event_loop()
+    embed_preflight_url = profile_url.rstrip("/") + "/embed/"
+    try:
+        preflight_blocked = await loop.run_in_executor(_EXECUTOR, _httpx_preflight_blocked, embed_preflight_url)
+    except Exception:
+        preflight_blocked = False
+    if preflight_blocked:
+        logger.info(
+            "Instagram scrape: preflight detected a login wall for %s before "
+            "touching the browser pool - returning [] immediately "
+            "(reason=login_wall, no Chromium launch spent on this).", embed_preflight_url,
+        )
+        return []
 
     def _run() -> List[str]:
         if sys.platform.startswith("win"):

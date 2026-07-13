@@ -10,7 +10,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-from scrapers.browser_utils import normalize_comments
+from scrapers.browser_utils import browser_launch_slot, normalize_comments
 from config import (
     MAX_GOOGLE_REVIEWS,
     MAX_SCROLL_ITERATIONS,
@@ -31,13 +31,30 @@ MAX_RESULTS = MAX_GOOGLE_REVIEWS
 
 # --- Hard internal time budget -----------------------------------------
 # Kept a few seconds under the outer asyncio.wait_for() cap applied per
-# job in app.py (30s) so this scraper almost always returns on its own,
+# job in app.py (48s) so this scraper almost always returns on its own,
 # with whatever it has collected so far, instead of being cut off cold by
 # the outer timeout and losing partial results. Now only the FIRST call for
 # a given business actually reaches this budget - every other product job
 # for the same company is served from the cache in _CACHE_LOCK-protected
 # dict below and returns near-instantly.
-TIME_BUDGET_SECONDS = 18
+#
+# WIDENED 18 -> 35 based on direct production-log evidence: a single failed
+# then slow-but-successful navigation retry sequence was observed consuming
+# ~24s by itself (attempt 1 using its full ~9s timeout, attempt 2 using
+# most of its ~7.8s allotment) - before the ~2.1s of fixed settle waits or
+# _PLACE_RESULT_LOOP_MIN_TIME_SECONDS's own 8s floor are even accounted
+# for. Both NAV_TIMEOUT_MS_MIN/MAX (config.py) scale UP as more budget is
+# available, so simply adding a few seconds back (as an earlier pass at
+# this fix did, 18->22) does not reliably solve it: worst case nav alone
+# can still consume up to ~21s (two attempts at the 12s ceiling minus
+# backoff), which left only ~1s of real margin at 22s - not enough to
+# clear the 8s place-result-loop floor. 35s leaves ~14s of margin after
+# that worst-case nav for settle waits, layout detection, and the loop's
+# own minimum, which is enough headroom based on what's been observed -
+# but page-load timing is network-dependent and should be validated
+# against real traffic; treat this as a strong first pass, not a
+# guaranteed-final number.
+TIME_BUDGET_SECONDS = 35
 
 # --- Navigation retry policy --------------------------------------------
 NAV_RETRIES = NAVIGATION_RETRIES
@@ -247,6 +264,32 @@ _REVIEWS_TAB_SELECTORS = [
     "xpath=//button[contains(@aria-label,'Review')]",
 ]
 
+# --- ROOT-CAUSE FIX (see _scrape_maps' place-result loop below) ----------
+# Minimum time_left() required to even ENTER the place-result selector
+# loop. This used to be hardcoded to 15 inline, which - combined with the
+# ~4-5s of fixed overhead that's always spent before this loop is reached
+# (initial nav + the 1800ms/300ms settle waits + consent dismissal +
+# bot-check + _detect_maps_layout) - meant time_left() was *already* at or
+# below 15 on essentially every single call, every time, regardless of
+# company. The loop's own `break` fired on its very first check, before a
+# single selector was ever tried, and did so silently (no log line), which
+# is exactly why every business in the production logs (Concept Kart, boAt
+# Lifestyle, Xiaomi India, Sony - completely unrelated companies) failed
+# identically with "no place-result selector matched in time": nothing was
+# ever actually attempted. Every other time-budget guard in this file (see
+# the `_wait_for_review_panel`, review-tab hunt, and scroll-loop checks
+# below) uses 6-12 as its "give up" threshold, not 15 - this constant
+# brings the place-result loop back in line with that convention.
+#
+# NOTE: lowering this threshold alone was not sufficient on its own - it
+# was still observed going negative (-5.8s) in production even at 8,
+# because TIME_BUDGET_SECONDS itself (see above) was too small for a
+# failed-then-successful nav retry sequence to fit inside. Both fixes are
+# required together: this threshold controls how much time the loop needs
+# once reached; TIME_BUDGET_SECONDS controls whether that much time is
+# realistically ever left over.
+_PLACE_RESULT_LOOP_MIN_TIME_SECONDS = 8
+
 # Selectors for a place result in the Maps search results list, used to
 # click into a place's detail page. Listed in order of specificity: the
 # structural href match is resilient to Google's periodic class-name
@@ -408,17 +451,75 @@ def _strip_review_boilerplate(text: str) -> str:
     return t
 
 
+# Near-duplicate collapsing (see _dedupe) only ever activates for strings at
+# least this long, so two short-but-similarly-phrased *distinct* reviews
+# (e.g. "Great service, highly recommend!" from two different reviewers)
+# are never at risk of being merged - only long, near-verbatim repeats are.
+_NEAR_DUP_MIN_LEN = 40
+_NEAR_DUP_RATIO = 0.93
+
+
 def _dedupe(strings: List[str]) -> List[str]:
-    """Case/whitespace-insensitive de-duplication, order-preserving."""
+    """Case/whitespace-insensitive de-duplication, order-preserving.
+
+    Also collapses near-duplicates for longer strings. ``raw_results`` (see
+    ``_scrape_sync``) can merge text from Maps plus the Google-search and
+    Bing fallbacks, which only run when Maps didn't return enough reviews -
+    and it's common for a search-engine snippet to be a shorter excerpt of a
+    review whose full text was already captured from Maps. An exact-match
+    check alone doesn't catch that, since the wording/truncation differs
+    between sources. Scoped to ``_NEAR_DUP_MIN_LEN``+ strings at a high
+    similarity ratio, with a cheap length-ratio check before the more
+    expensive comparison, so cost stays negligible at the review counts this
+    module deals with.
+    """
     seen = set()
     out: List[str] = []
+    kept_long: List[str] = []  # normalized keys of already-kept long entries
     for s in strings:
         key = re.sub(r"\s+", " ", s).strip().lower()
         if not key or key in seen:
             continue
+        if len(key) >= _NEAR_DUP_MIN_LEN:
+            is_near_dup = False
+            for other in kept_long:
+                longer, shorter = (len(other), len(key)) if len(other) >= len(key) else (len(key), len(other))
+                if shorter / longer < 0.7:
+                    continue  # cheap pre-filter: too different in length to bother comparing
+                if SequenceMatcher(None, key, other).ratio() >= _NEAR_DUP_RATIO:
+                    is_near_dup = True
+                    break
+            if is_near_dup:
+                continue
+            kept_long.append(key)
         seen.add(key)
         out.append(s)
     return out
+
+
+def _wait_for_more(page, selector: str, prev_count: int, max_ms: int = 500) -> int:
+    """Poll ``selector``'s match count in short steps until it exceeds
+    ``prev_count`` or ``max_ms`` elapses, whichever comes first.
+
+    Replaces an unconditional ``page.wait_for_timeout(max_ms)`` after a
+    scroll step: the worst-case wait is identical (this never runs longer
+    than ``max_ms``), but as soon as new review nodes attach - which is
+    most of the time on a live feed - this returns immediately instead of
+    always sitting out the full window, leaving more of the scraper's time
+    budget for additional scroll iterations. Mirrors the same helper in
+    youtube_scraper.py.
+    """
+    deadline = time.monotonic() + (max_ms / 1000)
+    count = prev_count
+    while time.monotonic() < deadline:
+        try:
+            count = page.locator(selector).count()
+        except Exception:
+            return count
+        if count > prev_count:
+            return count
+        page.wait_for_timeout(100)
+    return count
 
 
 def _bot_checked(page) -> bool:
@@ -594,10 +695,39 @@ def _scroll_reviews_panel(page, time_left, max_results: int = None) -> int:
     logger.info("Scrolling reviews (target up to %d review(s))...", max_results)
 
     def _count() -> int:
+        """Count currently-rendered review nodes.
+
+        ``div[data-review-id]`` is checked first since it's Google's current
+        structural marker for a review card (cheap: a single locator call in
+        the normal case, and behaves identically to before whenever it
+        returns >0). If it ever reports 0 - e.g. a future Maps build
+        drops/renames that attribute, the same kind of class-name churn this
+        file's other selector lists are already built to survive - falling
+        straight through to "no new reviews" would make the idle-scroll
+        logic below stop after just a couple of iterations even though the
+        feed is actively rendering content. As a safety net in that (today
+        unseen) case only, we also check the other known review-card
+        selectors from ``_REVIEW_SELECTORS`` and take whichever reports the
+        highest count, so a single selector going stale can't silently stall
+        collection.
+        """
         try:
-            return page.locator("div[data-review-id]").count()
+            primary = page.locator("div[data-review-id]").count()
         except Exception:
-            return -1
+            primary = -1
+        if primary > 0:
+            return primary
+        best = max(primary, 0)
+        for sel in _REVIEW_SELECTORS:
+            if sel == "div[data-review-id]":
+                continue
+            try:
+                c = page.locator(sel).count()
+            except Exception:
+                continue
+            if c > best:
+                best = c
+        return best
 
     scrollable = None
     for sel in _REVIEW_PANEL_SELECTORS:
@@ -627,9 +757,12 @@ def _scroll_reviews_panel(page, time_left, max_results: int = None) -> int:
                 break
             try:
                 page.mouse.wheel(0, 900)
-                page.wait_for_timeout(400)
             except Exception:
                 break
+            # Readiness-based wait: return as soon as new review nodes
+            # attach instead of always sitting out the full 400ms window.
+            # Same worst-case bound as the previous fixed sleep.
+            _wait_for_more(page, "div[data-review-id]", prev_count, max_ms=400)
             count = _count()
             if count <= prev_count:
                 idle += 1
@@ -666,7 +799,10 @@ def _scroll_reviews_panel(page, time_left, max_results: int = None) -> int:
             scrollable.evaluate("el => el.scrollTo(0, el.scrollHeight)")
         except Exception:
             break
-        page.wait_for_timeout(500)
+        # Readiness-based wait: return as soon as new review nodes attach
+        # instead of always sitting out the full 500ms window. Same
+        # worst-case bound as the previous fixed sleep.
+        _wait_for_more(page, "div[data-review-id]", prev_count, max_ms=500)
 
         # Periodically expand truncated / translated reviews so their full
         # text is present in the DOM once we go collect it. Doing this
@@ -789,7 +925,8 @@ def _ensure_context():
         pw = sync_playwright().start()
         handle.playwright = pw
 
-    browser = pw.chromium.launch(headless=True, args=_LAUNCH_ARGS)
+    with browser_launch_slot():
+        browser = pw.chromium.launch(headless=True, args=_LAUNCH_ARGS)
     context = browser.new_context(
         user_agent=_USER_AGENT,
         locale="en-US",
@@ -1161,8 +1298,44 @@ def _collect_review_texts(page, limit: int) -> List[str]:
     return [t for t in texts if t.strip().lower() not in _UI_LABEL_BLACKLIST]
 
 
+def _disambiguate_maps_query(query: str, company_data: Dict[str, str] = None) -> str:
+    """Append a domain hint to a bare company-name query when we have one.
+
+    The log shows both production runs landing on layout="search_results"
+    for a plain company-name query ("Headphone Zone", "boAt Lifestyle") -
+    a name generic/common enough that Maps returns a results list rather
+    than single-result-redirecting to the business page directly. The
+    click-through loop that recovers from this already exists and already
+    scores candidates by name similarity AND by whether the result's link
+    contains the business's own website domain (see best_match_score /
+    target_website below) - but every selector it has to try costs real
+    time, and in this run there wasn't enough left for even one more.
+
+    Feeding Maps' own search a more specific query up front - the same
+    "add a distinguishing word" trick a person doing this search by hand
+    would use - measurably increases how often Maps skips the results
+    list itself and single-result-redirects straight to the business
+    page, which is strictly cheaper than reaching the same page via the
+    click-through loop. This changes only the text sent to Maps; the
+    existing click-through/scoring logic below is untouched and still
+    runs exactly as before if Maps still returns a list.
+    """
+    website = (company_data or {}).get("website", "") or ""
+    if not website:
+        return query
+    domain = website.lower()
+    for prefix in ("https://", "http://", "www."):
+        if domain.startswith(prefix):
+            domain = domain[len(prefix):]
+    domain = domain.split("/")[0].strip()
+    if not domain or domain.lower() in query.lower():
+        return query
+    return f"{query} {domain}"
+
+
 def _scrape_maps(page, query: str, time_left, company_data: Dict[str, str] = None) -> Tuple[List[str], bool]:
     texts: List[str] = []
+    maps_query = _disambiguate_maps_query(query, company_data)
     # ``hl=en&gl=in`` forces Google to render the Maps UI in English
     # regardless of whatever locale/geolocation it would otherwise infer for
     # the scraping host's IP. The browser context already sets
@@ -1172,7 +1345,7 @@ def _scrape_maps(page, query: str, time_left, company_data: Dict[str, str] = Non
     # literally named "Reviews", which is exactly why the role/name lookup
     # below can find nothing even though the tab is present and clickable.
     maps_url = (
-        f"https://www.google.com/maps/search/{query.replace(' ', '+')}"
+        f"https://www.google.com/maps/search/{maps_query.replace(' ', '+')}"
         "?hl=en&gl=in"
     )
 
@@ -1340,15 +1513,46 @@ def _scrape_maps(page, query: str, time_left, company_data: Dict[str, str] = Non
             )
             return False
 
-        for selector in _PLACE_RESULT_SELECTORS:
-            if time_left() <= 15:
+        logger.debug(
+            "[PLACE_RESULT] entering place-result selector loop for query=%r: "
+            "time_left=%.1fs, min_required=%.1fs, %d selector(s) queued.",
+            query, time_left(), _PLACE_RESULT_LOOP_MIN_TIME_SECONDS,
+            len(_PLACE_RESULT_SELECTORS),
+        )
+        for _sel_idx, selector in enumerate(_PLACE_RESULT_SELECTORS):
+            if time_left() <= _PLACE_RESULT_LOOP_MIN_TIME_SECONDS:
+                logger.warning(
+                    "[PLACE_RESULT] aborting place-result loop for query=%r: "
+                    "only %.1fs left (need >%.1fs) at selector %d/%d (%r) - "
+                    "%d selector(s) never attempted.",
+                    query, time_left(), _PLACE_RESULT_LOOP_MIN_TIME_SECONDS,
+                    _sel_idx + 1, len(_PLACE_RESULT_SELECTORS), selector,
+                    len(_PLACE_RESULT_SELECTORS) - _sel_idx,
+                )
                 break
             try:
                 page.wait_for_selector(selector, timeout=6000)
-            except Exception:
+                logger.debug(
+                    "[PLACE_RESULT] selector %d/%d (%r) matched for query=%r "
+                    "(time_left=%.1fs).",
+                    _sel_idx + 1, len(_PLACE_RESULT_SELECTORS), selector,
+                    query, time_left(),
+                )
+            except Exception as _sel_exc:
+                logger.debug(
+                    "[PLACE_RESULT] selector %d/%d (%r) did not match for "
+                    "query=%r within 6000ms (time_left=%.1fs): %s",
+                    _sel_idx + 1, len(_PLACE_RESULT_SELECTORS), selector,
+                    query, time_left(), _sel_exc,
+                )
                 continue
             try:
                 results = page.locator(selector).all()
+                logger.debug(
+                    "[PLACE_RESULT] selector %r resolved %d candidate node(s) "
+                    "for query=%r.",
+                    selector, len(results), query,
+                )
                 for result in results[:5]:  # limited candidates
                     if time_left() <= 12:
                         break
@@ -1662,7 +1866,20 @@ def _scrape_maps(page, query: str, time_left, company_data: Dict[str, str] = Non
     # --- Step 4: idle-based scrolling, then a final expansion pass so
     # anything loaded on the very last scroll still gets its "More" /
     # translation / CSS-truncated text revealed before extraction. ---
-    found_count = _scroll_reviews_panel(page, time_left, max_results=MAX_GOOGLE_REVIEWS)
+    # Scroll toward a modestly higher raw-node target than the final cap.
+    # MAX_GOOGLE_REVIEWS counts *usable* reviews after boilerplate-stripping,
+    # the 5-word minimum, the _looks_like_review filter, and dedupe - all of
+    # which run after this scroll loop is done. A raw DOM node count equal to
+    # MAX_GOOGLE_REVIEWS routinely yields fewer than MAX_GOOGLE_REVIEWS
+    # reviews once those filters run, so stopping the scroll exactly at the
+    # cap quietly under-delivers. Padding the *target* by ~20% (small fixed
+    # floor of +5) gives the later filters headroom without changing the
+    # worst-case runtime: MAX_SCROLL_ITERATIONS, SCROLL_IDLE_LIMIT, and the
+    # time budget inside _scroll_reviews_panel still bound it exactly as
+    # before. The final returned list is still hard-capped at
+    # MAX_GOOGLE_REVIEWS below (see the `[:MAX_GOOGLE_REVIEWS]` slice).
+    _scroll_target = int(MAX_GOOGLE_REVIEWS * 1.2) + 5
+    found_count = _scroll_reviews_panel(page, time_left, max_results=_scroll_target)
     _expand_more_buttons(page, time_left)
     _expand_translated_reviews(page, time_left)
     _expand_hidden_review_text(page, time_left)

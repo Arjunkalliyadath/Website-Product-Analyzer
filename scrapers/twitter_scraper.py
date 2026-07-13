@@ -9,7 +9,9 @@ import time
 from pathlib import Path
 from typing import Dict, List
 
-from scrapers.browser_utils import normalize_comments
+import httpx
+
+from scrapers.browser_utils import browser_launch_slot, normalize_comments
 from config import (
     MAX_TWITTER_POSTS,
     MAX_SCROLL_ITERATIONS,
@@ -24,9 +26,13 @@ logger = logging.getLogger(__name__)
 
 # --- Hard internal time budget -----------------------------------------
 # Kept a few seconds under the outer asyncio.wait_for() cap applied in
-# app.py (20s) so this scraper almost always returns on its own, with
-# whatever it has collected so far, instead of being cut off cold by the
-# outer timeout and losing partial results. Lowered from 16 -> 12 now that
+# app.py (26s, widened from 20s - the old value was below observed
+# setup_time (~7.4s) + this budget (12s), leaving only ~0.6s of margin
+# before debug-artifact/screenshot capture on a failure path could push
+# the outer timeout past its own cap) so this scraper almost always
+# returns on its own, with whatever it has collected so far, instead of
+# being cut off cold by the outer timeout and losing partial results.
+# Lowered from 16 -> 12 now that
 # navigation itself fails fast (NAV_TIMEOUT_MS, NAVIGATION_RETRIES in
 # config.py), so a blocked/login-walled profile is recognized in a few
 # seconds instead of eating the whole budget on retries.
@@ -255,7 +261,8 @@ def _ensure_context():
         pw = sync_playwright().start()
         handle.playwright = pw
 
-    browser = pw.chromium.launch(headless=True, args=_LAUNCH_ARGS)
+    with browser_launch_slot():
+        browser = pw.chromium.launch(headless=True, args=_LAUNCH_ARGS)
     context = browser.new_context(
         user_agent=_USER_AGENT,
         viewport={"width": 1280, "height": 1800},
@@ -307,6 +314,47 @@ def _profile_url(target: str) -> str:
     if not re.fullmatch(r"[A-Za-z0-9_]+", handle):
         handle = re.sub(r"[^A-Za-z0-9_]", "", handle.replace(" ", ""))
     return f"https://x.com/{handle}" if handle else ""
+
+
+# --- Browser-free preflight ------------------------------------------------
+# X/Twitter is optional per the pipeline's own priority order, and the log
+# shows every single attempt in this run either failing to navigate at all
+# (browser-launch contention ate the time budget before Chromium could even
+# open the page) or landing on a login wall once it did load. Since
+# _looks_blocked's own URL/text markers work just as well against a plain
+# HTTP response as a rendered page, checking them BEFORE ever calling
+# _ensure_context() means an obviously-blocked target never consumes one of
+# the shared browser-launch slots (browser_launch_slot()) at all - freeing
+# that capacity for Google/YouTube instead, without touching
+# MAX_CONCURRENT_BROWSER_LAUNCHES or any timeout constant.
+_PREFLIGHT_TIMEOUT_SECONDS = 4.0
+
+
+def _httpx_preflight_blocked(url: str) -> bool:
+    """One plain GET, no retry: True if the response is already an
+    unambiguous login-wall/redirect, False if it looks navigable (or if
+    the check itself is inconclusive - in which case the existing
+    Playwright path decides, unchanged)."""
+    try:
+        with httpx.Client(follow_redirects=True) as client:
+            resp = client.get(
+                url,
+                timeout=_PREFLIGHT_TIMEOUT_SECONDS,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+                    ),
+                },
+            )
+    except Exception:
+        return False  # inconclusive - let the browser path try properly
+
+    final_url = str(resp.url)
+    if any(marker in final_url for marker in _LOGIN_MARKERS):
+        return True
+    body_sample = resp.text[:20000].lower()
+    return any(marker in body_sample for marker in _LOGIN_TEXT_MARKERS)
 
 
 def _looks_blocked(page) -> bool:
@@ -509,6 +557,31 @@ def _goto_with_retry(page, url: str, *, timeout: int, time_left, retries: int = 
     return False
 
 
+def _wait_for_more(page, selector: str, prev_count: int, max_ms: int = 500) -> int:
+    """Poll ``selector``'s match count in short steps until it exceeds
+    ``prev_count`` or ``max_ms`` elapses, whichever comes first.
+
+    Replaces an unconditional ``page.wait_for_timeout(max_ms)`` after a
+    scroll step: the worst-case wait is identical (this never runs longer
+    than ``max_ms``), but as soon as new article nodes attach - which is
+    most of the time on a live timeline - this returns immediately instead
+    of always sitting out the full window, leaving more of the scraper's
+    time budget for additional scroll iterations. Mirrors the same helper
+    in youtube_scraper.py / google_scraper.py.
+    """
+    deadline = time.monotonic() + (max_ms / 1000)
+    count = prev_count
+    while time.monotonic() < deadline:
+        try:
+            count = page.locator(selector).count()
+        except Exception:
+            return count
+        if count > prev_count:
+            return count
+        page.wait_for_timeout(100)
+    return count
+
+
 def _get_articles(page):
     """Fetch tweet/reply elements using a structural selector first.
 
@@ -652,10 +725,17 @@ def _scroll_timeline_until_idle(page, time_left, max_items: int):
         prev_count = max(prev_count, count)
 
         try:
+            dom_count_before = page.locator('article[data-testid="tweet"], article').count()
+        except Exception:
+            dom_count_before = -1
+        try:
             page.mouse.wheel(0, 1800)
         except Exception:
             break
-        page.wait_for_timeout(500)
+        # Readiness-based wait: return as soon as new article nodes attach
+        # instead of always sitting out the full 500ms window. Same
+        # worst-case bound as the previous fixed sleep.
+        _wait_for_more(page, 'article[data-testid="tweet"], article', dom_count_before, max_ms=500)
 
     return seen_text, links
 
@@ -672,6 +752,19 @@ async def scrape_twitter_comments(company_data: Dict[str, str]) -> List[str]:
     url = _profile_url(target)
     if not url:
         logger.warning("Twitter/X scrape: could not resolve a usable profile URL from %r.", target)
+        return []
+
+    loop = asyncio.get_event_loop()
+    try:
+        preflight_blocked = await loop.run_in_executor(_EXECUTOR, _httpx_preflight_blocked, url)
+    except Exception:
+        preflight_blocked = False
+    if preflight_blocked:
+        logger.info(
+            "Twitter/X scrape: preflight detected a login wall for %s before "
+            "touching the browser pool - returning [] immediately "
+            "(reason=login_wall, no Chromium launch spent on this).", url,
+        )
         return []
 
     def _run() -> List[str]:
@@ -776,7 +869,16 @@ async def scrape_twitter_comments(company_data: Dict[str, str]) -> List[str]:
                 try:
                     if not _goto_with_retry(page, link, timeout=_adaptive_nav_timeout(time_left), time_left=time_left):
                         continue
-                    page.wait_for_timeout(1000)
+                    # Readiness-based wait: return as soon as the tweet's
+                    # own articles (the reply thread) attach instead of
+                    # always sitting out a blind 1000ms first. Capped at
+                    # the same 1000ms, so worst-case time-budget usage is
+                    # unchanged - a fast-rendering tweet page just no
+                    # longer pays the full wait before scrolling starts.
+                    try:
+                        page.wait_for_selector('article[data-testid="tweet"], article', timeout=1000)
+                    except Exception:
+                        pass
                     page.mouse.wheel(0, 1200)
                     page.wait_for_timeout(600)
                     # Expand any publicly-visible "Show more replies" /

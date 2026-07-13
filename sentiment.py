@@ -197,29 +197,48 @@ def get_sentiment_pipeline():
                 "sentiment-analysis",
                 model=_SENTIMENT_MODEL_ID,
                 tokenizer=_SENTIMENT_MODEL_ID,
-                # Belt-and-suspenders on top of the HF_HUB_OFFLINE /
-                # TRANSFORMERS_OFFLINE env vars set in
-                # _ensure_offline_mode_configured(): local_files_only=True
-                # tells transformers directly, at the call site, to never
-                # perform the ETag/HEAD "is the cache stale" check against
-                # huggingface.co - it goes straight to the local cache or
-                # raises, with no network attempt and no retry/backoff
-                # sequence in between. This is what previously cost ~30s
-                # per analysis (5 retries against a blocked host) even
-                # though the model was already cached locally the whole
-                # time.
-                local_files_only=True,
+                # BUGFIX: local_files_only must be passed via model_kwargs,
+                # not as a bare keyword to pipeline(). pipeline() only
+                # forwards model_kwargs to AutoConfig.from_pretrained(),
+                # AutoModelForSequenceClassification.from_pretrained(), and
+                # (copied) AutoTokenizer.from_pretrained() - the three
+                # places that actually accept local_files_only.
+                #
+                # A bare local_files_only=True kwarg, by contrast, is *not*
+                # consumed by pipeline()'s named parameters, so it falls
+                # into pipeline()'s **kwargs, which get passed straight
+                # through to the pipeline class's __init__ and from there
+                # into TextClassificationPipeline._sanitize_parameters(),
+                # which buckets any unrecognized kwarg into preprocess_params.
+                # Those preprocess_params are re-applied on every single
+                # inference call as tokenizer_kwargs, i.e.
+                # self.tokenizer(text, ..., local_files_only=True). That is
+                # what reached PreTrainedTokenizerFast._batch_encode_plus(),
+                # which has no such argument and raised the TypeError seen
+                # at inference time (not at load time, since loading happens
+                # lazily on first use here) - and which then permanently
+                # tripped the circuit breaker down to keyword fallback.
+                #
+                # Passed this way instead, local_files_only still fully
+                # blocks any network round-trip during model/tokenizer
+                # loading (same guarantee as before) - it just no longer
+                # leaks into the per-call tokenizer arguments where it
+                # isn't a supported option.
+                model_kwargs={"local_files_only": True},
                 # Carried over from the old app.py-local pipeline loader
                 # this consolidates: without truncation, a comment/review
                 # longer than the model's 512-token limit would raise at
                 # inference time instead of being safely truncated.
+                # truncation/max_length ARE valid _batch_encode_plus
+                # arguments, so these are correctly left as pipeline-level
+                # kwargs (they're meant to reach the tokenizer call).
                 truncation=True,
                 max_length=512,
             )
             logger.info(
-                "Sentiment pipeline loaded from local cache (local_files_only=True, "
-                "zero network attempts) and cached in memory for reuse by all "
-                "future calls."
+                "Sentiment pipeline loaded from local cache (local_files_only=True "
+                "via model_kwargs, zero network attempts) and cached in memory for "
+                "reuse by all future calls."
             )
         except Exception as exc:
             _mark_model_unavailable(f"pipeline load raised: {exc!r}")

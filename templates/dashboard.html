@@ -177,6 +177,68 @@
     .chart-wrap { position: relative; width: 100%; max-width: 240px; margin: 1rem auto 0; }
 
     
+    .sentiment-breakdown-card { display: flex; flex-direction: column; transition: box-shadow .25s ease, transform .25s ease; }
+    .sentiment-breakdown-card:hover { box-shadow: 0 18px 40px rgba(65,48,28,.11); transform: translateY(-2px); }
+
+    .sentbrk-chart-center { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); text-align: center; pointer-events: none; }
+    .sentbrk-chart-center-value { font-size: 1.5rem; font-weight: 700; color: var(--text); letter-spacing: -.02em; line-height: 1; }
+    .sentbrk-chart-center-label { font-size: .66rem; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; margin-top: .2rem; }
+
+    .sentbrk-bars { display: flex; flex-direction: column; gap: .85rem; margin-top: 1.4rem; }
+
+    .sentbrk-bar-row { padding: .55rem .65rem; border-radius: 14px; transition: background .2s ease, transform .2s ease; }
+    .sentbrk-bar-row:hover { background: var(--primary-l); transform: translateX(2px); }
+
+    .sentbrk-bar-top { display: flex; align-items: center; gap: .45rem; margin-bottom: .4rem; }
+    .sentbrk-bar-icon { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; border-radius: 50%; flex-shrink: 0; }
+    .sentbrk-bar-icon--pos { color: var(--positive); background: rgba(46,125,50,.12); }
+    .sentbrk-bar-icon--neg { color: var(--negative); background: rgba(179,38,74,.12); }
+    .sentbrk-bar-icon--neu { color: var(--neutral);  background: rgba(138,106,31,.12); }
+
+    .sentbrk-bar-name { font-size: .82rem; font-weight: 600; color: var(--text); }
+    .sentbrk-bar-pct { margin-left: auto; font-size: .82rem; font-weight: 700; color: var(--text); font-variant-numeric: tabular-nums; }
+
+    .sentbrk-bar-track { position: relative; height: 8px; border-radius: 100px; background: var(--border); overflow: hidden; }
+    .sentbrk-bar-fill {
+      position: absolute; inset: 0; width: var(--sentbrk-w, 0%);
+      border-radius: 100px; transform: scaleX(0); transform-origin: left;
+      animation: sentbrkGrow 1s cubic-bezier(.16,1,.3,1) forwards;
+      animation-delay: .1s;
+    }
+    .sentbrk-bar-row--neg .sentbrk-bar-fill { animation-delay: .22s; }
+    .sentbrk-bar-row--neu .sentbrk-bar-fill { animation-delay: .34s; }
+
+    .sentbrk-bar-fill--pos { background: linear-gradient(90deg, #2E7D32, #57B860); }
+    .sentbrk-bar-fill--neg { background: linear-gradient(90deg, #B3264A, #E0567D); }
+    .sentbrk-bar-fill--neu { background: linear-gradient(90deg, #8A6A1F, #C79A3A); }
+
+    @keyframes sentbrkGrow { to { transform: scaleX(1); } }
+
+    .sentbrk-bar-count { margin-top: .32rem; font-size: .72rem; color: var(--muted); margin-left: 1.9rem; }
+
+    .sentbrk-empty { display: flex; flex-direction: column; align-items: center; text-align: center; padding: 1.6rem .5rem .4rem; gap: .55rem; }
+    .sentbrk-empty-icon { width: 64px; height: 64px; display: flex; align-items: center; justify-content: center; animation: sentbrkFloat 3.2s ease-in-out infinite; }
+    @keyframes sentbrkFloat { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-5px); } }
+
+    .sentbrk-empty-title { font-size: .98rem; font-weight: 700; color: var(--text); margin-top: .2rem; }
+    .sentbrk-empty-desc { font-size: .8rem; color: var(--muted); line-height: 1.5; max-width: 30ch; }
+
+    .sentbrk-empty-shimmer { width: 100%; max-width: 220px; display: flex; flex-direction: column; gap: .5rem; margin-top: .6rem; }
+    .sentbrk-empty-shimmer-bar {
+      height: 7px; border-radius: 100px;
+      background: linear-gradient(90deg, var(--border) 0%, var(--primary-l) 50%, var(--border) 100%);
+      background-size: 200% 100%;
+      animation: sentbrkShimmer 1.8s ease-in-out infinite;
+    }
+    .sentbrk-empty-shimmer-bar:nth-child(2) { animation-delay: .15s; }
+    .sentbrk-empty-shimmer-bar:nth-child(3) { animation-delay: .3s; }
+    @keyframes sentbrkShimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+
+    @media (max-width: 600px) {
+      .sentbrk-bar-count { margin-left: 0; }
+    }
+
+    
     .platform-list { display: flex; flex-direction: column; gap: .7rem; margin-top: .65rem; }
     .platform-row { display: flex; align-items: center; gap: .7rem; }
     .platform-icon {
@@ -207,6 +269,10 @@
       transition: all .15s;
       font-family: inherit;
     }
+    .tab-panel .comment-filters {
+      position: sticky; top: 0; z-index: 3;
+      background: var(--surface); padding: .3rem 0 .8rem;
+    }
     .filter-btn:hover { border-color: var(--primary); color: var(--text); }
     .filter-btn.active { background: var(--primary); border-color: var(--primary); color: #fff; }
     .filter-btn.pos.active { background: var(--positive); border-color: var(--positive); color: #fff; }
@@ -214,29 +280,112 @@
     .filter-btn.neu.active { background: var(--neutral);  border-color: var(--neutral);  color: #fff; }
 
     
-    .comments-list { display: flex; flex-direction: column; gap: .55rem; }
+    .comments-list {
+      display: flex; flex-direction: column; gap: .85rem;
+      max-height: 620px; overflow-y: auto; overflow-x: hidden;
+      padding: .2rem .3rem .2rem 0; margin-top: .2rem;
+      scrollbar-width: thin; scrollbar-color: var(--border) transparent;
+    }
+    .comments-list::-webkit-scrollbar { width: 7px; }
+    .comments-list::-webkit-scrollbar-track { background: transparent; }
+    .comments-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 100px; }
+    .comments-list::-webkit-scrollbar-thumb:hover { background: var(--primary); }
+
     .comment-card {
-      background: var(--bg);
+      position: relative;
+      background: var(--surface);
       border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: .85rem 1rem;
+      border-radius: 16px;
+      padding: 1rem 1.15rem 1rem 1.35rem;
       display: flex;
-      gap: .9rem;
-      align-items: flex-start;
-      transition: border-color .15s;
+      gap: 0;
+      align-items: stretch;
+      transition: border-color .2s ease, box-shadow .2s ease, transform .2s ease;
+      overflow: hidden;
     }
     .comment-card:hover { border-color: var(--primary); }
-    .comment-sentiment-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; margin-top: .38rem; }
-    .comment-body { flex: 1; }
-    .comment-text { font-size: .875rem; line-height: 1.6; color: var(--text); }
-    .comment-meta { display: flex; gap: .65rem; margin-top: .35rem; font-size: .72rem; color: var(--muted); align-items: center; }
-    .badge {
-      display: inline-block; padding: .12rem .45rem; border-radius: 100px;
-      font-size: .66rem; font-weight: 600; text-transform: uppercase; letter-spacing: .04em;
+    .comment-sentiment-dot {
+      position: absolute; left: 0; top: 0; bottom: 0; width: 4px;
+      border-radius: 0; flex-shrink: 0; margin-top: 0;
     }
-    .badge-pos { background: #f0fdf4; color: var(--positive); }
-    .badge-neg { background: #fef2f2; color: var(--negative); }
-    .badge-neu { background: #fffbeb; color: var(--neutral); }
+    .comment-card-inner { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: .6rem; }
+    .comment-top-row { display: flex; align-items: center; justify-content: space-between; gap: .6rem; flex-wrap: wrap; }
+    .comment-body { flex: 1; min-width: 0; }
+    .comment-text {
+      font-size: .875rem; line-height: 1.65; color: var(--text);
+      position: relative; padding-left: 1.1rem;
+    }
+    .comment-text::before {
+      content: "\201C"; position: absolute; left: -.15rem; top: -.3rem;
+      font-size: 1.4rem; font-weight: 800; color: var(--primary); opacity: .45;
+      font-family: Georgia, serif; line-height: 1;
+    }
+    .comment-meta { display: flex; gap: .5rem; margin-top: .55rem; font-size: .72rem; color: var(--muted); align-items: center; flex-wrap: wrap; }
+    .badge {
+      display: inline-block; padding: .2rem .55rem; border-radius: 100px;
+      font-size: .64rem; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+      border: 1px solid transparent; flex-shrink: 0;
+    }
+    .badge-pos { background: #f0fdf4; color: var(--positive); border-color: rgba(46,125,50,.18); }
+    .badge-neg { background: #fef2f2; color: var(--negative); border-color: rgba(179,38,74,.18); }
+    .badge-neu { background: #fffbeb; color: var(--neutral); border-color: rgba(138,106,31,.18); }
+
+    /* --- Platform badge (icon + name), color driven by --platform-color --- */
+    .platform-badge {
+      display: inline-flex; align-items: center; gap: .4rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      background: color-mix(in srgb, var(--platform-color, var(--muted)) 10%, var(--surface));
+      border: 1px solid color-mix(in srgb, var(--platform-color, var(--muted)) 28%, var(--border));
+      border-radius: 100px; padding: .22rem .6rem .22rem .35rem;
+    }
+    .platform-badge-icon {
+      width: 18px; height: 18px; border-radius: 50%; flex-shrink: 0;
+      display: flex; align-items: center; justify-content: center;
+      background: var(--platform-color, var(--muted)); color: #fff;
+      font-size: .62rem; line-height: 1;
+    }
+    .platform-badge-name { font-size: .72rem; font-weight: 700; color: var(--text); }
+
+    /* --- Product name badge --- */
+    .product-badge {
+      display: inline-flex; align-items: center;
+      background: var(--primary-l); color: var(--primary);
+      border: 1px solid rgba(90,79,207,.18);
+      border-radius: 100px; padding: .16rem .55rem;
+      font-size: .68rem; font-weight: 600;
+    }
+
+    /* --- Timestamp --- */
+    .comment-timestamp {
+      display: inline-flex; align-items: center; gap: .3rem;
+      color: var(--muted); font-size: .72rem;
+      margin-left: auto;
+    }
+    .comment-timestamp::before {
+      content: ""; width: 12px; height: 12px; flex-shrink: 0;
+      background: var(--muted);
+      -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='9'/%3E%3Cpath d='M12 7v5l3 2'/%3E%3C/svg%3E") center / contain no-repeat;
+      mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='9'/%3E%3Cpath d='M12 7v5l3 2'/%3E%3C/svg%3E") center / contain no-repeat;
+    }
+
+    /* --- Reviewer / rating meta used by the Website Reviews cards --- */
+    .comment-author { font-weight: 700; color: var(--text); }
+    .comment-rating { color: #C79A3A; font-weight: 700; letter-spacing: .02em; }
+
+    /* --- Loading skeleton (available for async use; not wired to any script) --- */
+    .comment-skeleton {
+      border-radius: 16px; padding: 1rem 1.15rem;
+      background: var(--surface); border: 1px solid var(--border);
+      display: flex; flex-direction: column; gap: .55rem;
+    }
+    .comment-skeleton-line {
+      height: 9px; border-radius: 100px;
+      background: linear-gradient(90deg, var(--border) 0%, var(--primary-l) 50%, var(--border) 100%);
+      background-size: 200% 100%; animation: commentSkeletonShimmer 1.6s ease-in-out infinite;
+    }
+    @keyframes commentSkeletonShimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+
 
     
     .summary-text { font-size: .9rem; line-height: 1.75; color: var(--muted); margin-bottom: 1.1rem; }
@@ -291,7 +440,18 @@
     .dl-btn:hover { border-color: var(--primary); color: var(--primary); background: var(--primary-l); }
 
     
-    .empty { text-align: center; padding: 2.5rem; color: var(--muted); font-size: .875rem; }
+    .empty {
+      display: flex; flex-direction: column; align-items: center; text-align: center;
+      gap: .6rem; padding: 2.6rem 1.2rem; color: var(--muted); font-size: .85rem;
+      line-height: 1.55; background: var(--bg); border: 1px dashed var(--border); border-radius: 16px;
+    }
+    .empty-icon {
+      width: 44px; height: 44px; border-radius: 50%; flex-shrink: 0;
+      background: var(--primary-l); color: var(--primary);
+      display: flex; align-items: center; justify-content: center;
+      animation: emptyFloat 3.2s ease-in-out infinite;
+    }
+    @keyframes emptyFloat { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-4px); } }
 
     
     .score-wrap { display: flex; align-items: baseline; gap: .5rem; margin-top: .3rem; }
@@ -305,6 +465,207 @@
     .score-label.mixed { background: #fffbeb; color: var(--neutral); }
     .score-label.negative, .score-label.very-negative { background: #fef2f2; color: var(--negative); }
     .score-label.no-data { background: var(--bg); color: var(--muted); }
+
+    
+    .buyrec-card { position: relative; overflow: hidden; }
+
+    .buyrec-hero {
+      display: grid; grid-template-columns: 1.3fr auto 1fr; gap: 1.6rem; align-items: center;
+      padding: 1.5rem; border-radius: 20px; margin-top: .3rem;
+      background: linear-gradient(145deg, rgba(90,79,207,.06), rgba(90,79,207,.015));
+      border: 1px solid var(--border);
+      backdrop-filter: blur(6px);
+    }
+    .buyrec-hero--very-positive, .buyrec-hero--positive { background: linear-gradient(145deg, rgba(46,125,50,.08), rgba(46,125,50,.015)); }
+    .buyrec-hero--mixed { background: linear-gradient(145deg, rgba(138,106,31,.08), rgba(138,106,31,.015)); }
+    .buyrec-hero--negative, .buyrec-hero--very-negative { background: linear-gradient(145deg, rgba(179,38,74,.08), rgba(179,38,74,.015)); }
+
+    @media (max-width: 760px) {
+      .buyrec-hero { grid-template-columns: 1fr; }
+      .buyrec-hero-divider { display: none; }
+    }
+
+    .buyrec-hero-divider { width: 1px; align-self: stretch; background: var(--border); }
+
+    .buyrec-badge {
+      font-size: 1rem !important; padding: .45rem 1.1rem !important; margin-top: .6rem !important;
+      font-weight: 700; letter-spacing: -.01em; box-shadow: 0 6px 16px rgba(0,0,0,.05);
+    }
+
+    .buyrec-explanation { margin-top: .85rem; line-height: 1.6; max-width: 46ch; }
+
+    .buyrec-pending { display: flex; gap: .7rem; margin-top: .9rem; align-items: flex-start; }
+    .buyrec-pending-icon {
+      flex-shrink: 0; width: 30px; height: 30px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+      background: rgba(138,106,31,.14); color: var(--neutral); font-size: .95rem;
+      animation: buyrecPulse 2.2s ease-in-out infinite;
+    }
+    @keyframes buyrecPulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(138,106,31,.22); } 50% { box-shadow: 0 0 0 6px rgba(138,106,31,0); } }
+    .buyrec-pending-title { font-weight: 700; font-size: .88rem; margin-bottom: .25rem; }
+    .buyrec-pending-text { font-size: .8rem; color: var(--muted); line-height: 1.55; max-width: 42ch; }
+
+    .buyrec-gauge-wrap { display: flex; flex-direction: column; align-items: center; text-align: center; }
+
+    .buyrec-gauge { position: relative; width: 132px; height: 132px; margin: .5rem 0 .4rem; }
+    .buyrec-gauge-svg { width: 100%; height: 100%; transform: rotate(-90deg); }
+    .buyrec-gauge-track { fill: none; stroke: var(--border); stroke-width: 10; }
+    .buyrec-gauge-fill {
+      fill: none; stroke-width: 10; stroke-linecap: round;
+      stroke-dasharray: 326.7;
+      stroke-dashoffset: 326.7;
+      stroke: var(--primary);
+      animation: buyrecRing 1.3s cubic-bezier(.16,1,.3,1) forwards;
+      animation-delay: .1s;
+    }
+    @keyframes buyrecRing { to { stroke-dashoffset: calc(326.7 - (326.7 * var(--ring-pct, 0)) / 100); } }
+
+    .buyrec-gauge--very-positive .buyrec-gauge-fill, .buyrec-gauge--positive .buyrec-gauge-fill { stroke: var(--positive); }
+    .buyrec-gauge--mixed .buyrec-gauge-fill { stroke: var(--neutral); }
+    .buyrec-gauge--negative .buyrec-gauge-fill, .buyrec-gauge--very-negative .buyrec-gauge-fill { stroke: var(--negative); }
+    .buyrec-gauge--no-data .buyrec-gauge-fill { stroke: var(--muted); }
+
+    .buyrec-gauge-center {
+      position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    }
+    .buyrec-gauge-score { font-size: 2.1rem !important; line-height: 1; }
+    .buyrec-gauge-meta { max-width: 30ch; margin-top: .5rem; line-height: 1.5; }
+
+    .buyrec-products {
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: .9rem; margin-top: .7rem;
+    }
+    .buyrec-product-card {
+      border: 1px solid var(--border); border-radius: 16px; padding: 1rem 1.1rem;
+      background: var(--surface); transition: transform .2s ease, box-shadow .2s ease, border-color .2s ease;
+    }
+    .buyrec-product-card:hover { transform: translateY(-3px); box-shadow: 0 14px 28px rgba(65,48,28,.09); border-color: var(--primary); }
+
+    .buyrec-product-card--very-positive, .buyrec-product-card--positive { border-left: 3px solid var(--positive); }
+    .buyrec-product-card--mixed { border-left: 3px solid var(--neutral); }
+    .buyrec-product-card--negative, .buyrec-product-card--very-negative { border-left: 3px solid var(--negative); }
+    .buyrec-product-card--no-data { border-left: 3px solid var(--muted); }
+
+    .buyrec-product-top { display: flex; align-items: center; gap: .5rem; margin-bottom: .8rem; }
+    .buyrec-product-icon {
+      width: 22px; height: 22px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+      flex-shrink: 0; background: rgba(90,79,207,.12); color: var(--primary);
+    }
+    .buyrec-product-icon--very-positive, .buyrec-product-icon--positive { background: rgba(46,125,50,.12); color: var(--positive); }
+    .buyrec-product-icon--mixed { background: rgba(138,106,31,.12); color: var(--neutral); }
+    .buyrec-product-icon--negative, .buyrec-product-icon--very-negative { background: rgba(179,38,74,.12); color: var(--negative); }
+    .buyrec-product-icon--no-data { background: var(--bg); color: var(--muted); }
+
+    .buyrec-product-name { font-weight: 700; font-size: .88rem; flex: 1; }
+    .buyrec-product-badge { margin-top: 0 !important; font-size: .68rem !important; padding: .18rem .55rem !important; }
+
+    .buyrec-product-stats { display: flex; gap: 1.4rem; }
+    .buyrec-product-stat-label { font-size: .68rem; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin-bottom: .2rem; }
+    .buyrec-product-stat-value { font-size: 1rem; font-weight: 700; color: var(--text); }
+    .buyrec-product-stat-value .card-sub { font-size: .72rem; font-weight: 500; margin-left: .2rem; }
+
+    
+    .brandrep-card { position: relative; }
+
+    .brandrep-hero { display: grid; grid-template-columns: 1.2fr 1fr; gap: 1.1rem; margin-top: .3rem; }
+    @media (max-width: 760px) { .brandrep-hero { grid-template-columns: 1fr; } }
+
+    .brandrep-score-card, .brandrep-gmaps-card {
+      border: 1px solid var(--border); border-radius: 18px; padding: 1.25rem 1.4rem;
+      background: linear-gradient(150deg, rgba(90,79,207,.05), rgba(90,79,207,.01));
+      transition: box-shadow .2s ease, transform .2s ease;
+    }
+    .brandrep-score-card:hover, .brandrep-gmaps-card:hover { box-shadow: 0 14px 30px rgba(65,48,28,.08); transform: translateY(-2px); }
+
+    .brandrep-score-card--excellent, .brandrep-score-card--good { background: linear-gradient(150deg, rgba(46,125,50,.07), rgba(46,125,50,.01)); }
+    .brandrep-score-card--mixed { background: linear-gradient(150deg, rgba(138,106,31,.07), rgba(138,106,31,.01)); }
+    .brandrep-score-card--poor { background: linear-gradient(150deg, rgba(179,38,74,.07), rgba(179,38,74,.01)); }
+
+    .brandrep-score-row { display: flex; align-items: center; gap: 1.2rem; margin-top: .6rem; }
+
+    .brandrep-ring { position: relative; width: 104px; height: 104px; flex-shrink: 0; }
+    .brandrep-ring-svg { width: 100%; height: 100%; transform: rotate(-90deg); }
+    .brandrep-ring-track { fill: none; stroke: var(--border); stroke-width: 9; }
+    .brandrep-ring-fill {
+      fill: none; stroke-width: 9; stroke-linecap: round;
+      stroke-dasharray: 326.7; stroke-dashoffset: 326.7; stroke: var(--primary);
+      animation: brandrepRing 1.3s cubic-bezier(.16,1,.3,1) forwards; animation-delay: .1s;
+    }
+    @keyframes brandrepRing { to { stroke-dashoffset: calc(326.7 - (326.7 * var(--ring-pct, 0)) / 100); } }
+    .brandrep-ring--excellent .brandrep-ring-fill, .brandrep-ring--good .brandrep-ring-fill { stroke: var(--positive); }
+    .brandrep-ring--mixed .brandrep-ring-fill { stroke: var(--neutral); }
+    .brandrep-ring--poor .brandrep-ring-fill { stroke: var(--negative); }
+    .brandrep-ring--no-data .brandrep-ring-fill { stroke: var(--muted); }
+    .brandrep-ring-center { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+    .brandrep-ring-score { font-size: 1.7rem !important; line-height: 1; }
+
+    .brandrep-score-meta { display: flex; flex-direction: column; }
+    .brandrep-badge { font-size: .85rem !important; padding: .3rem .8rem !important; }
+    .brandrep-score-sub { max-width: 24ch; line-height: 1.5; }
+
+    .brandrep-gmaps-row { display: flex; align-items: center; gap: .6rem; margin-top: .6rem; }
+    .brandrep-gmaps-icon {
+      width: 34px; height: 34px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+      background: rgba(90,79,207,.12); color: var(--primary); flex-shrink: 0;
+    }
+    .brandrep-gmaps-score { font-size: 1.6rem !important; }
+
+    .brandrep-gmaps-bar-track { height: 7px; border-radius: 100px; background: var(--border); overflow: hidden; margin: .7rem 0 .6rem; }
+    .brandrep-gmaps-bar-fill {
+      height: 100%; border-radius: 100px; width: var(--gmaps-pct, 0%);
+      background: linear-gradient(90deg, var(--primary), #8B7FE8);
+      transform: scaleX(0); transform-origin: left;
+      animation: brandrepGmapsGrow 1s cubic-bezier(.16,1,.3,1) forwards; animation-delay: .2s;
+    }
+    @keyframes brandrepGmapsGrow { to { transform: scaleX(1); } }
+    .brandrep-gmaps-bar-fill--excellent, .brandrep-gmaps-bar-fill--good { background: linear-gradient(90deg, var(--positive), #57B860); }
+    .brandrep-gmaps-bar-fill--mixed { background: linear-gradient(90deg, var(--neutral), #C79A3A); }
+    .brandrep-gmaps-bar-fill--poor { background: linear-gradient(90deg, var(--negative), #E0567D); }
+
+    .brandrep-gmaps-empty { display: flex; flex-direction: column; align-items: center; text-align: center; padding: .6rem .5rem .2rem; gap: .4rem; }
+    .brandrep-gmaps-empty-icon {
+      width: 46px; height: 46px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+      background: var(--bg); color: var(--muted); animation: brandrepFloat 3.2s ease-in-out infinite;
+    }
+    @keyframes brandrepFloat { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-4px); } }
+    .brandrep-gmaps-empty-title { font-weight: 700; font-size: .86rem; margin-top: .2rem; }
+    .brandrep-gmaps-empty-text { font-size: .78rem; color: var(--muted); max-width: 26ch; line-height: 1.5; }
+
+    .brandrep-platforms { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: .9rem; margin-top: .7rem; }
+    .brandrep-platform-card {
+      border: 1px solid var(--border); border-radius: 16px; padding: 1rem 1.1rem;
+      background: var(--surface); transition: transform .2s ease, box-shadow .2s ease, border-color .2s ease;
+    }
+    .brandrep-platform-card:hover { transform: translateY(-3px); box-shadow: 0 14px 28px rgba(65,48,28,.09); border-color: var(--primary); }
+    .brandrep-platform-card--excellent, .brandrep-platform-card--good { border-left: 3px solid var(--positive); }
+    .brandrep-platform-card--mixed { border-left: 3px solid var(--neutral); }
+    .brandrep-platform-card--poor { border-left: 3px solid var(--negative); }
+    .brandrep-platform-card--no-data { border-left: 3px solid var(--muted); }
+
+    .brandrep-platform-top { display: flex; align-items: center; gap: .5rem; }
+    .brandrep-platform-icon { font-size: 1.05rem; line-height: 1; flex-shrink: 0; }
+    .brandrep-platform-name { font-weight: 700; font-size: .88rem; flex: 1; }
+    .brandrep-platform-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; background: var(--muted); }
+    .brandrep-platform-dot--excellent, .brandrep-platform-dot--good { background: var(--positive); }
+    .brandrep-platform-dot--mixed { background: var(--neutral); }
+    .brandrep-platform-dot--poor { background: var(--negative); }
+
+    .brandrep-platform-count { margin-top: .25rem; }
+
+    .brandrep-platform-bar {
+      display: flex; height: 7px; border-radius: 100px; overflow: hidden; gap: 1.5px; margin: .7rem 0 .6rem;
+      opacity: 0; transform: scaleX(.9); transform-origin: left;
+      animation: brandrepBarIn .6s ease forwards; animation-delay: .15s;
+    }
+    @keyframes brandrepBarIn { to { opacity: 1; transform: scaleX(1); } }
+    .brandrep-platform-bar-seg { flex: 0 0 auto; width: calc(var(--seg-pct, 0) * 1%); }
+    .brandrep-platform-bar-seg--pos { background: var(--positive); }
+    .brandrep-platform-bar-seg--neg { background: var(--negative); }
+    .brandrep-platform-bar-seg--neu { background: var(--neutral); }
+
+    .brandrep-platform-bottom { display: flex; align-items: center; justify-content: space-between; gap: .5rem; }
+    .brandrep-platform-score { font-size: .95rem; font-weight: 700; color: var(--text); }
+    .brandrep-platform-score .card-sub { font-size: .72rem; font-weight: 500; margin-left: .15rem; }
+
+
 
     
     .chip-list { display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .5rem; }
@@ -408,6 +769,271 @@
       line-height: 1.5;
       color: var(--muted);
     }
+
+    
+    .herohead { position: relative; overflow: hidden; }
+    .herohead::before {
+      content: ""; position: absolute; inset: 0; pointer-events: none;
+      background: radial-gradient(560px 260px at 85% -10%, rgba(90,79,207,.35), transparent 70%);
+    }
+    .herohead-top { position: relative; display: flex; align-items: flex-start; justify-content: space-between; gap: 1.2rem; flex-wrap: wrap; }
+    .herohead-id { display: flex; align-items: flex-start; gap: 1rem; }
+    .herohead-avatar {
+      flex-shrink: 0; width: 52px; height: 52px; border-radius: 16px;
+      background: linear-gradient(150deg, #7A6FE0, #5A4FCF);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 1.3rem; font-weight: 800; color: #fff;
+      box-shadow: 0 10px 22px rgba(90,79,207,.35);
+    }
+    .herohead-ai-pill {
+      display: inline-flex; align-items: center; gap: .3rem; margin-right: .6rem;
+      padding: .18rem .6rem; border-radius: 999px; font-size: .66rem; font-weight: 700;
+      letter-spacing: .03em; text-transform: uppercase;
+      background: linear-gradient(120deg, rgba(122,111,224,.35), rgba(90,79,207,.2));
+      border: 1px solid rgba(255,255,255,.3); color: #fff; vertical-align: middle;
+      animation: heroPillGlow 2.6s ease-in-out infinite;
+    }
+    @keyframes heroPillGlow { 0%, 100% { box-shadow: 0 0 0 0 rgba(122,111,224,.25); } 50% { box-shadow: 0 0 0 5px rgba(122,111,224,0); } }
+    .herohead-timestamp { display: flex; align-items: center; gap: .4rem; margin-top: .3rem; white-space: nowrap; }
+    .herohead-timestamp-dot {
+      width: 6px; height: 6px; border-radius: 50%; background: #6EE7A0; flex-shrink: 0;
+      box-shadow: 0 0 0 0 rgba(110,231,160,.5); animation: heroDotPulse 2s ease-in-out infinite;
+    }
+    @keyframes heroDotPulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(110,231,160,.45); } 50% { box-shadow: 0 0 0 4px rgba(110,231,160,0); } }
+
+    .herokpi-grid {
+      display: grid; grid-template-columns: 1.7fr 1fr 1fr 1fr; gap: 1rem; margin-bottom: 1.25rem; align-items: stretch;
+    }
+    @media (max-width: 980px) { .herokpi-grid { grid-template-columns: 1fr 1fr; } }
+    @media (max-width: 600px) { .herokpi-grid { grid-template-columns: 1fr; } }
+
+    .herokpi-brand {
+      background: linear-gradient(150deg, rgba(90,79,207,.07), rgba(90,79,207,.015));
+      border: 1px solid var(--border);
+      transition: box-shadow .2s ease, transform .2s ease;
+    }
+    .herokpi-brand:hover { box-shadow: 0 16px 34px rgba(65,48,28,.09); transform: translateY(-2px); }
+    .herokpi-brand--excellent, .herokpi-brand--good { background: linear-gradient(150deg, rgba(46,125,50,.08), rgba(46,125,50,.015)); }
+    .herokpi-brand--mixed { background: linear-gradient(150deg, rgba(138,106,31,.08), rgba(138,106,31,.015)); }
+    .herokpi-brand--poor { background: linear-gradient(150deg, rgba(179,38,74,.08), rgba(179,38,74,.015)); }
+
+    .herokpi-brand-row { display: flex; align-items: center; gap: 1.2rem; margin-top: .7rem; }
+    .herokpi-ring { position: relative; width: 108px; height: 108px; flex-shrink: 0; }
+    .herokpi-ring-svg { width: 100%; height: 100%; transform: rotate(-90deg); }
+    .herokpi-ring-track { fill: none; stroke: var(--border); stroke-width: 9; }
+    .herokpi-ring-fill {
+      fill: none; stroke-width: 9; stroke-linecap: round; stroke: var(--primary);
+      stroke-dasharray: 326.7; stroke-dashoffset: 326.7;
+      animation: heroRingGrow 1.3s cubic-bezier(.16,1,.3,1) forwards; animation-delay: .15s;
+    }
+    @keyframes heroRingGrow { to { stroke-dashoffset: calc(326.7 - (326.7 * var(--ring-pct, 0)) / 100); } }
+    .herokpi-ring--excellent .herokpi-ring-fill, .herokpi-ring--good .herokpi-ring-fill { stroke: var(--positive); }
+    .herokpi-ring--mixed .herokpi-ring-fill { stroke: var(--neutral); }
+    .herokpi-ring--poor .herokpi-ring-fill { stroke: var(--negative); }
+    .herokpi-ring--no-data .herokpi-ring-fill { stroke: var(--muted); }
+    .herokpi-ring-center { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+    .herokpi-ring-score { font-size: 1.8rem !important; line-height: 1; }
+    .herokpi-brand-meta { display: flex; flex-direction: column; min-width: 0; }
+    .herokpi-badge { font-size: .85rem !important; padding: .3rem .8rem !important; }
+
+    .herokpi-card {
+      display: flex; flex-direction: column; justify-content: center;
+      transition: box-shadow .2s ease, transform .2s ease;
+    }
+    .herokpi-card:hover { box-shadow: 0 14px 30px rgba(65,48,28,.08); transform: translateY(-2px); }
+    .herokpi-icon {
+      width: 34px; height: 34px; border-radius: 10px; margin-bottom: .7rem;
+      display: flex; align-items: center; justify-content: center;
+      background: var(--primary-l); color: var(--primary);
+    }
+    .herokpi-metric-row { display: flex; align-items: baseline; gap: .4rem; margin-top: .35rem; }
+    .herokpi-metric { font-size: 1.9rem !important; }
+    .herokpi-metric--sm { font-size: 1.25rem !important; }
+    .herokpi-sub { margin-top: .4rem; line-height: 1.5; }
+
+    /* ==========================================================================
+       ANALYTICS / CHARTS SECTION — PREMIUM REDESIGN
+       Additive only: no existing class renamed, no ID touched, no Jinja
+       variable removed, no Chart.js option changed. Every rule below is
+       either a NEW class (analytics-*, chart-card-*, kpi-icon, analytics-
+       table) or targets a class that is already unique to this section
+       (herokpi-*, sentiment-breakdown-card, chart-wrap, platform-list,
+       sentiment-bar, card--total/positive/negative/neutral) so nothing
+       outside Analytics is affected.
+       ========================================================================== */
+
+    /* --- Section header (new, purely decorative/additive) --- */
+    .analytics-hero-heading {
+      display: flex; align-items: center; gap: .85rem;
+      margin: 2.4rem 0 1.1rem;
+    }
+    .analytics-hero-icon {
+      width: 42px; height: 42px; border-radius: 13px; flex-shrink: 0;
+      background: linear-gradient(150deg, #7A6FE0, var(--primary));
+      display: flex; align-items: center; justify-content: center;
+      color: #fff; box-shadow: 0 10px 22px rgba(90,79,207,.32);
+    }
+    .analytics-hero-title { font-size: 1.18rem; font-weight: 800; letter-spacing: -.01em; color: var(--text); }
+    .analytics-hero-sub { font-size: .82rem; color: var(--muted); margin-top: .18rem; }
+
+    /* --- Universal premium treatment for analytics cards --- */
+    .analytics-card {
+      position: relative;
+      border-radius: 20px;
+      overflow: hidden;
+      transition: box-shadow .25s ease, transform .25s ease, border-color .25s ease;
+    }
+    .analytics-card::before {
+      content: "";
+      position: absolute; inset: 0 0 auto 0; height: 3px;
+      background: linear-gradient(90deg, var(--primary), #9B90F0, var(--primary));
+      background-size: 200% 100%;
+      opacity: 0; transition: opacity .25s ease;
+    }
+    .analytics-card:hover {
+      box-shadow: 0 22px 46px rgba(65,48,28,.14);
+      transform: translateY(-3px);
+      border-color: rgba(90,79,207,.32);
+    }
+    .analytics-card:hover::before { opacity: 1; animation: analyticsSheen 2.4s linear infinite; }
+    @keyframes analyticsSheen { 0% { background-position: 0% 0; } 100% { background-position: 200% 0; } }
+
+    /* --- Chart card header: icon + title + description (new pattern) --- */
+    .chart-card-header { display: flex; align-items: flex-start; gap: .75rem; margin-bottom: .3rem; }
+    .chart-card-icon {
+      width: 36px; height: 36px; border-radius: 11px; flex-shrink: 0;
+      background: var(--primary-l); color: var(--primary);
+      display: flex; align-items: center; justify-content: center;
+    }
+    .chart-card-titles { flex: 1; min-width: 0; }
+    .chart-card-titles .card-label,
+    .chart-card-titles .section-title { margin-bottom: .22rem; }
+    .chart-card-desc { font-size: .78rem; color: var(--muted); line-height: 1.5; max-width: 46ch; }
+
+    /* --- Small KPI glyphs for the four total/positive/negative/neutral cards --- */
+    .kpi-icon {
+      width: 30px; height: 30px; border-radius: 9px; margin-bottom: .65rem;
+      display: flex; align-items: center; justify-content: center;
+      background: rgba(255,255,255,.6);
+    }
+    .card--total .kpi-icon    { color: #8A6A1F; }
+    .card--positive .kpi-icon { color: var(--positive); }
+    .card--negative .kpi-icon { color: var(--negative); }
+    .card--neutral .kpi-icon  { color: #1D4ED8; }
+
+    /* --- grid-4 KPI row polish (scoped: fires only where .analytics-card is present) --- */
+    .grid-4 { gap: 1rem; }
+    .grid-4 .analytics-card { border-width: 1px; padding: 1.5rem 1.5rem 1.4rem; }
+    .grid-4 .analytics-card .card-value { font-size: 2.2rem; margin-top: .1rem; }
+    .grid-4 .analytics-card .card-sub { margin-top: .45rem; }
+
+    /* --- Sentiment Distribution card ("Overall Sentiment Chart") --- */
+    .analytics-sentiment-distribution .chart-card-header { margin-bottom: .1rem; }
+    .analytics-sentiment-distribution .sentiment-bar-wrap { margin-top: 1rem; }
+    .analytics-sentiment-distribution .sentiment-bar {
+      height: 11px; box-shadow: inset 0 1px 3px rgba(20,15,5,.12);
+    }
+    .analytics-sentiment-distribution .sentiment-legend {
+      margin-top: 1rem; gap: 1.6rem; font-size: .8rem;
+    }
+    .analytics-sentiment-distribution .legend-item { font-weight: 600; color: var(--text); }
+    .analytics-sentiment-distribution .legend-dot { width: 9px; height: 9px; box-shadow: 0 0 0 4px rgba(0,0,0,.03); }
+
+    /* --- Sentiment Breakdown card (doughnut + bars) --- */
+    .sentiment-breakdown-card .chart-wrap {
+      max-width: 190px; padding: .5rem;
+      border-radius: 999px;
+      background: radial-gradient(circle at 50% 50%, var(--primary-l) 0%, rgba(90,79,207,0) 72%);
+    }
+    .sentbrk-chart-center-value { font-size: 1.65rem; }
+
+    /* --- Platform Coverage card ("Platform Distribution") --- */
+    .analytics-platform-card .platform-list { gap: .85rem; margin-top: .85rem; }
+    .analytics-platform-card .platform-row {
+      padding: .55rem .65rem; border-radius: 13px;
+      transition: background .2s ease, transform .2s ease;
+    }
+    .analytics-platform-card .platform-row:hover { background: var(--primary-l); transform: translateX(2px); }
+    .analytics-platform-card .platform-icon {
+      width: 32px; height: 32px; border-radius: 9px; font-size: .85rem;
+      box-shadow: 0 4px 10px rgba(20,15,5,.06);
+    }
+    .analytics-platform-card .platform-bar-bg { height: 5px; margin-top: .4rem; }
+    .analytics-platform-card .platform-count { font-size: .95rem; }
+
+    /* --- Product Comparison table --- */
+    .analytics-table {
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      overflow: hidden;
+      border-collapse: separate;
+      border-spacing: 0;
+    }
+    .analytics-table th {
+      background: linear-gradient(180deg, var(--primary-l), rgba(90,79,207,.02));
+      font-size: .68rem; padding: .7rem .8rem;
+      border-bottom: 1px solid var(--border);
+    }
+    .analytics-table td { padding: .8rem; }
+    .analytics-table tbody tr { transition: background .15s ease; }
+    .analytics-table tbody tr:nth-child(even) { background: rgba(20,15,5,.015); }
+    .analytics-table tbody tr:hover td { background: var(--primary-l); }
+    .analytics-table .mini-bar { height: 8px; border-radius: 100px; box-shadow: inset 0 1px 2px rgba(20,15,5,.08); }
+
+    /* --- Product Intelligence table: premium data-grid polish (additive only) --- */
+    .pi-table-wrap {
+      margin-top: .75rem;
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      overflow: auto;
+      max-height: 420px;
+      background: var(--surface);
+    }
+    .pi-table { margin-top: 0; border: none; border-radius: 0; }
+    .pi-table thead th {
+      position: sticky; top: 0; z-index: 2;
+      background: linear-gradient(180deg, #FBF8F2, #F5F0E6);
+      backdrop-filter: blur(6px);
+      box-shadow: inset 0 -1px 0 var(--border);
+    }
+    .pi-table tbody tr { border-bottom: 1px solid var(--border); }
+    .pi-table tbody tr:last-child { border-bottom: none; }
+    .pi-table tbody tr:nth-child(even) { background: rgba(90,79,207,.025); }
+    .pi-table tbody tr:hover td { background: var(--primary-l); }
+    .pi-table td, .pi-table th { padding: .85rem 1rem; vertical-align: middle; }
+
+    .pi-product-cell { display: flex; align-items: center; gap: .65rem; min-width: 140px; }
+    .pi-avatar {
+      flex-shrink: 0; width: 30px; height: 30px; border-radius: 9px;
+      background: linear-gradient(150deg, #7A6FE0, var(--primary));
+      color: #fff; font-size: .75rem; font-weight: 700;
+      display: flex; align-items: center; justify-content: center;
+      box-shadow: 0 4px 10px rgba(90,79,207,.28);
+    }
+    .pi-product-name { font-weight: 700; font-size: .88rem; color: var(--text); letter-spacing: -.01em; }
+
+    .pi-comments { display: inline-flex; align-items: center; gap: .35rem; font-weight: 600; font-size: .85rem; color: var(--text); }
+    .pi-comments svg { color: var(--muted); flex-shrink: 0; }
+
+    .pi-dist-bar { min-width: 120px; height: 8px; box-shadow: inset 0 1px 2px rgba(20,15,5,.08); }
+    .pi-dist-legend { display: flex; gap: .55rem; margin-top: .35rem; font-size: .68rem; font-weight: 600; }
+
+    .pi-score-cell { display: flex; align-items: center; gap: .55rem; }
+    .pi-score-value { font-size: 1.05rem; font-weight: 800; letter-spacing: -.01em; color: var(--text); min-width: 1.6rem; }
+    .pi-score-pill { margin-top: 0; white-space: nowrap; }
+
+    .pi-empty-row td { padding: 0; border-bottom: none; }
+
+    @media (max-width: 600px) {
+      .pi-table-wrap { max-height: 360px; }
+      .pi-product-cell { min-width: 110px; }
+    }
+
+    @media (max-width: 600px) {
+      .chart-card-header { gap: .6rem; }
+      .chart-card-icon { width: 32px; height: 32px; }
+      .analytics-hero-icon { width: 38px; height: 38px; }
+    }
   </style>
 </head>
 <body>
@@ -421,11 +1047,26 @@
     <a class="nav-back" href="/">← New search</a>
   </nav>
 
-  <div class="company-header">
-    <div class="company-eyebrow">Product Intelligence Report{% if company.discovery_version %}<span class="discovery-badge">{{ company.discovery_version }}</span>{% endif %}</div>
-    <div class="company-name">{{ (product_title | default(company.company_name) | default("Product")) | title }}</div>
-    <div class="card-sub" style="color:rgba(255,255,255,.68); margin:-.55rem 0 .85rem;">{{ (company.company_name | default("Company")) | title }}{% if company.website %} · {{ company.website }}{% endif %}</div>
-    <div class="company-links">
+  <div class="company-header herohead">
+    <div class="herohead-top">
+      <div class="herohead-id">
+        <div class="herohead-avatar">{{ (company.company_name | default("C"))[0] | upper }}</div>
+        <div>
+          <div class="company-eyebrow">
+            <span class="herohead-ai-pill">✦ AI-Powered Analysis</span>
+            Product Intelligence Report{% if company.discovery_version %}<span class="discovery-badge">{{ company.discovery_version }}</span>{% endif %}
+          </div>
+          <div class="company-name">{{ (product_title | default(company.company_name) | default("Product")) | title }}</div>
+          <div class="card-sub" style="color:rgba(255,255,255,.68); margin:-.3rem 0 0;">{{ (company.company_name | default("Company")) | title }}{% if company.website %} · {{ company.website }}{% endif %}</div>
+        </div>
+      </div>
+      {% if report_generated %}
+      <div class="report-generated herohead-timestamp">
+        <span class="herohead-timestamp-dot"></span>Report generated {{ report_generated }}
+      </div>
+      {% endif %}
+    </div>
+    <div class="company-links" style="margin-top:1.15rem;">
       {% if company.website %}
       <a class="company-link" href="{{ company.website }}" target="_blank">
         <span class="dot" style="background:#4285F4"></span>
@@ -463,29 +1104,72 @@
       </a>
       {% endif %}
     </div>
-    {% if report_generated %}
-    <div class="report-generated">Report generated {{ report_generated }}</div>
-    {% endif %}
   </div>
 
   
-  <div class="grid-2" style="margin-bottom:1.25rem;">
-    <div class="card">
-      <div class="card-label">Overall Brand Score</div>
-      <div class="score-wrap">
-        <div class="score-value">{{ brand_score | default(0) }}</div>
-        <div class="score-max">/ 100</div>
-      </div>
-      <span class="score-label {{ (brand_label | default("No Data")) | lower | replace(' ', '-') }}">{{ brand_label | default("No Data") }}</span>
-      <div class="score-explainer">Positive comments count fully and neutral comments count half, out of every comment collected — negative comments don't add any points. A higher score means more of the conversation is positive.</div>
+  {%- set hero_brand_class = (brand_label | default("No Data")) | lower | replace(' ', '-') -%}
+  <div class="analytics-hero-heading">
+    <div class="analytics-hero-icon">
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="M7 15l4-5 3 3 5-7"/></svg>
     </div>
-    <div class="card">
-      <div class="card-label">Product &amp; Service Discovery</div>
-      <div class="score-wrap" style="gap:1.5rem;">
-        <div><span class="score-value" style="font-size:1.5rem;">{{ products_found | default(0) }}</span> <span class="card-sub">products found</span></div>
-        <div><span class="score-value" style="font-size:1.5rem;">{{ services_found | default(0) }}</span> <span class="card-sub">services found</span></div>
+    <div>
+      <div class="analytics-hero-title">Performance Analytics</div>
+      <div class="analytics-hero-sub">Live sentiment, coverage, and comparison metrics across every tracked source</div>
+    </div>
+  </div>
+  <div class="herokpi-grid">
+    <div class="card herokpi-brand herokpi-brand--{{ hero_brand_class }} analytics-card">
+      <div class="card-label">Overall Brand Score</div>
+      <div class="herokpi-brand-row">
+        <div class="herokpi-ring herokpi-ring--{{ hero_brand_class }}">
+          <svg viewBox="0 0 120 120" class="herokpi-ring-svg">
+            <circle class="herokpi-ring-track" cx="60" cy="60" r="52"></circle>
+            <circle class="herokpi-ring-fill" cx="60" cy="60" r="52" style="--ring-pct:{{ brand_score | default(0) }};"></circle>
+          </svg>
+          <div class="herokpi-ring-center">
+            <div class="score-value herokpi-ring-score">{{ brand_score | default(0) }}</div>
+            <div class="score-max">/ 100</div>
+          </div>
+        </div>
+        <div class="herokpi-brand-meta">
+          <span class="score-label {{ hero_brand_class }} herokpi-badge">{{ brand_label | default("No Data") }}</span>
+          <div class="score-explainer">Positive comments count fully and neutral comments count half, out of every comment collected — negative comments don't add any points. A higher score means more of the conversation is positive.</div>
+        </div>
       </div>
-      <div class="card-sub" style="margin-top:.5rem;">{{ products_scraped | default(0) }} products scraped · {{ reviews_collected | default(0) }} Google reviews collected</div>
+    </div>
+
+    <div class="card herokpi-card analytics-card">
+      <div class="herokpi-icon">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="7" width="18" height="13" rx="2"/><path d="M8 7V5a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+      </div>
+      <div class="card-label">Products Analyzed</div>
+      <div class="herokpi-metric-row">
+        <span class="score-value herokpi-metric">{{ products_found | default(0) }}</span>
+        <span class="card-sub">products</span>
+      </div>
+      <div class="card-sub herokpi-sub">{{ services_found | default(0) }} services found · {{ products_scraped | default(0) }} scraped · {{ reviews_collected | default(0) }} Google reviews</div>
+    </div>
+
+    <div class="card herokpi-card analytics-card">
+      <div class="herokpi-icon">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg>
+      </div>
+      <div class="card-label">Platforms Covered</div>
+      <div class="herokpi-metric-row">
+        <span class="score-value herokpi-metric">{{ summary.platforms_covered | default(0) }}</span>
+      </div>
+      <div class="card-sub herokpi-sub">across social &amp; review platforms</div>
+    </div>
+
+    <div class="card herokpi-card analytics-card">
+      <div class="herokpi-icon">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M8.5 13.2c1 1.4 2.2 2.1 3.5 2.1s2.5-.7 3.5-2.1"/><path d="M8.7 9.5h.01M15.3 9.5h.01"/></svg>
+      </div>
+      <div class="card-label">Overall Sentiment</div>
+      <div class="herokpi-metric-row">
+        <span class="score-value herokpi-metric herokpi-metric--sm">{{ summary.overall_sentiment | default("No Data") }}</span>
+      </div>
+      <div class="card-sub herokpi-sub">across all collected reviews</div>
     </div>
   </div>
 
@@ -584,15 +1268,25 @@
         {% if p.website_reviews %}
         <div style="margin-top:.9rem;">
           <div class="card-sub" style="font-weight:600; text-transform:uppercase; letter-spacing:.05em; font-size:.68rem; margin-bottom:.4rem;">Website Reviews</div>
-          <div class="comments-list">
+          <div class="comments-list" style="max-height:420px;">
             {% for r in p.website_reviews %}
-            <div class="comment-card">
-              <div class="comment-body">
-                <div class="comment-text">{{ r.text }}</div>
-                <div class="comment-meta">
-                  <span>{{ r.author }}</span>
-                  {% if r.rating %}<span>★ {{ r.rating }}</span>{% endif %}
-                  {% if r.date %}<span>{{ r.date }}</span>{% endif %}
+            <div class="comment-card" data-platform="Website">
+              <div class="comment-sentiment-dot" style="background: var(--neutral);"></div>
+              <div class="comment-card-inner">
+                <div class="comment-top-row">
+                  <span class="platform-badge" style="--platform-color:#5A4FCF;">
+                    <span class="platform-badge-icon">🌐</span>
+                    <span class="platform-badge-name">Website</span>
+                  </span>
+                  {% if r.rating %}<span class="badge badge-neu">★ {{ r.rating }}</span>{% endif %}
+                </div>
+                <div class="comment-body">
+                  <div class="comment-text">{{ r.text }}</div>
+                  <div class="comment-meta">
+                    {% if p.name %}<span class="product-badge">{{ p.name }}</span>{% endif %}
+                    {% if r.author %}<span class="comment-author">{{ r.author }}</span>{% endif %}
+                    {% if r.date %}<span class="comment-timestamp">{{ r.date }}</span>{% endif %}
+                  </div>
                 </div>
               </div>
             </div>
@@ -600,6 +1294,7 @@
           </div>
         </div>
         {% endif %}
+
 
         {% if p.url %}
         <div class="download-row">
@@ -613,22 +1308,26 @@
   {% endif %}
   
   <div class="grid-4">
-    <div class="card card--total">
+    <div class="card card--total analytics-card">
+      <div class="kpi-icon"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div>
       <div class="card-label">Total Comments</div>
       <div class="card-value">{{ total | default(0) }}</div>
       <div class="card-sub">across all platforms</div>
     </div>
-    <div class="card card--positive">
+    <div class="card card--positive analytics-card">
+      <div class="kpi-icon"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 6l-9.5 9.5-5-5L1 18"/><path d="M17 6h6v6"/></svg></div>
       <div class="card-label">Positive</div>
       <div class="card-value">{{ positive | default(0) }}</div>
       <div class="card-sub">{{ positive_pct | default(0) }}% of total</div>
     </div>
-    <div class="card card--negative">
+    <div class="card card--negative analytics-card">
+      <div class="kpi-icon"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 18l-9.5-9.5-5 5L1 6"/><path d="M17 18h6v-6"/></svg></div>
       <div class="card-label">Negative</div>
       <div class="card-value">{{ negative | default(0) }}</div>
       <div class="card-sub">{{ negative_pct | default(0) }}% of total</div>
     </div>
-    <div class="card card--neutral">
+    <div class="card card--neutral analytics-card">
+      <div class="kpi-icon"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/></svg></div>
       <div class="card-label">Neutral</div>
       <div class="card-value">{{ neutral | default(0) }}</div>
       <div class="card-sub">{{ neutral_pct | default(0) }}% of total</div>
@@ -636,8 +1335,16 @@
   </div>
 
   
-  <div class="card" style="margin-bottom:1.25rem;">
-    <div class="card-label">Sentiment Distribution</div>
+  <div class="card analytics-card analytics-sentiment-distribution" style="margin-bottom:1.25rem;">
+    <div class="chart-card-header">
+      <div class="chart-card-icon">
+        <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="10" width="4" height="10" rx="1"/><rect x="10" y="4" width="4" height="16" rx="1"/><rect x="17" y="13" width="4" height="7" rx="1"/></svg>
+      </div>
+      <div class="chart-card-titles">
+        <div class="card-label">Sentiment Distribution</div>
+        <div class="chart-card-desc">Overall share of positive, negative, and neutral sentiment across every comment collected</div>
+      </div>
+    </div>
     <div class="sentiment-bar-wrap">
       <div class="sentiment-bar">
         <div class="sb-pos" style="flex:{{ positive_pct | default(0) }}"></div>
@@ -653,15 +1360,102 @@
   </div>
 
   
-  <div class="grid-2" style="margin-bottom:1.25rem;">
-    <div class="card">
-      <div class="card-label">Sentiment Breakdown</div>
+  <div class="grid-2 analytics-grid" style="margin-bottom:1.25rem;">
+    <div class="card sentiment-breakdown-card analytics-card">
+      <div class="chart-card-header">
+        <div class="chart-card-icon">
+          <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 1 9 9h-9z"/></svg>
+        </div>
+        <div class="chart-card-titles">
+          <div class="card-label">Sentiment Breakdown</div>
+          <div class="chart-card-desc">Review volume by sentiment, with a running total at the center of the chart</div>
+        </div>
+      </div>
+      {% if (total | default(0)) > 0 %}
       <div class="chart-wrap">
         <canvas id="sentimentChart"></canvas>
+        <div class="sentbrk-chart-center">
+          <div class="sentbrk-chart-center-value">{{ total | default(0) }}</div>
+          <div class="sentbrk-chart-center-label">Reviews</div>
+        </div>
       </div>
+
+      <div class="sentbrk-bars">
+        <div class="sentbrk-bar-row sentbrk-bar-row--pos">
+          <div class="sentbrk-bar-top">
+            <span class="sentbrk-bar-icon sentbrk-bar-icon--pos">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M8.5 13.2c1 1.4 2.2 2.1 3.5 2.1s2.5-.7 3.5-2.1"/><path d="M8.7 9.5h.01M15.3 9.5h.01"/></svg>
+            </span>
+            <span class="sentbrk-bar-name">Positive</span>
+            <span class="sentbrk-bar-pct">{{ positive_pct | default(0) }}%</span>
+          </div>
+          <div class="sentbrk-bar-track">
+            <div class="sentbrk-bar-fill sentbrk-bar-fill--pos" style="--sentbrk-w:{{ positive_pct | default(0) }}%;"></div>
+          </div>
+          <div class="sentbrk-bar-count">{{ positive | default(0) }} review{{ 's' if (positive | default(0)) != 1 else '' }}</div>
+        </div>
+
+        <div class="sentbrk-bar-row sentbrk-bar-row--neg">
+          <div class="sentbrk-bar-top">
+            <span class="sentbrk-bar-icon sentbrk-bar-icon--neg">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M8.5 15.3c1-1.4 2.2-2.1 3.5-2.1s2.5.7 3.5 2.1"/><path d="M8.7 9.5h.01M15.3 9.5h.01"/></svg>
+            </span>
+            <span class="sentbrk-bar-name">Negative</span>
+            <span class="sentbrk-bar-pct">{{ negative_pct | default(0) }}%</span>
+          </div>
+          <div class="sentbrk-bar-track">
+            <div class="sentbrk-bar-fill sentbrk-bar-fill--neg" style="--sentbrk-w:{{ negative_pct | default(0) }}%;"></div>
+          </div>
+          <div class="sentbrk-bar-count">{{ negative | default(0) }} review{{ 's' if (negative | default(0)) != 1 else '' }}</div>
+        </div>
+
+        <div class="sentbrk-bar-row sentbrk-bar-row--neu">
+          <div class="sentbrk-bar-top">
+            <span class="sentbrk-bar-icon sentbrk-bar-icon--neu">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M8.5 14h7"/><path d="M8.7 9.5h.01M15.3 9.5h.01"/></svg>
+            </span>
+            <span class="sentbrk-bar-name">Neutral</span>
+            <span class="sentbrk-bar-pct">{{ neutral_pct | default(0) }}%</span>
+          </div>
+          <div class="sentbrk-bar-track">
+            <div class="sentbrk-bar-fill sentbrk-bar-fill--neu" style="--sentbrk-w:{{ neutral_pct | default(0) }}%;"></div>
+          </div>
+          <div class="sentbrk-bar-count">{{ neutral | default(0) }} review{{ 's' if (neutral | default(0)) != 1 else '' }}</div>
+        </div>
+      </div>
+
+      {% else %}
+
+      <div class="sentbrk-empty">
+        <div class="sentbrk-empty-icon">
+          <svg viewBox="0 0 64 64" width="48" height="48" fill="none">
+            <circle cx="32" cy="32" r="30" fill="var(--primary-l)"/>
+            <path d="M20 40V28M28 40V22M36 40V31M44 40V25" stroke="var(--primary)" stroke-width="3" stroke-linecap="round"/>
+            <circle cx="44" cy="20" r="9" fill="var(--surface)" stroke="var(--primary)" stroke-width="2.4"/>
+            <path d="M41 20h6M44 17v6" stroke="var(--primary)" stroke-width="2.2" stroke-linecap="round"/>
+          </svg>
+        </div>
+        <h4 class="sentbrk-empty-title">No Product Review Sentiment Yet</h4>
+        <p class="sentbrk-empty-desc">Product-specific reviews are still being collected. Brand-level sentiment is already available and can be explored in the Brand Reputation section.</p>
+        <div class="sentbrk-empty-shimmer">
+          <div class="sentbrk-empty-shimmer-bar" style="width:70%;"></div>
+          <div class="sentbrk-empty-shimmer-bar" style="width:45%;"></div>
+          <div class="sentbrk-empty-shimmer-bar" style="width:58%;"></div>
+        </div>
+      </div>
+
+      {% endif %}
     </div>
-    <div class="card">
-      <div class="card-label">Platform Coverage</div>
+    <div class="card analytics-card analytics-platform-card">
+      <div class="chart-card-header">
+        <div class="chart-card-icon">
+          <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg>
+        </div>
+        <div class="chart-card-titles">
+          <div class="card-label">Platform Coverage</div>
+          <div class="chart-card-desc">Where the conversation is happening, ranked by comment volume</div>
+        </div>
+      </div>
       <div class="platform-list">
         {%- set platform_counts = platform_counts | default({}, true) -%}
         {%- set pc_google = platform_counts.Google | default(0) -%}
@@ -695,36 +1489,77 @@
   {%- set product_sentiment = product_sentiment | default({}, true) -%}
   {% if product_sentiment and (product_sentiment.keys() | list | length) > 1 %}
   
-  <div class="card" style="margin-bottom:1.25rem;">
-    <div class="section-title">Product-wise Sentiment</div>
-    <p class="card-sub" style="margin:-.35rem 0 1rem;">
-      "General" = brand-wide comments not tied to any single product
-      (the base company search, plus all Instagram/Twitter/YouTube
-      comments — those three platforms aren't queried per-product).
-    </p>
-    <table class="sentiment-table">
-      <thead>
-        <tr>
-          <th>Product</th><th>Comments</th><th>Distribution</th><th>Score</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for label, stats in product_sentiment.items() %}
-        <tr>
-          <td>{{ label }}</td>
-          <td>{{ stats.total }}</td>
-          <td>
-            <div class="mini-bar">
-              <div style="flex:{{ stats.positive_pct }}; background:var(--positive);"></div>
-              <div style="flex:{{ stats.negative_pct }}; background:var(--negative);"></div>
-              <div style="flex:{{ stats.neutral_pct }}; background:var(--neutral);"></div>
-            </div>
-          </td>
-          <td>{{ stats.score }} <span class="card-sub">{{ stats.score_label }}</span></td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
+  <div class="card analytics-card analytics-product-comparison" style="margin-bottom:1.25rem;">
+    <div class="chart-card-header">
+      <div class="chart-card-icon">
+        <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
+      </div>
+      <div class="chart-card-titles">
+        <div class="section-title" style="margin-bottom:.15rem;">Product-wise Sentiment</div>
+        <p class="card-sub chart-card-desc" style="margin:0;">
+          "General" = brand-wide comments not tied to any single product
+          (the base company search, plus all Instagram/Twitter/YouTube
+          comments — those three platforms aren't queried per-product).
+        </p>
+      </div>
+    </div>
+    <div class="pi-table-wrap">
+      <table class="sentiment-table analytics-table pi-table">
+        <thead>
+          <tr>
+            <th>Product</th><th>Comments</th><th>Distribution</th><th>Score</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for label, stats in product_sentiment.items() %}
+          {%- set pi_class = (stats.score_label | default("No Data")) | lower | replace(' ', '-') -%}
+          <tr>
+            <td>
+              <div class="pi-product-cell">
+                <span class="pi-avatar">{{ (label[0] | upper) if label else "?" }}</span>
+                <span class="pi-product-name">{{ label }}</span>
+              </div>
+            </td>
+            <td>
+              <span class="pi-comments">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+                {{ stats.total }}
+              </span>
+            </td>
+            <td>
+              <div class="mini-bar pi-dist-bar" title="{{ stats.positive_pct }}% positive, {{ stats.negative_pct }}% negative, {{ stats.neutral_pct }}% neutral">
+                <div style="flex:{{ stats.positive_pct }}; background:var(--positive);"></div>
+                <div style="flex:{{ stats.negative_pct }}; background:var(--negative);"></div>
+                <div style="flex:{{ stats.neutral_pct }}; background:var(--neutral);"></div>
+              </div>
+              <div class="pi-dist-legend">
+                <span style="color:var(--positive)">{{ stats.positive_pct }}%</span>
+                <span style="color:var(--negative)">{{ stats.negative_pct }}%</span>
+                <span style="color:var(--neutral)">{{ stats.neutral_pct }}%</span>
+              </div>
+            </td>
+            <td>
+              <div class="pi-score-cell">
+                <span class="pi-score-value">{{ stats.score }}</span>
+                <span class="score-label pi-score-pill {{ pi_class }}">{{ stats.score_label | default("No Data") }}</span>
+              </div>
+            </td>
+          </tr>
+          {% else %}
+          <tr class="pi-empty-row">
+            <td colspan="4">
+              <div class="empty">
+                <div class="empty-icon">
+                  <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
+                </div>
+                <div>No product comparison data available yet.</div>
+              </div>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
   </div>
   {% endif %}
 
@@ -779,31 +1614,55 @@
   {%- set confidence_score = confidence_score | default({}, true) -%}
   {%- set buying_recommendation = buying_recommendation | default({}, true) -%}
   {%- set product_recommendations = product_recommendations | default({}, true) -%}
-  <div class="card" style="margin-bottom:1.25rem;">
+  {%- set buyrec_class = buying_recommendation.css_class | default('no-data') -%}
+  {%- set conf_class = confidence_score.css_class | default('no-data') -%}
+  {%- set conf_score_val = confidence_score.score | default(0) -%}
+  <div class="card buyrec-card" style="margin-bottom:1.25rem;">
     <div class="section-title">Buying Recommendation &amp; Confidence</div>
     <p class="card-sub" style="margin:-.35rem 0 1rem;">
       Combines overall sentiment, per-aspect scores, review volume, and
       confidence/consistency across platforms — instead of relying on
       overall sentiment alone.
     </p>
-    <div class="grid-2" style="margin-bottom:0;">
-      <div>
+
+    <div class="buyrec-hero buyrec-hero--{{ buyrec_class }}">
+      <div class="buyrec-hero-main">
         <div class="card-label">Overall Buying Recommendation</div>
-        <span class="score-label {{ (buying_recommendation.css_class | default('no-data')) }}" style="font-size:.95rem; padding:.3rem .8rem;">
+        <span class="score-label {{ buyrec_class }} buyrec-badge">
           {{ buying_recommendation.label | default("No Data") }}
         </span>
-        <div class="card-sub" style="margin-top:.6rem; line-height:1.6;">
+
+        {% if buyrec_class == 'no-data' %}
+        <div class="buyrec-pending">
+          <span class="buyrec-pending-icon">⚠</span>
+          <div>
+            <div class="buyrec-pending-title">Recommendation Pending</div>
+            <div class="buyrec-pending-text">More verified product reviews are required before our AI can generate a reliable buying recommendation. Brand-level reputation is already available.</div>
+          </div>
+        </div>
+        {% else %}
+        <div class="card-sub buyrec-explanation">
           {{ buying_recommendation.explanation | default("Not enough data to generate a recommendation.") }}
         </div>
+        {% endif %}
       </div>
-      <div>
+
+      <div class="buyrec-hero-divider"></div>
+
+      <div class="buyrec-gauge-wrap">
         <div class="card-label">Confidence Score</div>
-        <div class="score-wrap">
-          <div class="score-value" style="font-size:1.8rem;">{{ confidence_score.score | default(0) }}</div>
-          <div class="score-max">/ 100</div>
+        <div class="buyrec-gauge buyrec-gauge--{{ conf_class }}">
+          <svg viewBox="0 0 120 120" class="buyrec-gauge-svg">
+            <circle class="buyrec-gauge-track" cx="60" cy="60" r="52"></circle>
+            <circle class="buyrec-gauge-fill" cx="60" cy="60" r="52" style="--ring-pct:{{ conf_score_val }};"></circle>
+          </svg>
+          <div class="buyrec-gauge-center">
+            <div class="score-value buyrec-gauge-score">{{ conf_score_val }}</div>
+            <div class="score-max">/ 100</div>
+          </div>
         </div>
-        <span class="score-label {{ confidence_score.css_class | default('no-data') }}">{{ confidence_score.label | default("No Data") }}</span>
-        <div class="card-sub" style="margin-top:.5rem;">
+        <span class="score-label {{ conf_class }}">{{ confidence_score.label | default("No Data") }}</span>
+        <div class="card-sub buyrec-gauge-meta">
           Based on {{ confidence_score.review_count | default(0) }} review(s) across
           {{ confidence_score.platforms_covered | default(0) }} platform(s) ·
           platform agreement {{ confidence_score.platform_agreement | default(0) }}% ·
@@ -813,78 +1672,121 @@
     </div>
 
     {% if product_recommendations %}
-    <div class="insight-heading" style="margin-top:1.3rem;">Per-Product Recommendation</div>
-    <table class="sentiment-table" style="margin-top:.5rem;">
-      <thead>
-        <tr>
-          <th>Product</th><th>Recommendation</th><th>Blended Score</th><th>Confidence</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for product, rec in product_recommendations.items() %}
-        <tr>
-          <td>{{ product }}</td>
-          <td><span class="score-label {{ rec.css_class | default('no-data') }}">{{ rec.label | default("No Data") }}</span></td>
-          <td>{{ rec.blended_score | default(0) }} <span class="card-sub">/ 100</span></td>
-          <td>{{ rec.confidence_score | default(0) }} <span class="card-sub">{{ rec.confidence_label | default("No Data") }}</span></td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
+    <div class="insight-heading" style="margin-top:1.6rem;">Per-Product Recommendation</div>
+    <div class="buyrec-products">
+      {% for product, rec in product_recommendations.items() %}
+      {%- set prod_class = rec.css_class | default('no-data') -%}
+      <div class="buyrec-product-card buyrec-product-card--{{ prod_class }}">
+        <div class="buyrec-product-top">
+          <span class="buyrec-product-icon buyrec-product-icon--{{ prod_class }}">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M8.5 12.5l2.5 2.5 4.5-5"/></svg>
+          </span>
+          <div class="buyrec-product-name">{{ product }}</div>
+          <span class="score-label {{ prod_class }} buyrec-product-badge">{{ rec.label | default("No Data") }}</span>
+        </div>
+        <div class="buyrec-product-stats">
+          <div class="buyrec-product-stat">
+            <div class="buyrec-product-stat-label">Blended Score</div>
+            <div class="buyrec-product-stat-value">{{ rec.blended_score | default(0) }}<span class="card-sub">/100</span></div>
+          </div>
+          <div class="buyrec-product-stat">
+            <div class="buyrec-product-stat-label">Confidence</div>
+            <div class="buyrec-product-stat-value">{{ rec.confidence_score | default(0) }}<span class="card-sub">{{ rec.confidence_label | default("No Data") }}</span></div>
+          </div>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
     {% endif %}
   </div>
 
   {%- set brand_reputation = brand_reputation | default({}, true) -%}
   {%- set brand_gmaps = brand_reputation.google_maps | default({}, true) -%}
-  <div class="card" style="margin-bottom:1.25rem;">
+  {%- set brand_class = (brand_reputation.score_label | default("No Data")) | lower | replace(' ', '-') -%}
+  {%- set gmaps_class = (brand_gmaps.score_label | default("No Data")) | lower | replace(' ', '-') -%}
+  <div class="card brandrep-card" style="margin-bottom:1.25rem;">
     <div class="section-title">Brand Reputation</div>
     <p class="card-sub" style="margin:-.35rem 0 1rem;">
       Kept separate from product sentiment above — this covers Google Maps
       reviews and general brand-wide social mentions that aren't tied to any
       one selected product.
     </p>
-    <div class="grid-2" style="margin-bottom:0;">
-      <div>
+
+    <div class="brandrep-hero">
+      <div class="brandrep-score-card brandrep-score-card--{{ brand_class }}">
         <div class="card-label">Overall Brand Reputation Score</div>
-        <div class="score-wrap">
-          <div class="score-value">{{ brand_reputation.score | default(0) }}</div>
-          <div class="score-max">/ 100</div>
+        <div class="brandrep-score-row">
+          <div class="brandrep-ring brandrep-ring--{{ brand_class }}">
+            <svg viewBox="0 0 120 120" class="brandrep-ring-svg">
+              <circle class="brandrep-ring-track" cx="60" cy="60" r="52"></circle>
+              <circle class="brandrep-ring-fill" cx="60" cy="60" r="52" style="--ring-pct:{{ brand_reputation.score | default(0) }};"></circle>
+            </svg>
+            <div class="brandrep-ring-center">
+              <div class="score-value brandrep-ring-score">{{ brand_reputation.score | default(0) }}</div>
+              <div class="score-max">/ 100</div>
+            </div>
+          </div>
+          <div class="brandrep-score-meta">
+            <span class="score-label {{ brand_class }} brandrep-badge">{{ brand_reputation.score_label | default("No Data") }}</span>
+            <div class="card-sub brandrep-score-sub">{{ brand_reputation.total | default(0) }} brand-wide mention(s) across all platforms</div>
+          </div>
         </div>
-        <span class="score-label {{ (brand_reputation.score_label | default("No Data")) | lower | replace(' ', '-') }}">{{ brand_reputation.score_label | default("No Data") }}</span>
-        <div class="card-sub" style="margin-top:.5rem;">{{ brand_reputation.total | default(0) }} brand-wide mention(s) across all platforms</div>
       </div>
-      <div>
+
+      <div class="brandrep-gmaps-card brandrep-gmaps-card--{{ gmaps_class }}">
         <div class="card-label">Google Maps Reviews</div>
-        <div class="score-wrap">
-          <div class="score-value" style="font-size:1.6rem;">{{ brand_gmaps.score | default(0) }}</div>
-          <div class="score-max">/ 100</div>
+        {% if (brand_gmaps.total | default(0)) > 0 %}
+        <div class="brandrep-gmaps-row">
+          <div class="brandrep-gmaps-icon">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21s7-6.5 7-11.5A7 7 0 0 0 5 9.5C5 14.5 12 21 12 21Z"/><circle cx="12" cy="9.5" r="2.5"/></svg>
+          </div>
+          <div class="score-wrap">
+            <div class="score-value brandrep-gmaps-score">{{ brand_gmaps.score | default(0) }}</div>
+            <div class="score-max">/ 100</div>
+          </div>
         </div>
-        <span class="score-label {{ (brand_gmaps.score_label | default("No Data")) | lower | replace(' ', '-') }}">{{ brand_gmaps.score_label | default("No Data") }}</span>
+        <div class="brandrep-gmaps-bar-track">
+          <div class="brandrep-gmaps-bar-fill brandrep-gmaps-bar-fill--{{ gmaps_class }}" style="--gmaps-pct:{{ brand_gmaps.score | default(0) }};"></div>
+        </div>
+        <span class="score-label {{ gmaps_class }}">{{ brand_gmaps.score_label | default("No Data") }}</span>
         <div class="card-sub" style="margin-top:.5rem;">{{ brand_gmaps.total | default(0) }} Google Maps review(s)</div>
+        {% else %}
+        <div class="brandrep-gmaps-empty">
+          <div class="brandrep-gmaps-empty-icon">
+            <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21s7-6.5 7-11.5A7 7 0 0 0 5 9.5C5 14.5 12 21 12 21Z"/><circle cx="12" cy="9.5" r="2.5"/></svg>
+          </div>
+          <div class="brandrep-gmaps-empty-title">No Google Maps reviews yet</div>
+          <div class="brandrep-gmaps-empty-text">Once reviews are collected, your location rating will appear here.</div>
+        </div>
+        {% endif %}
       </div>
     </div>
+
     {% if brand_reputation.by_platform %}
-    <table class="sentiment-table" style="margin-top:1rem;">
-      <thead>
-        <tr><th>Platform</th><th>Comments</th><th>Distribution</th><th>Score</th></tr>
-      </thead>
-      <tbody>
-        {% for label, stats in brand_reputation.by_platform.items() %}
-        <tr>
-          <td>{{ label }}</td>
-          <td>{{ stats.total }}</td>
-          <td>
-            <div class="mini-bar">
-              <div style="flex:{{ stats.positive_pct }}; background:var(--positive);"></div>
-              <div style="flex:{{ stats.negative_pct }}; background:var(--negative);"></div>
-              <div style="flex:{{ stats.neutral_pct }}; background:var(--neutral);"></div>
-            </div>
-          </td>
-          <td>{{ stats.score }} <span class="card-sub">{{ stats.score_label }}</span></td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
+    <div class="insight-heading" style="margin-top:1.6rem;">Platform Comparison</div>
+    <div class="brandrep-platforms">
+      {% for label, stats in brand_reputation.by_platform.items() %}
+      {%- set stat_class = (stats.score_label | default("No Data")) | lower | replace(' ', '-') -%}
+      {%- set ll = label | lower -%}
+      <div class="brandrep-platform-card brandrep-platform-card--{{ stat_class }}">
+        <div class="brandrep-platform-top">
+          <span class="brandrep-platform-icon">{% if 'google' in ll %}🔍{% elif 'twitter' in ll or ll == 'x' %}𝕏{% elif 'instagram' in ll %}📸{% elif 'youtube' in ll %}▶{% elif 'facebook' in ll %}📘{% elif 'tiktok' in ll %}🎵{% elif 'reddit' in ll %}🧵{% else %}💬{% endif %}</span>
+          <div class="brandrep-platform-name">{{ label }}</div>
+          <span class="brandrep-platform-dot brandrep-platform-dot--{{ stat_class }}"></span>
+        </div>
+        <div class="card-sub brandrep-platform-count">{{ stats.total }} comment{{ 's' if stats.total != 1 else '' }}</div>
+        <div class="brandrep-platform-bar">
+          <div class="brandrep-platform-bar-seg brandrep-platform-bar-seg--pos" style="--seg-pct:{{ stats.positive_pct }};"></div>
+          <div class="brandrep-platform-bar-seg brandrep-platform-bar-seg--neg" style="--seg-pct:{{ stats.negative_pct }};"></div>
+          <div class="brandrep-platform-bar-seg brandrep-platform-bar-seg--neu" style="--seg-pct:{{ stats.neutral_pct }};"></div>
+        </div>
+        <div class="brandrep-platform-bottom">
+          <span class="brandrep-platform-score">{{ stats.score }}<span class="card-sub">/100</span></span>
+          <span class="score-label {{ stat_class }}">{{ stats.score_label }}</span>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
     {% endif %}
   </div>
 
@@ -1060,18 +1962,29 @@
   </div>
 
   {% macro comment_card(c) %}
+  {%- set _pl = (c.platform | default('')) | lower -%}
+  {%- set _picon = '▶' if 'you' in _pl else ('🔍' if 'goog' in _pl else ('👽' if 'reddit' in _pl else ('𝕏' if ('twit' in _pl or _pl == 'x') else ('📸' if 'insta' in _pl else ('🌐' if ('web' in _pl or 'site' in _pl) else '💬'))))) -%}
+  {%- set _pcolor = '#FF0000' if 'you' in _pl else ('#4285F4' if 'goog' in _pl else ('#FF4500' if 'reddit' in _pl else ('#000000' if ('twit' in _pl or _pl == 'x') else ('#E1306C' if 'insta' in _pl else ('#5A4FCF' if ('web' in _pl or 'site' in _pl) else '#7B746C'))))) -%}
   <div class="comment-card" data-sentiment="{{ c.sentiment | default('neutral') }}" data-platform="{{ c.platform | default('') }}">
     <div class="comment-sentiment-dot"
          style="background: {% if c.sentiment == 'positive' %}var(--positive){% elif c.sentiment == 'negative' %}var(--negative){% else %}var(--neutral){% endif %}">
     </div>
-    <div class="comment-body">
-      <div class="comment-text">{{ c.comment | default("") }}</div>
-      <div class="comment-meta">
+    <div class="comment-card-inner">
+      <div class="comment-top-row">
+        <span class="platform-badge" style="--platform-color:{{ _pcolor }};">
+          <span class="platform-badge-icon">{{ _picon }}</span>
+          <span class="platform-badge-name">{{ c.platform | default("Unknown") }}</span>
+        </span>
         <span class="badge {% if c.sentiment == 'positive' %}badge-pos{% elif c.sentiment == 'negative' %}badge-neg{% else %}badge-neu{% endif %}">
           {{ c.sentiment | default("neutral") }}
         </span>
-        <span>{{ c.platform | default("") }}</span>
-        {% if c.product and c.product != 'General' %}<span>· {{ c.product }}</span>{% endif %}
+      </div>
+      <div class="comment-body">
+        <div class="comment-text">{{ c.comment | default("") }}</div>
+        <div class="comment-meta">
+          {% if c.product and c.product != 'General' %}<span class="product-badge">{{ c.product }}</span>{% endif %}
+          {% if c.date %}<span class="comment-timestamp">{{ c.date }}</span>{% endif %}
+        </div>
       </div>
     </div>
   </div>
@@ -1092,7 +2005,7 @@
       <div class="comments-list">
         {% for c in insight_tabs.top_positive %}{{ comment_card(c) }}{% endfor %}
       </div>
-      {% else %}<div class="empty">No standout positive reviews yet — check back once more feedback has been collected.</div>{% endif %}
+      {% else %}<div class="empty"><div class="empty-icon"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M8.5 13.2c1 1.4 2.2 2.1 3.5 2.1s2.5-.7 3.5-2.1"/><path d="M8.7 9.5h.01M15.3 9.5h.01"/></svg></div><div>No standout positive reviews yet — check back once more feedback has been collected.</div></div>{% endif %}
     </div>
 
     <div class="tab-panel" data-panel="negative" style="display:none;">
@@ -1100,7 +2013,7 @@
       <div class="comments-list">
         {% for c in insight_tabs.top_negative %}{{ comment_card(c) }}{% endfor %}
       </div>
-      {% else %}<div class="empty">No standout negative reviews yet — check back once more feedback has been collected.</div>{% endif %}
+      {% else %}<div class="empty"><div class="empty-icon"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M8.5 15.3c1-1.4 2.2-2.1 3.5-2.1s2.5.7 3.5 2.1"/><path d="M8.7 9.5h.01M15.3 9.5h.01"/></svg></div><div>No standout negative reviews yet — check back once more feedback has been collected.</div></div>{% endif %}
     </div>
 
     <div class="tab-panel" data-panel="platform" style="display:none;">
@@ -1121,39 +2034,42 @@
         </div>
       </div>
       {% endfor %}
-      {% else %}<div class="empty">No comments collected yet for this platform — try running the analysis again later.</div>{% endif %}
+      {% else %}<div class="empty"><div class="empty-icon"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div><div>No comments collected yet for this platform — try running the analysis again later.</div></div>{% endif %}
     </div>
   </div>
 
 </div>
 
 <script>
-const ctx = document.getElementById('sentimentChart').getContext('2d');
-new Chart(ctx, {
-  type: 'doughnut',
-  data: {
-    labels: ['Positive', 'Negative', 'Neutral'],
-    datasets: [{
-      data: [{{ positive | default(0) }}, {{ negative | default(0) }}, {{ neutral | default(0) }}],
-      backgroundColor: ['#16a34a', '#dc2626', '#d97706'],
-      borderColor: '#ffffff',
-      borderWidth: 3,
-      hoverOffset: 4,
-    }]
-  },
-  options: {
-    cutout: '68%',
-    plugins: {
-      legend: { display: false },
-      tooltip: {
-        backgroundColor: '#111827',
-        padding: 10,
-        cornerRadius: 6,
-      }
+const sentimentCanvas = document.getElementById('sentimentChart');
+if (sentimentCanvas) {
+  const ctx = sentimentCanvas.getContext('2d');
+  new Chart(ctx, {
+    type: 'doughnut',
+    data: {
+      labels: ['Positive', 'Negative', 'Neutral'],
+      datasets: [{
+        data: [{{ positive | default(0) }}, {{ negative | default(0) }}, {{ neutral | default(0) }}],
+        backgroundColor: ['#16a34a', '#dc2626', '#d97706'],
+        borderColor: '#ffffff',
+        borderWidth: 3,
+        hoverOffset: 4,
+      }]
     },
-    animation: { animateRotate: true, duration: 600 }
-  }
-});
+    options: {
+      cutout: '68%',
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          backgroundColor: '#111827',
+          padding: 10,
+          cornerRadius: 6,
+        }
+      },
+      animation: { animateRotate: true, duration: 600 }
+    }
+  });
+}
 
 function showInsightTab(tab, btn) {
   document.querySelectorAll('.filter-btn[data-tab]').forEach(b => b.classList.remove('active'));

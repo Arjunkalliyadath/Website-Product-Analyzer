@@ -1,32 +1,99 @@
 """
-product_intelligence.py
-------------------------
-Phase 3A: Product Intelligence Engine.
+Module Name: product_intelligence.py
 
-Product-centric enrichment layer. Everything downstream of Product
-Discovery/selection now revolves around the PRODUCT URL: for every
-selected product this module fetches that product's own page HTML
-exactly ONCE and runs every extractor below against that single
-downloaded payload - name, brand, category, image, price, availability,
-specifications, FAQ, aggregate rating, rating count, and website (on-page)
-reviews are all derived from the one fetch. No field here ever triggers a
-second request to the same URL.
+Purpose:
+    Product-centric enrichment layer for Phase 3A of the pipeline. For every
+    selected product, this module fetches that product's own page HTML
+    exactly once and derives every enrichment field - name, brand, category,
+    image, price, availability, specifications, FAQ, aggregate rating,
+    rating count, and website (on-page) reviews - from that single
+    downloaded payload. No field in this module ever triggers a second
+    request to the same product URL.
 
-Public entry points (the only things other modules should call):
-    await build_product_intelligence(product) -> ProductIntelligence
-    await build_product_intelligence_batch(products) -> List[ProductIntelligence]
+Responsibilities:
+    - Fetch each product's page with a single bounded HTTP GET.
+    - Parse the page once (BeautifulSoup + JSON-LD flattening) and reuse
+      that parsed representation across every extractor.
+    - Extract core product fields from schema.org Product JSON-LD, falling
+      back to OpenGraph/product meta tags on the same page when no usable
+      JSON-LD is present.
+    - Extract specifications, FAQ entries, aggregate rating/rating count,
+      and on-page website reviews from the same parsed payload.
+    - Discover and, when present, fetch a single structured review-provider
+      endpoint (Judge.me, Yotpo, Loox, Stamped, Bazaarvoice, PowerReviews,
+      or a native store endpoint) already referenced on the product page.
+    - Fall back to a generic, provider-agnostic HTML review scan when no
+      structured endpoint is discoverable.
+    - Merge and de-duplicate reviews collected from JSON-LD, the structured
+      provider, and the generic HTML scan into a single capped list.
+    - Degrade gracefully to already-known discovery fields whenever a
+      fetch fails, times out, or extraction raises, without ever leaving
+      the caller with an empty or incomplete object.
+    - Run this enrichment concurrently across a batch of products, bounded
+      by config.MAX_PARALLEL_TASKS.
 
-`product` may be a `SelectedProduct` dataclass instance (see app.py), a
-plain dict with name/url/brand/image/category keys, or anything exposing
-those as attributes - only `.name`/`.url`/`.brand`/`.image`/`.category`
-(or dict equivalents) are read.
+Architecture:
+    Public entry points (the only things other modules should call):
+        await build_product_intelligence(product) -> ProductIntelligence
+        await build_product_intelligence_batch(products) -> List[ProductIntelligence]
 
-Explicitly out of scope for this module (later phases): YouTube/Reddit
-scraping, the Recommendation Engine, Aspect Sentiment, Confidence
-Score. This module does not touch browser pooling, sentiment analysis,
-PDF generation, or the Flask/FastAPI routes - it is a self-contained,
-additive enrichment step that analyze_selected() calls once per batch of
-selected products.
+    `product` may be a `SelectedProduct` dataclass instance (see app.py), a
+    plain dict with name/url/brand/image/category keys, or any object
+    exposing those as attributes - only `.name`/`.url`/`.brand`/`.image`/
+    `.category` (or dict equivalents) are read.
+
+    Internally the module is organized into: networking (one GET per
+    product page, plus at most one additional GET to a discovered
+    structured review endpoint), JSON-LD flattening/lookup, core field
+    extraction with a meta-tag fallback, specification/FAQ extraction,
+    rating extraction, and website-review extraction (JSON-LD, structured
+    provider, and generic HTML, merged and de-duplicated).
+
+    Explicitly out of scope for this module (handled in later phases):
+    YouTube/Reddit scraping, the Recommendation Engine, Aspect Sentiment,
+    and Confidence Score. This module does not touch browser pooling,
+    sentiment analysis, PDF generation, or the Flask/FastAPI routes - it is
+    a self-contained, additive enrichment step that analyze_selected()
+    calls once per batch of selected products.
+
+Enrichment Pipeline:
+    1. Resolve fallback fields (name/brand/category/url/image) from the
+       caller-supplied product.
+    2. If no URL is present, return immediately with fetch_status="skipped".
+    3. Fetch the product page HTML exactly once, bounded by
+       PRODUCT_PAGE_TIMEOUT_SECONDS.
+    4. Parse the HTML once into a BeautifulSoup tree and a flattened list
+       of JSON-LD nodes.
+    5. Extract core fields from the schema.org Product node, or from
+       OpenGraph/product meta tags when no usable Product JSON-LD exists.
+    6. Extract price (JSON-LD offers, else a price-classed element),
+       category (JSON-LD, else breadcrumb, else discovery fallback),
+       specifications, FAQ entries, and aggregate rating/rating count.
+    7. Extract website reviews in priority order: schema.org Product.review
+       JSON-LD, then a discovered structured review-provider endpoint
+       (at most one extra request), then a generic HTML review scan -
+       merging and de-duplicating the results.
+    8. Populate and return a ProductIntelligence instance, marking
+       fetch_status as "success", "failed", or "skipped" as appropriate.
+
+Inputs:
+    A `SelectedProduct`-like object, dict, or any object exposing
+    name/url/brand/image/category (single product), or a list of such
+    objects (batch). Network input is the HTML of each product's own page,
+    and - at most once per product - the JSON response of a discovered
+    structured review-provider endpoint.
+
+Outputs:
+    A single `ProductIntelligence` instance, or a `List[ProductIntelligence]`
+    in the same order as the input batch. Each instance exposes name,
+    brand, category, url, image, price, availability, specifications, faq,
+    aggregate_rating, rating_count, website_reviews, and a diagnostic-only
+    fetch_status ("success" | "failed" | "skipped").
+
+Dependencies:
+    asyncio, json, logging, re, dataclasses, typing, urllib.parse.urljoin,
+    httpx, bs4.BeautifulSoup, config (MAX_PARALLEL_TASKS), and
+    product_extraction (extract_price, parse_breadcrumb_category).
 """
 
 from __future__ import annotations
@@ -47,13 +114,6 @@ from product_extraction import extract_price, parse_breadcrumb_category
 
 logger = logging.getLogger(__name__)
 
-# --------------------------------------------------------------------------
-# Fetch settings - exactly one plain HTTP GET per product page. Mirrors the
-# headers/timeout/verify posture product_discovery._fetch_static() already
-# uses elsewhere in the pipeline, kept as a small local copy so this module
-# has no import-time dependency on product_discovery (which pulls in
-# Playwright/browser-pooling machinery this phase must not touch).
-# --------------------------------------------------------------------------
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -63,9 +123,6 @@ HEADERS = {
 FETCH_TIMEOUT_SECONDS = 10.0
 FETCH_CONNECT_TIMEOUT_SECONDS = 6.0
 
-# Outer hard cutoff for one product page (fetch + parse + extract). A
-# single slow/blocked product page can never block the whole batch - see
-# build_product_intelligence_batch(), which also bounds concurrency.
 PRODUCT_PAGE_TIMEOUT_SECONDS = 15
 
 MAX_SPECIFICATIONS = 30
@@ -73,17 +130,8 @@ MAX_FAQ_ITEMS = 20
 MAX_WEBSITE_REVIEWS = 20
 MAX_REVIEW_BODY_CHARS = 500
 
-# The ONE additional request this module is allowed to make beyond the
-# product page itself, when a structured review-provider endpoint is
-# clearly discoverable on that page. Kept well under PRODUCT_PAGE_TIMEOUT_
-# SECONDS so a slow review API can never blank out the rest of an already-
-# successfully-extracted product (see build_product_intelligence()).
 STRUCTURED_REVIEW_TIMEOUT_SECONDS = 8.0
 
-
-# --------------------------------------------------------------------------
-# Data model
-# --------------------------------------------------------------------------
 
 @dataclass
 class ProductIntelligence:
@@ -99,45 +147,23 @@ class ProductIntelligence:
     aggregate_rating: Optional[float] = None
     rating_count: Optional[int] = None
     website_reviews: List[Dict[str, str]] = field(default_factory=list)
-
-    # Diagnostics only ("success" | "failed" | "skipped"). Never required
-    # by callers - purely additive, safe to ignore in templates.
     fetch_status: str = "skipped"
 
     def as_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
 
-# --------------------------------------------------------------------------
-# Public API
-# --------------------------------------------------------------------------
-
 async def build_product_intelligence(product: Any) -> ProductIntelligence:
-    """Accepts a single Product-like object and returns a fully populated
-    ProductIntelligence, fetching that product's own page exactly once.
+    fallback = _extract_fallback_fields(product)
+    fallback_name = fallback["name"]
+    fallback_url = fallback["url"]
+    fallback_brand = fallback["brand"]
+    fallback_image = fallback["image"]
+    fallback_category = fallback["category"]
 
-    Falls back to whatever fields the caller already had (from Product
-    Discovery / the user's selection) whenever the page can't be fetched,
-    times out, or is missing a given field - this function never raises
-    and never leaves the object completely empty.
-    """
-    fallback_name = _get_field(product, "name")
-    fallback_url = _get_field(product, "url")
-    fallback_brand = _get_field(product, "brand")
-    fallback_image = _get_field(product, "image")
-    fallback_category = _get_field(product, "category")
-
-    intel = ProductIntelligence(
-        name=fallback_name,
-        brand=fallback_brand,
-        category=fallback_category,
-        url=fallback_url,
-        image=fallback_image,
-    )
+    intel = ProductIntelligence(**fallback)
 
     if not fallback_url:
-        # Nothing to fetch - a product without a URL still flows through
-        # with whatever Product Discovery already knew about it.
         intel.fetch_status = "skipped"
         return intel
 
@@ -164,9 +190,6 @@ async def build_product_intelligence(product: Any) -> ProductIntelligence:
         intel.fetch_status = "failed"
         return intel
 
-    # ---- ONE parse of the ONE downloaded HTML payload -------------------
-    # Every extractor below reuses `soup` / `nodes` - no further network
-    # requests and no re-fetching for individual fields.
     try:
         soup = BeautifulSoup(html, "html.parser")
         nodes = _flatten_jsonld_nodes(html)
@@ -175,8 +198,6 @@ async def build_product_intelligence(product: Any) -> ProductIntelligence:
 
         core = _extract_core_fields(product_node, fallback_url) if product_node else {}
         if not any(core.get(k) for k in ("name", "image", "price")):
-            # No usable Product JSON-LD - fall back to meta tags on the
-            # SAME soup rather than a second fetch.
             core = _merge_fields(core, _extract_meta_fallback(soup, fallback_url))
 
         price = core.get("price") or _extract_price_from_page(soup)
@@ -194,20 +215,6 @@ async def build_product_intelligence(product: Any) -> ProductIntelligence:
         intel.aggregate_rating = rating_info["aggregate_rating"]
         intel.rating_count = rating_info["rating_count"]
 
-        # --- Website Reviews: structured-provider-first, generic-HTML
-        # fallback ----------------------------------------------------------
-        # 1) schema.org Product.review JSON-LD (already parsed above, free).
-        # 2) Before any HTML scraping: inspect THIS already-downloaded page
-        #    for a directly discoverable structured review-provider endpoint
-        #    (Judge.me / Shopify Product Reviews / Yotpo / Loox / Stamped /
-        #    Bazaarvoice / PowerReviews / native JSON). Only ONE additional
-        #    request is made, and only when a concrete endpoint URL is
-        #    already present on the page - never guessed or constructed.
-        # 3) Otherwise, one generic (platform-agnostic) HTML review scan
-        #    against the SAME soup - no extra fetch.
-        # Wrapped in its own try/except so a slow or failed review lookup
-        # can never blank out the name/brand/price/specs/faq/rating fields
-        # already extracted above - it only ever degrades website_reviews.
         jsonld_reviews = _extract_website_reviews(product_node)
         structured_reviews: List[Dict[str, str]] = []
         try:
@@ -233,8 +240,6 @@ async def build_product_intelligence(product: Any) -> ProductIntelligence:
         )
         intel.fetch_status = "success"
     except Exception:
-        # Extraction bugs must never blank out fields we already have from
-        # discovery - degrade to the fallback object instead of raising.
         logger.exception(
             "Product Intelligence extraction failed for %r after a "
             "successful fetch - returning discovery fallback fields only.",
@@ -246,12 +251,6 @@ async def build_product_intelligence(product: Any) -> ProductIntelligence:
 
 
 async def build_product_intelligence_batch(products: List[Any]) -> List["ProductIntelligence"]:
-    """Builds ProductIntelligence for every selected product concurrently,
-    bounded by config.MAX_PARALLEL_TASKS - the same cap the rest of the
-    pipeline already uses for parallel scrape jobs, so this never opens
-    more simultaneous connections than the Google Reviews scraper does.
-    Order of the returned list matches the order of `products`.
-    """
     if not products:
         return []
 
@@ -266,26 +265,25 @@ async def build_product_intelligence_batch(products: List[Any]) -> List["Product
                     "Product Intelligence batch job failed unexpectedly "
                     "for %r - degrading to known discovery fields.", item,
                 )
-                return ProductIntelligence(
-                    name=_get_field(item, "name"),
-                    brand=_get_field(item, "brand"),
-                    category=_get_field(item, "category"),
-                    url=_get_field(item, "url"),
-                    image=_get_field(item, "image"),
-                    fetch_status="failed",
-                )
+                return ProductIntelligence(**_extract_fallback_fields(item), fetch_status="failed")
 
     return list(await asyncio.gather(*(_one(p) for p in products)))
 
-
-# --------------------------------------------------------------------------
-# Field access helper (SelectedProduct dataclass, dict, or any object)
-# --------------------------------------------------------------------------
 
 def _get_field(product: Any, field_name: str) -> str:
     if isinstance(product, dict):
         return str(product.get(field_name) or "").strip()
     return str(getattr(product, field_name, "") or "").strip()
+
+
+def _extract_fallback_fields(product: Any) -> Dict[str, str]:
+    return {
+        "name": _get_field(product, "name"),
+        "brand": _get_field(product, "brand"),
+        "category": _get_field(product, "category"),
+        "url": _get_field(product, "url"),
+        "image": _get_field(product, "image"),
+    }
 
 
 def _merge_fields(primary: Dict[str, str], fallback: Dict[str, str]) -> Dict[str, str]:
@@ -294,14 +292,7 @@ def _merge_fields(primary: Dict[str, str], fallback: Dict[str, str]) -> Dict[str
     return merged
 
 
-# --------------------------------------------------------------------------
-# Networking - exactly one GET per product page
-# --------------------------------------------------------------------------
-
 async def _fetch_product_html(url: str) -> str:
-    """Plain HTTP fetch of a single product page. Returns "" on any
-    failure (bad status, timeout, connection error) - callers fall back to
-    already-known fields rather than retrying or blocking the batch."""
     try:
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(FETCH_TIMEOUT_SECONDS, connect=FETCH_CONNECT_TIMEOUT_SECONDS),
@@ -316,12 +307,6 @@ async def _fetch_product_html(url: str) -> str:
         logger.info("Product Intelligence fetch failed for %s: %s", url, exc)
         return ""
 
-
-# --------------------------------------------------------------------------
-# JSON-LD parsing (local, minimal copy - product_extraction's flatten/type
-# helpers are private to that module, so this mirrors just the two rules
-# this module needs: follow @graph/itemListElement, and read @type).
-# --------------------------------------------------------------------------
 
 def _flatten_jsonld_nodes(html: str) -> List[Dict]:
     if not html:
@@ -374,11 +359,6 @@ def _find_faqpage_nodes(nodes: List[Dict]) -> List[Dict]:
     return [n for n in nodes if _schema_type(n) == "faqpage"]
 
 
-# --------------------------------------------------------------------------
-# Core field extraction (name / brand / category / image / price /
-# availability) from the schema.org Product JSON-LD node.
-# --------------------------------------------------------------------------
-
 def _extract_core_fields(product_node: Dict, page_url: str) -> Dict[str, str]:
     name = str(product_node.get("name") or "").strip()
 
@@ -420,8 +400,6 @@ def _extract_core_fields(product_node: Dict, page_url: str) -> Dict[str, str]:
 
 
 def _extract_meta_fallback(soup: BeautifulSoup, page_url: str) -> Dict[str, str]:
-    """Used only when the page has no usable Product JSON-LD. Reads
-    OpenGraph / product meta tags off the SAME soup - never a new fetch."""
 
     def _meta(*names: str) -> str:
         for n in names:
@@ -450,8 +428,6 @@ def _extract_meta_fallback(soup: BeautifulSoup, page_url: str) -> Dict[str, str]
 
 
 def _extract_price_from_page(soup: BeautifulSoup) -> str:
-    """Last-resort price fallback: the first element whose class hints at
-    a price, scanned on the already-parsed soup - no extra fetch."""
     price_el = soup.find(class_=re.compile(r"price", re.IGNORECASE))
     if price_el is not None:
         price = extract_price(price_el.get_text(" ", strip=True))
@@ -460,17 +436,7 @@ def _extract_price_from_page(soup: BeautifulSoup) -> str:
     return ""
 
 
-# --------------------------------------------------------------------------
-# Specifications
-# --------------------------------------------------------------------------
-
 def _extract_specifications(soup: BeautifulSoup) -> Dict[str, str]:
-    """Best-effort key/value spec table, tried in order of reliability:
-    1) <dl>/<dt>/<dd> definition lists (most semantically correct)
-    2) <table> rows scoped inside a spec/attribute container
-    3) generic "Key: Value" text rows inside a spec/detail container
-    Stops adding once MAX_SPECIFICATIONS is reached.
-    """
     specs: Dict[str, str] = {}
 
     for dl in soup.find_all("dl"):
@@ -515,14 +481,7 @@ def _extract_specifications(soup: BeautifulSoup) -> Dict[str, str]:
     return specs
 
 
-# --------------------------------------------------------------------------
-# FAQ
-# --------------------------------------------------------------------------
-
 def _extract_faq(faq_nodes: List[Dict], soup: BeautifulSoup) -> List[Dict[str, str]]:
-    """Prefers schema.org FAQPage JSON-LD (structured, unambiguous). Only
-    falls back to a heuristic HTML accordion scan when no FAQPage node was
-    present on the page - still against the same soup, no extra fetch."""
     faqs: List[Dict[str, str]] = []
     seen: set = set()
 
@@ -558,10 +517,6 @@ def _extract_faq(faq_nodes: List[Dict], soup: BeautifulSoup) -> List[Dict[str, s
     return faqs
 
 
-# --------------------------------------------------------------------------
-# Aggregate rating / rating count
-# --------------------------------------------------------------------------
-
 def _extract_rating(product_node: Dict) -> Dict[str, Optional[float]]:
     agg = product_node.get("aggregateRating") if product_node else None
     if isinstance(agg, list):
@@ -588,11 +543,20 @@ def _to_int(value: Any) -> Optional[int]:
         return None
 
 
-# --------------------------------------------------------------------------
-# Website (on-page) reviews - distinct from the Google/Twitter/Instagram/
-# YouTube scrapers: these are reviews already published on the product
-# page itself (schema.org Review entries on the Product node).
-# --------------------------------------------------------------------------
+def _truncate_review_text(text: str) -> str:
+    if len(text) > MAX_REVIEW_BODY_CHARS:
+        return text[: MAX_REVIEW_BODY_CHARS - 3].rstrip() + "..."
+    return text
+
+
+def _build_review(author: str, rating: str, text: str, date_val: str) -> Dict[str, str]:
+    return {
+        "author": author or "Anonymous",
+        "rating": rating,
+        "text": text,
+        "date": date_val,
+    }
+
 
 def _extract_website_reviews(product_node: Dict) -> List[Dict[str, str]]:
     if not product_node:
@@ -613,8 +577,7 @@ def _extract_website_reviews(product_node: Dict) -> List[Dict[str, str]]:
         author = str(author or "").strip()
 
         body = str(r.get("reviewBody") or r.get("description") or "").strip()
-        if len(body) > MAX_REVIEW_BODY_CHARS:
-            body = body[: MAX_REVIEW_BODY_CHARS - 3].rstrip() + "..."
+        body = _truncate_review_text(body)
 
         rating = ""
         rating_node = r.get("reviewRating")
@@ -624,26 +587,12 @@ def _extract_website_reviews(product_node: Dict) -> List[Dict[str, str]]:
         date_published = str(r.get("datePublished") or "").strip()
 
         if body or author:
-            reviews.append({
-                "author": author or "Anonymous",
-                "rating": rating,
-                "text": body,
-                "date": date_published,
-            })
+            reviews.append(_build_review(author, rating, body, date_published))
         if len(reviews) >= MAX_WEBSITE_REVIEWS:
             break
 
     return reviews
 
-
-# --------------------------------------------------------------------------
-# Structured review providers - platform-agnostic detection + ONE fetch.
-# These are third-party review widgets/apps used across Shopify,
-# WooCommerce, Magento and similar storefronts - detection only looks for a
-# directly fetchable URL already present in the downloaded HTML (script
-# src, inline script text, or a data-* attribute). It never guesses at an
-# endpoint's shape and never executes any JavaScript.
-# --------------------------------------------------------------------------
 
 REVIEW_PROVIDER_DOMAINS = (
     "judge.me",
@@ -659,21 +608,12 @@ _REVIEW_ENDPOINT_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Static-asset extensions - never treated as a data endpoint, even if they
-# match one of the domains above (e.g. a provider's CDN-hosted JS bundle).
 _STATIC_ASSET_RE = re.compile(r"\.(?:js|css|png|jpe?g|gif|svg|woff2?|ttf)(?:\?|$)", re.IGNORECASE)
 
-# A candidate URL is only treated as a genuine data endpoint - not a widget
-# asset - when it looks like one: an API/widget path, a .json path, or a
-# query string (most review-widget calls are GETs with product/shop
-# identifiers as params).
 _ENDPOINT_HINT_RE = re.compile(r"(?:/api/|/widgets?/|\.json|\?)", re.IGNORECASE)
 
 
 def _discover_structured_review_endpoint(html: str) -> str:
-    """Scans the already-downloaded page HTML for a directly fetchable
-    review-provider endpoint. Returns "" when nothing clearly discoverable
-    is found - callers must never construct or guess a URL themselves."""
     if not html:
         return ""
     for match in _REVIEW_ENDPOINT_RE.finditer(html):
@@ -686,12 +626,6 @@ def _discover_structured_review_endpoint(html: str) -> str:
 
 
 async def _fetch_structured_reviews(endpoint: str) -> List[Dict[str, str]]:
-    """The ONE additional request this module is allowed to make beyond the
-    product page itself - only reached when _discover_structured_review_
-    endpoint() found a concrete, already-present endpoint URL. Parses the
-    JSON response generically rather than assuming any one provider's exact
-    response shape, so this works the same way across Judge.me, Yotpo,
-    Loox, Stamped, Bazaarvoice, PowerReviews, or a native store endpoint."""
     try:
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(STRUCTURED_REVIEW_TIMEOUT_SECONDS, connect=FETCH_CONNECT_TIMEOUT_SECONDS),
@@ -714,11 +648,13 @@ _REVIEW_RATING_KEYS = ("rating", "score", "stars", "review_rating", "star_rating
 _REVIEW_DATE_KEYS = ("date", "created_at", "date_published", "timestamp", "review_date")
 
 
+def _first_value(item: Dict, keys: "tuple[str, ...]", require_not_none: bool = False) -> str:
+    if require_not_none:
+        return next((str(item[k]).strip() for k in keys if item.get(k) is not None), "")
+    return next((str(item[k]).strip() for k in keys if item.get(k)), "")
+
+
 def _find_review_list(node: Any, depth: int = 0) -> List[Dict]:
-    """Walks a parsed JSON payload looking for the first list of dicts that
-    "looks like" a review list (each item has at least one text-like key).
-    Provider-agnostic by design - every provider nests its reviews array at
-    a different depth/key, so this doesn't assume any single shape."""
     if depth > 6:
         return []
     if isinstance(node, list):
@@ -741,41 +677,24 @@ def _parse_generic_review_payload(data: Any) -> List[Dict[str, str]]:
     raw_reviews = _find_review_list(data)
     reviews: List[Dict[str, str]] = []
     for item in raw_reviews:
-        text = next((str(item[k]).strip() for k in _REVIEW_TEXT_KEYS if item.get(k)), "")
+        text = _first_value(item, _REVIEW_TEXT_KEYS)
         if not text:
             continue
-        if len(text) > MAX_REVIEW_BODY_CHARS:
-            text = text[: MAX_REVIEW_BODY_CHARS - 3].rstrip() + "..."
-        author = next((str(item[k]).strip() for k in _REVIEW_AUTHOR_KEYS if item.get(k)), "")
-        rating = next((str(item[k]).strip() for k in _REVIEW_RATING_KEYS if item.get(k) is not None), "")
-        date_val = next((str(item[k]).strip() for k in _REVIEW_DATE_KEYS if item.get(k)), "")
-        reviews.append({
-            "author": author or "Anonymous",
-            "rating": rating,
-            "text": text,
-            "date": date_val,
-        })
+        text = _truncate_review_text(text)
+        author = _first_value(item, _REVIEW_AUTHOR_KEYS)
+        rating = _first_value(item, _REVIEW_RATING_KEYS, require_not_none=True)
+        date_val = _first_value(item, _REVIEW_DATE_KEYS)
+        reviews.append(_build_review(author, rating, text, date_val))
         if len(reviews) >= MAX_WEBSITE_REVIEWS:
             break
     return reviews
 
 
-# --------------------------------------------------------------------------
-# Generic HTML review fallback - used only when no structured provider
-# endpoint was discoverable. Works against the SAME soup already parsed for
-# the rest of Product Intelligence, so it costs no extra fetch. Selectors
-# are all provider/app-level (schema.org microdata, or the Shopify
-# "Product reviews" app's own generic CSS classes) - never scoped to any
-# one merchant's page, per the "no Headphone Zone-specific selectors"
-# requirement. This is what makes Website Reviews work the same way across
-# Shopify, WooCommerce, Magento and similar storefronts.
-# --------------------------------------------------------------------------
-
 def _extract_generic_html_reviews(soup: BeautifulSoup) -> List[Dict[str, str]]:
     candidates = soup.select('[itemprop="review"], [itemtype*="Review" i]')
     if not candidates:
         candidates = soup.select(
-            '[class*="spr-review" i], '           # Shopify "Product reviews" app
+            '[class*="spr-review" i], '
             '[class*="review-item" i], [class*="review-card" i], '
             '[class*="review-entry" i], [class*="review-content" i], '
             '[class*="review_item" i], [id*="review-item" i]'
@@ -800,16 +719,9 @@ def _extract_generic_html_reviews(soup: BeautifulSoup) -> List[Dict[str, str]]:
         author = _find_block_text(block, author_hints)
         rating = _find_block_rating(block)
         date_val = _find_block_text(block, date_hints)
+        text = _truncate_review_text(text)
 
-        if len(text) > MAX_REVIEW_BODY_CHARS:
-            text = text[: MAX_REVIEW_BODY_CHARS - 3].rstrip() + "..."
-
-        reviews.append({
-            "author": author or "Anonymous",
-            "rating": rating,
-            "text": text,
-            "date": date_val,
-        })
+        reviews.append(_build_review(author, rating, text, date_val))
         if len(reviews) >= MAX_WEBSITE_REVIEWS:
             break
 
@@ -861,9 +773,6 @@ def _find_block_rating(block: Any) -> str:
 
 
 def _merge_website_reviews(*groups: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    """Merges JSON-LD / structured-provider / generic-HTML review lists in
-    priority order, de-duplicating by (text, author) so the same review
-    surfaced by two sources isn't counted twice. Caps at MAX_WEBSITE_REVIEWS."""
     merged: List[Dict[str, str]] = []
     seen: set = set()
     for group in groups:

@@ -345,9 +345,27 @@ def _extract_shopify_product_json_id(client: httpx.Client, target: str) -> Optio
 # --- 3a. Judge.me --------------------------------------------------------
 _JUDGEME_ID_RE = re.compile(r"data-product-id=[\"'](\d+)[\"']|jdgm-widget[^>]*data-id=[\"'](\d+)[\"']")
 
+# Judge.me's public widget API is keyed to the store's *.myshopify.com
+# domain, not whatever custom domain the storefront is actually served
+# from (e.g. headphonezone.in) — a mismatch here silently returns an
+# empty review list even when Judge.me is genuinely installed with real
+# reviews (confirmed by jdgm-* classes in the DOM). Shopify themes almost
+# always leak this domain somewhere in the page (Shopify.shop, a
+# checkout/asset host, etc.), so this recovers it without needing a
+# browser.
+_MYSHOPIFY_DOMAIN_RE = re.compile(r"([a-z0-9][a-z0-9\-]*\.myshopify\.com)", re.IGNORECASE)
+
+
+def _extract_myshopify_domain(html: str) -> Optional[str]:
+    m = _MYSHOPIFY_DOMAIN_RE.search(html)
+    return m.group(1).lower() if m else None
+
 
 def _extract_judgeme(
-    client: httpx.Client, html: str, shop_domain: str, fallback_product_id: Optional[str] = None
+    client: httpx.Client,
+    html: str,
+    shop_domains: List[str],
+    fallback_product_id: Optional[str] = None,
 ) -> List[_Review]:
     m = _JUDGEME_ID_RE.search(html)
     product_id = (m.group(1) or m.group(2)) if m else None
@@ -359,25 +377,32 @@ def _extract_judgeme(
     if not product_id:
         return []
 
-    url = (
-        "https://judge.me/api/v1/widgets/product_review"
-        f"?shop_domain={shop_domain}&platform=shopify&product_id={product_id}"
-        "&per_page=50&page=1"
-    )
-    resp = _get_simple(client, url)
-    if resp is None:
-        return []
-    out: List[_Review] = []
-    try:
-        soup = BeautifulSoup(resp.text, "html.parser")
-        for body in soup.select(".jdgm-rev__body, .jdgm-rev__text"):
-            text = body.get_text(" ", strip=True)
-            if text and len(text.split()) >= _MIN_WORDS:
-                out.append(_Review(text=text, source="judgeme"))
-    except Exception:
-        pass
-    return out
-
+    # Try every candidate domain we have — custom domain first, then the
+    # real myshopify.com domain if we found one — stopping at the first
+    # one Judge.me's API actually recognizes.
+    for shop_domain in shop_domains:
+        if not shop_domain:
+            continue
+        url = (
+            "https://judge.me/api/v1/widgets/product_review"
+            f"?shop_domain={shop_domain}&platform=shopify&product_id={product_id}"
+            "&per_page=50&page=1"
+        )
+        resp = _get_simple(client, url)
+        if resp is None:
+            continue
+        out: List[_Review] = []
+        try:
+            soup = BeautifulSoup(resp.text, "html.parser")
+            for body in soup.select(".jdgm-rev__body, .jdgm-rev__text"):
+                text = body.get_text(" ", strip=True)
+                if text and len(text.split()) >= _MIN_WORDS:
+                    out.append(_Review(text=text, source="judgeme"))
+        except Exception:
+            pass
+        if out:
+            return out
+    return []
 
 # --- 3b. Yotpo ------------------------------------------------------------
 _YOTPO_APPKEY_RE = re.compile(r"yotpo[_-]?app[_-]?key[\"'\s:=]+[\"']?([A-Za-z0-9]{6,})", re.IGNORECASE)
@@ -453,6 +478,8 @@ def _extract_loox(
 # --- 4. Generic HTML heuristic fallback ------------------------------------
 _REVIEW_BLOCK_HINTS = [
     "review", "rating", "testimonial", "feedback", "comment",
+    "jdgm", "yotpo", "loox", "oke-", "okendo", "stamped", "rivyo",
+    "reviewsio", "trustpilot", "junip", "ali-reviews",
 ]
 _NOISE_RE = re.compile(
     r"^(add to cart|buy now|write a review|sort by|filter|load more|"
@@ -496,7 +523,10 @@ def _extract_html_heuristic(html: str) -> List[_Review]:
 
 # --- shared extraction pipeline -------------------------------------------
 def _shop_domain_from_url(url: str) -> str:
-    return urlparse(url).netloc.lower().lstrip("www.")
+    netloc = urlparse(url).netloc.lower()
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+    return netloc
 
 
 def _extract_all_tiers(
@@ -516,8 +546,10 @@ def _extract_all_tiers(
 
     with httpx.Client(follow_redirects=True) as client:
         url_slug = urlparse(target).path.rstrip("/").rsplit("/", 1)[-1]
+        myshopify_domain = _extract_myshopify_domain(html)
+        judgeme_domains = [d for d in (shop_domain, myshopify_domain) if d]
         for extractor, args in (
-            (_extract_judgeme, (client, html, shop_domain, shopify_product_id)),
+            (_extract_judgeme, (client, html, judgeme_domains, shopify_product_id)),
             (_extract_yotpo, (client, html, shopify_product_id)),
             (_extract_loox, (client, html, url_slug, shopify_product_id)),
         ):

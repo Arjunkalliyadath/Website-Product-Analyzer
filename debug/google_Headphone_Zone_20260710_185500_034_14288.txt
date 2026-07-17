@@ -1,4 +1,0 @@
-reason: nav_failure
-query: Headphone Zone
-final_url: https://www.google.com/maps/search/Headphone+Zone?hl=en&gl=in
-page_title: Google Maps

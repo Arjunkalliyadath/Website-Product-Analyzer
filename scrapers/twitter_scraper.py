@@ -11,7 +11,7 @@ from typing import Dict, List
 
 import httpx
 
-from scrapers.browser_utils import browser_launch_slot, normalize_comments
+from scrapers.browser_utils import browser_launch_slot, normalize_comments, find_social_profile_url
 from config import (
     MAX_TWITTER_POSTS,
     MAX_SCROLL_ITERATIONS,
@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 # navigation itself fails fast (NAV_TIMEOUT_MS, NAVIGATION_RETRIES in
 # config.py), so a blocked/login-walled profile is recognized in a few
 # seconds instead of eating the whole budget on retries.
-TIME_BUDGET_SECONDS = 12
+TIME_BUDGET_SECONDS = 16
 
 # Overall cap on how many tweets/replies this scraper will try to collect
 # for one company/handle, sourced from config so it can be tuned without
@@ -358,21 +358,13 @@ def _httpx_preflight_blocked(url: str) -> bool:
 
 
 def _looks_blocked(page) -> bool:
-    """Cheap, instant login-wall/redirect check (no waiting)."""
+    """Return True only for a real login redirect."""
     try:
         url = page.url or ""
     except Exception:
-        url = ""
-    if any(marker in url for marker in _LOGIN_MARKERS):
-        return True
-    # Fall back to a cheap text check for the in-page sign-in prompt X
-    # sometimes shows without changing the URL. Bounded to a tiny amount of
-    # text so this never turns into an expensive full-page scan.
-    try:
-        body_text = page.locator("body").inner_text(timeout=500).lower()
-    except Exception:
         return False
-    return any(marker in body_text for marker in _LOGIN_TEXT_MARKERS)
+
+    return any(marker in url for marker in _LOGIN_MARKERS)
 
 
 def _diagnose_empty_page(page) -> str:
@@ -531,7 +523,7 @@ def _goto_with_retry(page, url: str, *, timeout: int, time_left, retries: int = 
                 attempt + 1, total_attempts, url, remaining, attempt_timeout,
             )
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=attempt_timeout)
+            page.goto(url, wait_until="commit", timeout=attempt_timeout,)
             return True
         except Exception as exc:
             last_exc = exc
@@ -744,176 +736,275 @@ async def scrape_twitter_comments(company_data: Dict[str, str]) -> List[str]:
     target = (
         company_data.get("twitter_url")
         or company_data.get("twitter")
-        or company_data.get("company_name", "")
     )
-    if not target:
-        return []
-
-    url = _profile_url(target)
-    if not url:
-        logger.warning("Twitter/X scrape: could not resolve a usable profile URL from %r.", target)
-        return []
 
     loop = asyncio.get_event_loop()
+
+    if not target:
+        company_name = (company_data.get("company_name") or "").strip()
+        if company_name:
+            try:
+                target = await loop.run_in_executor(
+                    _EXECUTOR, find_social_profile_url, company_name, "twitter",
+                )
+            except Exception:
+                target = ""
+            if target:
+                logger.info(
+                    "Twitter/X scrape: no handle from the site scan; "
+                    "search fallback found %r for %r.", target, company_name,
+                )
+        if not target:
+            logger.info(
+                "Twitter/X scrape: no handle from the site scan and the "
+                "search fallback found nothing for %r; skipping rather "
+                "than guessing a handle from the name.",
+                company_data.get("company_name"),
+            )
+            return []
+
+    url = _profile_url(target)
+
+    if not url:
+        logger.warning(
+            "Twitter/X scrape: could not resolve a usable profile URL from %r.",
+            target,
+        )
+        return []
+
     try:
-        preflight_blocked = await loop.run_in_executor(_EXECUTOR, _httpx_preflight_blocked, url)
+        preflight_blocked = await loop.run_in_executor(
+            _EXECUTOR,
+            _httpx_preflight_blocked,
+            url,
+        )
     except Exception:
         preflight_blocked = False
+
     if preflight_blocked:
         logger.info(
             "Twitter/X scrape: preflight detected a login wall for %s before "
-            "touching the browser pool - returning [] immediately "
-            "(reason=login_wall, no Chromium launch spent on this).", url,
+            "touching the browser pool.",
+            url,
         )
         return []
 
     def _run() -> List[str]:
+
         if sys.platform.startswith("win"):
-            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+            asyncio.set_event_loop_policy(
+                asyncio.WindowsProactorEventLoopPolicy()
+            )
 
         setup_start = time.monotonic()
 
         try:
             context = _ensure_context()
         except Exception:
-            logger.exception("Could not start/obtain a browser context for %r.", url)
+            logger.exception(
+                "Could not start/obtain a browser context for %r.",
+                url,
+            )
             return []
 
         results: List[str] = []
         duplicates_removed = 0
         seen = set()
 
-        def _add(text: str) -> None:
+        def _add(text: str):
             nonlocal duplicates_removed
+
             key = " ".join(text.split()).lower()
+
             if key in seen:
                 duplicates_removed += 1
                 return
+
             seen.add(key)
             results.append(text)
 
         page = None
+
         try:
             page = context.new_page()
             page.set_default_timeout(8000)
 
-            # The internal time budget clock starts here, only AFTER
-            # browser launch, context creation, and page creation have all
-            # finished - not before. Starting the clock earlier (the old
-            # behavior) meant Chromium/context startup time silently ate
-            # into the budget before navigation ever got a chance to run,
-            # which is exactly what produced "Skipping navigation: out of
-            # time budget" before the page had even been opened.
             setup_elapsed = time.monotonic() - setup_start
+
             start = time.monotonic()
             deadline = start + TIME_BUDGET_SECONDS
+
             logger.info(
                 "Twitter/X scrape: browser/context/page setup took %.1fs; "
                 "starting %ds navigation+scrape budget now.",
-                setup_elapsed, TIME_BUDGET_SECONDS,
+                setup_elapsed,
+                TIME_BUDGET_SECONDS,
             )
 
-            def time_left() -> float:
+            def time_left():
                 return deadline - time.monotonic()
 
-            if not _goto_with_retry(
-                page, url, timeout=_adaptive_nav_timeout(time_left), time_left=time_left
-            ):
+            _nav_start = time.monotonic()
+            _nav_ok = _goto_with_retry(
+                page,
+                url,
+                timeout=_adaptive_nav_timeout(time_left),
+                time_left=time_left,
+            )
+            logger.info(
+                "Twitter/X scrape: navigation took %.2fs (ok=%s).",
+                time.monotonic() - _nav_start, _nav_ok,
+            )
+            if not _nav_ok:
                 _save_debug_artifacts(page, url, "nav_failure")
                 return normalize_comments(results)
 
             if _looks_blocked(page):
-                logger.info(
-                    "Twitter/X scrape: redirected to a login wall for %s — "
-                    "stopping immediately instead of waiting it out.", url,
-                )
-                _save_debug_artifacts(page, url, "login_wall", extra={"login_wall_present": "True"})
-                return normalize_comments(results)
+                try:
+                    page.wait_for_selector("article", timeout=5000)
+                    logger.info(
+                        "Login prompt detected, but tweets are visible. Continuing."
+                    )
+                except Exception:
+                    logger.info("Actual login wall detected.")
+                    _save_debug_artifacts(page, url, "login_wall")
+                    return normalize_comments(results)
 
             got_articles = True
+
+            _select_start = time.monotonic()
+
             try:
-                page.wait_for_selector("article", timeout=4000)
-                # Tweets render progressively even after the first
-                # <article> exists (virtualized list), so give the
-                # timeline a brief beat to settle before we start reading
-                # it - this is what avoids treating a half-rendered page
-                # as "no tweets" further down the pipeline.
+                page.wait_for_selector("article", timeout=7000)
                 page.wait_for_timeout(300)
+
             except Exception:
+
                 got_articles = False
+
                 reason = _diagnose_empty_page(page)
+
                 try:
                     title = page.title()
                 except Exception:
                     title = "<unknown>"
+
                 logger.info(
-                    "Twitter/X scrape: no tweets rendered for %s within ~4s "
-                    "(page title: %r). Diagnosis: %s.",
-                    url, title, reason,
+                    "Twitter/X scrape: no tweets rendered for %s "
+                    "(title=%r diagnosis=%s)",
+                    url,
+                    title,
+                    reason,
                 )
 
-            tweet_links: List[str] = []
+            logger.info(
+                "Twitter/X scrape: wait_for_selector(article) took %.2fs (found=%s).",
+                time.monotonic() - _select_start, got_articles,
+            )
+
+            tweet_links = []
+
             if got_articles and time_left() > 2:
+
+                _scroll_start = time.monotonic()
+
                 timeline_texts, tweet_links = _scroll_timeline_until_idle(
-                    page, time_left, MAX_TOTAL_POSTS
+                    page,
+                    time_left,
+                    MAX_TOTAL_POSTS,
                 )
+
+                logger.info(
+                    "Twitter/X scrape: timeline scrolling took %.2fs (collected=%d).",
+                    time.monotonic() - _scroll_start, len(timeline_texts),
+                )
+
                 for t in timeline_texts:
                     _add(t)
 
-            # Open individual tweets (in the order discovered) to pull in
-            # their replies, continuing until we hit the overall cap or run
-            # low on time rather than stopping after a fixed handful.
+            _reply_expand_total = 0.0
+
             for link in tweet_links:
+
                 if len(results) >= MAX_TOTAL_POSTS or time_left() <= 3:
                     break
+
                 try:
-                    if not _goto_with_retry(page, link, timeout=_adaptive_nav_timeout(time_left), time_left=time_left):
+
+                    if not _goto_with_retry(
+                        page,
+                        link,
+                        timeout=_adaptive_nav_timeout(time_left),
+                        time_left=time_left,
+                    ):
                         continue
-                    # Readiness-based wait: return as soon as the tweet's
-                    # own articles (the reply thread) attach instead of
-                    # always sitting out a blind 1000ms first. Capped at
-                    # the same 1000ms, so worst-case time-budget usage is
-                    # unchanged - a fast-rendering tweet page just no
-                    # longer pays the full wait before scrolling starts.
+
                     try:
-                        page.wait_for_selector('article[data-testid="tweet"], article', timeout=1000)
+                        page.wait_for_selector(
+                            'article[data-testid="tweet"], article',
+                            timeout=1000,
+                        )
                     except Exception:
                         pass
+
                     page.mouse.wheel(0, 1200)
                     page.wait_for_timeout(600)
-                    # Expand any publicly-visible "Show more replies" /
-                    # "Continue thread" controls before reading the page,
-                    # so replies collapsed by default aren't missed.
+
+                    _expand_start = time.monotonic()
                     _expand_reply_threads(page, time_left)
+                    _reply_expand_total += time.monotonic() - _expand_start
 
                     remaining = MAX_TOTAL_POSTS - len(results)
+
                     replies_added = 0
+
                     articles = _get_articles(page)
-                    for reply in articles[1:1 + max(remaining, MAX_REPLIES_PER_TWEET)]:
+
+                    for reply in articles[
+                        1 : 1 + max(remaining, MAX_REPLIES_PER_TWEET)
+                    ]:
+
                         if len(results) >= MAX_TOTAL_POSTS:
                             break
+
                         if _is_noise_article(reply):
                             continue
+
                         try:
+
                             text = reply.inner_text()
+
                             if text and len(text.split()) > 4:
+
                                 before = len(results)
+
                                 _add(text)
+
                                 if len(results) > before:
                                     replies_added += 1
+
                         except Exception:
                             continue
+
                     logger.info(
-                        "Twitter/X scrape: tweet=%s contributed %d new repl(y/ies); "
-                        "running total=%d/%d.",
-                        link, replies_added, len(results), MAX_TOTAL_POSTS,
+                        "Twitter/X scrape: tweet=%s contributed %d replies.",
+                        link,
+                        replies_added,
                     )
+
                 except Exception:
                     continue
 
+            logger.info(
+                "Twitter/X scrape: reply expansion took %.2fs total across %d link(s).",
+                _reply_expand_total, len(tweet_links),
+            )
+
             if not results:
                 _save_debug_artifacts(
-                    page, url, "zero_tweets",
+                    page,
+                    url,
+                    "zero_tweets",
                     extra={
                         "login_wall_present": str(_looks_blocked(page)),
                         "articles_exist": str(len(_get_articles(page)) > 0),
@@ -922,6 +1013,7 @@ async def scrape_twitter_comments(company_data: Dict[str, str]) -> List[str]:
                 )
 
         finally:
+
             if page is not None:
                 try:
                     page.close()
@@ -929,19 +1021,38 @@ async def scrape_twitter_comments(company_data: Dict[str, str]) -> List[str]:
                     pass
 
         final = normalize_comments(results)[:MAX_TOTAL_POSTS]
+
         elapsed = time.monotonic() - start
+
         logger.info(
             "Twitter/X posts for %s: raw=%d duplicates_removed=%d final=%d "
-            "elapsed=%.1fs (cap=%d).",
-            url, len(results), duplicates_removed, len(final), elapsed,
-            MAX_TOTAL_POSTS,
+            "elapsed=%.1fs",
+            url,
+            len(results),
+            duplicates_removed,
+            len(final),
+            elapsed,
         )
+
+        logger.info(
+            "Twitter/X scrape: total scraper runtime %.2fs (setup+navigation+scrape).",
+            time.monotonic() - setup_start,
+        )
+
         logger.info("Twitter returned %d posts", len(final))
+
         return final
 
-    loop = asyncio.get_event_loop()
+    logger.info("Twitter: submitting _run() to executor")
+
     try:
-        return await loop.run_in_executor(_EXECUTOR, _run)
+        result = await loop.run_in_executor(_EXECUTOR, _run)
+        logger.info("Twitter: executor returned %d posts", len(result))
+        return result
+
     except Exception:
-        logger.exception("Unhandled error scraping Twitter/X comments for %r.", url)
+        logger.exception(
+            "Unhandled error scraping Twitter/X comments for %r.",
+            url,
+        )
         return []

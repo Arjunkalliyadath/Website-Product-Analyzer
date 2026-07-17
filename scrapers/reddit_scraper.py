@@ -376,22 +376,37 @@ def _build_search_tiers(company_name: str, product_name: str, product_brand: str
 
 
 def _scrape_sync(company_name: str, product_name: str, product_brand: str) -> List[RedditComment]:
+    # Record the start time to enforce the overall scraping time limit
     start = time.monotonic()
 
+    # Returns the remaining time available for scraping
     def time_left() -> float:
         return TIME_BUDGET_SECONDS - (time.monotonic() - start)
 
+    # Generate different search queries (tiers) to maximize the chance of finding discussions
     tiers = _build_search_tiers(company_name, product_name, product_brand)
+
+    # Stores all collected comments
     collected: List[RedditComment] = []
+
+    # Used to prevent duplicate comments
     seen_keys: set = set()
+
+    # Tracks which search tier successfully returned comments
     source = "none"
 
+    # Try each search tier until comments are found or time runs out
     for label, query in tiers:
+
+        # Stop trying new search queries if there isn't enough time left
         if time_left() <= _MIN_TIME_FOR_ANOTHER_TIER_SECONDS:
             logger.info("Reddit scrape: skipping tier %r - out of time budget.", label)
             break
 
+        # Search Reddit for posts matching the current query
         posts, working_domain = _search_reddit(query, time_left())
+
+        # Skip to the next search tier if no posts were found
         if not posts:
             logger.info("Reddit scrape: tier %r search (%r) found 0 discussion posts.", label, query)
             continue
@@ -401,33 +416,60 @@ def _scrape_sync(company_name: str, product_name: str, product_brand: str) -> Li
             "fetching comments.", label, query, len(posts),
         )
 
+        # Stores comments collected from the current search tier
         tier_comments: List[RedditComment] = []
+
+        # Fetch comments from each Reddit post
         for post in posts:
+
+            # Stop processing if the remaining time is very low
             if time_left() <= _MIN_TIME_FOR_ANOTHER_TIER_SECONDS / 2:
                 break
+
             subreddit = post.get("subreddit", "")
             post_id = post.get("id", "")
             title = post.get("title", "")
+
+            # Skip invalid posts
             if not subreddit or not post_id:
                 continue
 
-            comments = _fetch_post_comments(working_domain, subreddit, post_id, title, time_left())
+            # Retrieve comments from the current Reddit post
+            comments = _fetch_post_comments(
+                working_domain,
+                subreddit,
+                post_id,
+                title,
+                time_left(),
+            )
+
+            # Small delay between requests to avoid sending requests too quickly
             time.sleep(_REQUEST_DELAY_SECONDS)
 
+            # Add only unique comments
             for c in comments:
                 key = c.comment_text.strip().lower()
+
                 if not key or key in seen_keys:
                     continue
+
                 seen_keys.add(key)
                 tier_comments.append(c)
 
+            # Stop collecting once the maximum comment limit is reached
             if len(collected) + len(tier_comments) >= MAX_TOTAL_COMMENTS:
                 break
 
+        # If this search tier returned comments, stop trying lower-priority tiers
         if tier_comments:
             collected.extend(tier_comments)
             source = label
-            logger.info("Reddit scrape: tier %r succeeded with %d comment(s).", label, len(tier_comments))
+
+            logger.info(
+                "Reddit scrape: tier %r succeeded with %d comment(s).",
+                label,
+                len(tier_comments),
+            )
             break
 
         logger.info(
@@ -435,11 +477,21 @@ def _scrape_sync(company_name: str, product_name: str, product_brand: str) -> Li
             label,
         )
 
+    # Calculate the total scraping time
     elapsed = time.monotonic() - start
+
+    # Log the final scraping summary
     logger.info(
         "Reddit comments for company=%r product=%r: source=%s collected=%d elapsed=%.1fs (cap=%d).",
-        company_name, product_name, source, len(collected), elapsed, MAX_TOTAL_COMMENTS,
+        company_name,
+        product_name,
+        source,
+        len(collected),
+        elapsed,
+        MAX_TOTAL_COMMENTS,
     )
+
+    # Return the collected comments, limited to the maximum allowed
     return collected[:MAX_TOTAL_COMMENTS]
 
 

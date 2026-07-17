@@ -1,3 +1,92 @@
+"""
+Module Name
+    app.py — ManobhavaAI Social Media Product Intelligence Service
+
+Purpose
+    FastAPI backend that turns a company website URL into a multi-platform
+    Product Intelligence report: it discovers a company's products, scrapes
+    reviews/comments about them from Google, Twitter, Instagram, YouTube,
+    Reddit and the company's own website, runs sentiment and aspect
+    analysis over the results, and renders both an interactive dashboard
+    and a downloadable PDF report.
+
+Responsibilities
+    - Resolve a submitted company name/URL into normalized website metadata
+      (logo, social handles, etc.) via company_discovery.
+    - Discover a company's product catalogue via product_discovery, and let
+      the user hand-pick which products to analyze when there are many.
+    - Fan out concurrent, time-bounded scraping jobs per platform per
+      product (Google Reviews, Twitter, Instagram, YouTube, Reddit,
+      website reviews), each guarded by its own semaphore and hard
+      timeout so no single platform can block the whole request.
+    - Clean, deduplicate, and batch-run sentiment analysis (sentiment.py)
+      over every collected comment, then aggregate positive/negative/
+      neutral statistics per product, per platform, and for brand-wide
+      ("General") mentions separately (Brand Reputation vs Product
+      Intelligence).
+    - Derive aspect-level sentiment (aspect_intelligence.py), a Confidence
+      Score, and a Buying Recommendation per product and overall, purely
+      from already-computed aggregates.
+    - Generate a narrative executive summary and a branded multi-page PDF
+      report (reportlab), and render the results dashboard (Jinja2).
+
+Architecture
+    - Two parallel entry points share an identical scrape -> sentiment ->
+      aggregate -> summarize -> PDF -> dashboard pipeline:
+        * POST /analyze          — auto-discovered products (<=10).
+        * POST /analyze_selected — user-selected products from
+          select_products.html (also enriches via product_intelligence.py
+          and scrapes each product's own page for reviews).
+    - POST /discover_products lets a user browse/select from the full
+      catalogue regardless of size; GET /discover exposes metadata
+      resolution as a small JSON API; GET /download/{path} serves
+      generated export files.
+    - A dedicated single-worker ThreadPoolExecutor runs the (synchronous)
+      sentiment pipeline off the asyncio event loop; it is preloaded once
+      at startup so the first real request doesn't pay the model-load cost.
+    - Per-request stage timing/logging is provided by the shared
+      _make_pipeline_profiler() factory, used identically by both
+      /analyze and /analyze_selected.
+    - A collection of module-level helper functions (prefixed with `_`)
+      implement the aggregation, confidence-scoring, recommendation, and
+      PDF-rendering logic as small, independently testable units that only
+      ever read data already computed earlier in the pipeline.
+
+Major Functions
+    - analyze() / analyze_selected(): the two main request handlers
+      implementing the full scrape -> sentiment -> report pipeline.
+    - discover_products_endpoint() / discover(): product/metadata
+      discovery endpoints used ahead of a full analysis.
+    - _aggregate_by_key(), _compute_overall_stats(),
+      _aggregate_brand_reputation(): sentiment aggregation helpers.
+    - _compute_confidence_score(), _compute_buying_recommendation():
+      Confidence Score and Buying Recommendation computation.
+    - generate_summary(): builds the narrative executive summary and
+      per-product summaries shown on the dashboard and PDF.
+    - generate_pdf_report(): renders the branded, multi-section PDF report.
+
+Inputs
+    - HTML form fields: company_name (a website URL) for /analyze and
+      /discover_products; website + selected_products (a JSON array of
+      product objects) for /analyze_selected.
+    - Query parameter: website for GET /discover.
+    - Configuration constants from config.py (scrape volume caps, timeouts,
+      concurrency limits, blacklist/prominence/feature keyword lists).
+
+Outputs
+    - Rendered HTML (index.html, select_products.html, dashboard.html) via
+      Jinja2Templates.
+    - JSON metadata from GET /discover.
+    - Generated PDF/CSV/Excel export files served from /downloads.
+
+Dependencies
+    - FastAPI, Jinja2, pandas, reportlab.
+    - Local modules: config, company_discovery, product_discovery,
+      product_intelligence, aspect_intelligence, sentiment, url_utils,
+      utils, and the scrapers.* package (google/twitter/instagram/
+      youtube/reddit/website_review scrapers).
+"""
+
 import asyncio
 import concurrent.futures
 import json
@@ -39,9 +128,6 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-# --- PDF report generation (reportlab only) --------------------------------
-# Purely additive: used only by generate_pdf_report() below. Does not touch
-# any existing scraping, sentiment, discovery, or dashboard-calculation code.
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY
 from reportlab.lib.pagesizes import A4
@@ -64,7 +150,7 @@ from company_discovery import extract_website_metadata
 from product_discovery import discover_products
 from product_intelligence import build_product_intelligence_batch
 from aspect_intelligence import build_aspect_intelligence_by_product
-from sentiment import analyze_sentiment, analyze_sentiment_batch, get_sentiment_pipeline
+from sentiment import analyze_sentiment_batch, get_sentiment_pipeline
 from url_utils import derive_company_name, is_url, normalize_url
 from utils import clean_comment, normalize_text, remove_links, unique_comments
 from scrapers.google_scraper import scrape_google_reviews
@@ -78,15 +164,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-# ============================================================================
-# Product-centric selection model
-# ----------------------------------------------------------------------------
-# Everything downstream of Product Discovery now revolves around this object
-# instead of a bare product-name string. select_products.html serializes one
-# of these (as JSON) per checked card; analyze_selected() parses them back
-# into SelectedProduct instances so every future scraper can be handed the
-# full object (name/url/brand/image/category) instead of just a name.
-# ============================================================================
 @dataclass
 class SelectedProduct:
     name: str
@@ -100,13 +177,6 @@ class SelectedProduct:
 
 
 def _parse_selected_products(raw: str) -> List[SelectedProduct]:
-    """Parse the JSON array of product objects posted by select_products.html.
-
-    Accepts a JSON list of objects shaped like:
-        {"name": "...", "url": "...", "brand": "...", "image": "...", "category": "..."}
-    De-duplicates by URL (falling back to name when a product has no URL) and
-    drops any entry without at least a name.
-    """
     try:
         parsed = json.loads(raw) if raw else []
     except (TypeError, ValueError):
@@ -151,44 +221,7 @@ app.mount("/downloads", StaticFiles(directory=str(DOWNLOADS_DIR)), name="downloa
 
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
-# NOTE: sentiment-pipeline loading used to be duplicated here (a second,
-# ad-hoc `get_sentiment_pipeline()` that called `transformers.pipeline(...)`
-# directly, with its own `_patch_ssl_compatibility()` helper). That copy
-# never forced offline mode, so every analysis run paid for a real
-# HEAD-request attempt to huggingface.co (and its full retry/backoff
-# sequence) before falling back to the local cache. The single, real
-# loader — the one that actually forces offline mode and never touches the
-# network — now lives exclusively in sentiment.py and is imported above.
-# See sentiment.get_sentiment_pipeline() for the loading logic itself.
 
-# ============================================================================
-# Sentiment pipeline: startup preload + off-event-loop execution
-# ----------------------------------------------------------------------------
-# get_sentiment_pipeline()/analyze_sentiment_batch() are unchanged (still
-# imported from sentiment.py, same signatures, same behavior). What changes
-# here is WHEN the pipeline is first loaded and WHERE both calls run:
-#
-#   - Previously, get_sentiment_pipeline() was only ever called from inside
-#     an /analyze or /analyze_selected request, synchronously, directly on
-#     the asyncio event loop. The very first analysis after every process
-#     start (or every --reload restart in dev) therefore paid the full
-#     model-load cost (~24s observed) as part of that user's request, and
-#     did so while blocking the event loop - no other request of any kind
-#     (including a second, unrelated user's request) could be served for
-#     that entire window.
-#
-#   - Now: (1) a startup event eagerly calls the existing loader once,
-#     before any request arrives, so the first real request never pays
-#     that cost; and (2) both call sites hand the (already-imported,
-#     unmodified) get_sentiment_pipeline/analyze_sentiment_batch functions
-#     to a dedicated single-worker ThreadPoolExecutor via
-#     loop.run_in_executor() instead of calling them directly. A
-#     single-worker pool keeps sentiment access serialized across
-#     concurrent requests - the same access pattern the pipeline already
-#     had when every call ran on the one event loop thread - while moving
-#     the blocking work off the event loop, so unrelated request handling
-#     (routing, static files, other in-flight scrapers) is never frozen by
-#     it.
 _SENTIMENT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     max_workers=1, thread_name_prefix="sentiment_pipeline"
 )
@@ -201,9 +234,6 @@ async def _preload_sentiment_pipeline() -> None:
     try:
         await loop.run_in_executor(_SENTIMENT_EXECUTOR, get_sentiment_pipeline)
     except Exception:
-        # Preloading is a pure optimization - if it fails for any reason,
-        # fall back silently to the existing behavior (lazy load on first
-        # request), rather than preventing the app from starting.
         logger.exception(
             "Sentiment pipeline preload failed at startup; it will be "
             "loaded lazily on the first request instead."
@@ -220,32 +250,18 @@ async def _preload_sentiment_pipeline() -> None:
 def index(request: Request):
     return templates.TemplateResponse(request=request, name="index.html", context={})
 
-@app.post("/analyze")
-async def analyze(request: Request, company_name: str = Form(...)):
-    # === Performance profiling instrumentation ===================
-    # Timing-only additions. No business logic, algorithms, or
-    # function signatures below are modified by this instrumentation.
+def _make_pipeline_profiler():
     pipeline_start = time.perf_counter()
     stage_times: Dict[str, float] = {}
 
-    def _log_stage(name: str, elapsed: float) -> None:
+    def log_stage(name: str, elapsed: float) -> None:
         stage_times[name] = stage_times.get(name, 0.0) + elapsed
         logger.info(
             "\n%s\nStage: %s\nTime: %.2f sec\n%s",
             "=" * 50, name, elapsed, "=" * 50,
         )
 
-    async def _timed(name: str, coro, timeout: float = None):
-        # Hard per-scraper cutoff (requirement: no platform may block the
-        # whole pipeline). Each scraper carries its own internal time
-        # budget and is *intended* to return gracefully with partial
-        # results before this fires - but if this outer timeout fires
-        # first, asyncio.wait_for() cancels the awaited coroutine and we
-        # return [] here; nothing partial is retrieved from it. This is a
-        # true last-resort backstop, not a mechanism for getting partial
-        # results - see GOOGLE_JOB_TIMEOUT_SECONDS etc. above for why each
-        # value is now sized to comfortably exceed setup_time + that
-        # scraper's own internal budget.
+    async def timed(name: str, coro, timeout: float = None):
         _start = time.perf_counter()
         try:
             if timeout is not None:
@@ -262,9 +278,9 @@ async def analyze(request: Request, company_name: str = Form(...)):
                     return []
             return await coro
         finally:
-            _log_stage(name, time.perf_counter() - _start)
+            log_stage(name, time.perf_counter() - _start)
 
-    def _log_total_and_breakdown() -> None:
+    def log_total_and_breakdown() -> None:
         total_elapsed = time.perf_counter() - pipeline_start
         logger.info(
             "\n==========================\nTOTAL EXECUTION TIME\n==========================\n%.2f sec",
@@ -276,7 +292,13 @@ async def analyze(request: Request, company_name: str = Form(...)):
                 pct = (elapsed / total_elapsed) * 100
                 breakdown.append(f"  {stage_name}: {pct:.1f}%")
             logger.info("\n".join(breakdown))
-    # === end instrumentation setup =================================
+
+    return log_stage, timed, log_total_and_breakdown
+
+
+@app.post("/analyze")
+async def analyze(request: Request, company_name: str = Form(...)):
+    _log_stage, _timed, _log_total_and_breakdown = _make_pipeline_profiler()
 
     company_name = company_name.strip()
     if not company_name:
@@ -288,10 +310,6 @@ async def analyze(request: Request, company_name: str = Form(...)):
     try:
         _stage_start = time.perf_counter()
 
-        # --- Website URL is now the single source of truth. -------------
-        # Company Discovery (name -> guessed website via search) has been
-        # removed. If the input isn't already a URL, we ask for one rather
-        # than trying to guess a website from a name.
         if not is_url(company_name):
             return templates.TemplateResponse(
                 request=request, name="index.html",
@@ -336,9 +354,6 @@ async def analyze(request: Request, company_name: str = Form(...)):
         logger.info("Website metadata resolved: %s", company_data)
         _log_stage("Website Metadata Extraction", time.perf_counter() - _stage_start)
 
-        # From here on, `company_name` mirrors the resolved/derived name so
-        # every downstream step (Product Discovery, scraping, Sentiment,
-        # Dashboard, exports) behaves exactly as it did before — unchanged.
         company_name = company_data["company_name"]
 
         _stage_start = time.perf_counter()
@@ -372,27 +387,12 @@ async def analyze(request: Request, company_name: str = Form(...)):
             product_company_data["company_name"] = f"{company_data['company_name']} {product}"
             google_jobs.append({"label": product, "data": product_company_data})
 
-        # YouTube jobs mirror google_jobs' "General + one per product"
-        # shape, but keep `company_name` un-concatenated (it doubles as the
-        # brand term for the scraper's "<brand> <product> review" search
-        # tier) and instead pass the bare product name separately via
-        # `product_name`, which the scraper reads to drive its
-        # product-centric search priority order. A job with no
-        # `product_name` (the "General" entry) gets exactly today's
-        # behavior from the scraper: straight to the official channel.
         youtube_jobs: List[Dict[str, Any]] = [{"label": "General", "data": company_data}]
         for product in scrape_targets:
             yt_product_data = dict(company_data)
             yt_product_data["product_name"] = product
             youtube_jobs.append({"label": product, "data": yt_product_data})
 
-        # Reddit jobs mirror youtube_jobs' "General + one per product"
-        # shape and the same "bare company_name + separate product_name"
-        # data contract, since reddit_scraper.py's product-centric search
-        # priority order (Product -> Brand+Product -> Company+Product) is
-        # driven by exactly those two fields. A job with no `product_name`
-        # (the "General" entry) gets the scraper's plain company-name
-        # search instead of the product-tiered one.
         reddit_jobs: List[Dict[str, Any]] = [{"label": "General", "data": company_data}]
         for product in scrape_targets:
             reddit_product_data = dict(company_data)
@@ -400,40 +400,12 @@ async def analyze(request: Request, company_name: str = Form(...)):
             reddit_jobs.append({"label": product, "data": reddit_product_data})
 
         google_semaphore = asyncio.Semaphore(config.MAX_PARALLEL_TASKS)
-        # Bounded to the YouTube scraper's own browser-pool size rather than
-        # config.MAX_PARALLEL_TASKS: that pool (not this semaphore) is the
-        # real concurrency limit, so sizing the semaphore to match keeps
-        # every job's asyncio.wait_for clock from starting before a browser
-        # worker is actually available to run it.
         youtube_semaphore = asyncio.Semaphore(MAX_BROWSER_WORKERS)
-        # Same reasoning as youtube_semaphore above, sized to Reddit's own
-        # (deliberately small) worker pool instead of config.MAX_PARALLEL_TASKS,
-        # since Reddit's public JSON endpoints rate-limit unauthenticated
-        # clients more aggressively than a generic concurrency cap would allow for.
         reddit_semaphore = asyncio.Semaphore(MAX_REDDIT_WORKERS)
 
-        # Hard per-platform ceilings. Each scraper's own internal time
-        # budget is set a few seconds below these so it returns naturally
-        # with partial results; these are the outer safety-net cutoffs
-        # that guarantee no single platform can block the whole request.
-        #
-        # ROOT-CAUSE FIX: each scraper's internal TIME_BUDGET_SECONDS clock
-        # only starts AFTER browser/context/page setup finishes (setup is
-        # commonly 6-8s, observed up to 7.8s in production logs), but this
-        # asyncio.wait_for's clock starts the instant the coroutine is
-        # scheduled - i.e. it includes setup time. The previous values
-        # (30/20/20/20) were below setup_time + internal_budget for every
-        # browser scraper, so this outer timeout fired first on essentially
-        # every real run, before the scraper's own graceful tier-fallback
-        # logic ever got a chance to finish - guaranteeing empty results
-        # regardless of whether the platform actually had data available.
-        # Each value below is sized to setup_time + that scraper's own
-        # TIME_BUDGET_SECONDS + a margin for post-timeout exception/logging
-        # overhead. Revisit if setup time grows further (e.g. more
-        # concurrent Chromium instances competing for CPU).
         GOOGLE_JOB_TIMEOUT_SECONDS = 48
-        TWITTER_TIMEOUT_SECONDS = 26
-        INSTAGRAM_TIMEOUT_SECONDS = 26
+        TWITTER_TIMEOUT_SECONDS = 32
+        INSTAGRAM_TIMEOUT_SECONDS = 34
         YOUTUBE_TIMEOUT_SECONDS = 30
         REDDIT_TIMEOUT_SECONDS = 20
 
@@ -457,13 +429,6 @@ async def analyze(request: Request, company_name: str = Form(...)):
                     )
                     return []
                 except asyncio.CancelledError:
-                    # Defense-in-depth: scrape_google_reviews() already shields
-                    # the shared background scrape from any single caller's
-                    # cancellation and swallows this itself, but we catch it
-                    # here too so a CancelledError can never reach
-                    # asyncio.gather()'s results list below - it isn't an
-                    # Exception subclass, so isinstance(outcome, Exception)
-                    # would otherwise miss it and crash on list(outcome).
                     logger.warning("Google Reviews job for %r was cancelled", job.get("label"))
                     return []
                 except Exception:
@@ -471,10 +436,6 @@ async def analyze(request: Request, company_name: str = Form(...)):
                     return []
 
         async def _scrape_google_jobs_group() -> List[Any]:
-            # Wraps the whole Google job set (General + per-product, still
-            # bounded by the same semaphore) so we get one wall-clock timing
-            # for the "Google Review Collection" stage without altering how
-            # the individual jobs are scheduled or their results.
             _group_start = time.perf_counter()
             try:
                 return await asyncio.gather(
@@ -510,12 +471,7 @@ async def analyze(request: Request, company_name: str = Form(...)):
                     logger.exception("YouTube Scraper job for %r failed", job.get("label"))
                     return []
 
-        async def _scrape_youtube_jobs_group() -> List[str]:
-            # Same "General + one per product" job pattern as Google above,
-            # but merged (deduplicated) back into a single flat comment
-            # list here, since downstream (sentiment/dashboard/PDF) still
-            # expects one "YouTube" comment list, not a per-product
-            # breakdown - identical output shape to before this change.
+        async def _scrape_youtube_jobs_group() -> List[Dict[str, Any]]:
             _group_start = time.perf_counter()
             try:
                 per_job_results = await asyncio.gather(
@@ -524,17 +480,19 @@ async def analyze(request: Request, company_name: str = Form(...)):
                 )
             finally:
                 _log_stage("YouTube Scraper", time.perf_counter() - _group_start)
-            merged: List[str] = []
             seen_keys: set = set()
-            for outcome in per_job_results:
+            by_product: List[Dict[str, Any]] = []
+            for job, outcome in zip(youtube_jobs, per_job_results):
                 comments = list(outcome) if not isinstance(outcome, BaseException) else []
+                deduped: List[str] = []
                 for c in comments:
                     key = c.strip().lower()
                     if not key or key in seen_keys:
                         continue
                     seen_keys.add(key)
-                    merged.append(c)
-            return merged
+                    deduped.append(c)
+                by_product.append({"product": job["label"], "comments": deduped})
+            return by_product
 
         async def _scrape_reddit_job(job: Dict[str, Any]) -> List[str]:
             async with reddit_semaphore:
@@ -558,11 +516,7 @@ async def analyze(request: Request, company_name: str = Form(...)):
                     logger.exception("Reddit Scraper job for %r failed", job.get("label"))
                     return []
 
-        async def _scrape_reddit_jobs_group() -> List[str]:
-            # Same "General + one per product" job pattern as Google/YouTube
-            # above, merged (deduplicated) back into a single flat comment
-            # list here, since downstream (sentiment/dashboard/PDF) expects
-            # one "Reddit" comment list, not a per-product breakdown.
+        async def _scrape_reddit_jobs_group() -> List[Dict[str, Any]]:
             _group_start = time.perf_counter()
             try:
                 per_job_results = await asyncio.gather(
@@ -571,17 +525,19 @@ async def analyze(request: Request, company_name: str = Form(...)):
                 )
             finally:
                 _log_stage("Reddit Scraper", time.perf_counter() - _group_start)
-            merged: List[str] = []
             seen_keys: set = set()
-            for outcome in per_job_results:
+            by_product: List[Dict[str, Any]] = []
+            for job, outcome in zip(reddit_jobs, per_job_results):
                 comments = list(outcome) if not isinstance(outcome, BaseException) else []
+                deduped: List[str] = []
                 for c in comments:
                     key = c.strip().lower()
                     if not key or key in seen_keys:
                         continue
                     seen_keys.add(key)
-                    merged.append(c)
-            return merged
+                    deduped.append(c)
+                by_product.append({"product": job["label"], "comments": deduped})
+            return by_product
 
         results = await asyncio.gather(
             _scrape_google_jobs_group(),
@@ -593,25 +549,33 @@ async def analyze(request: Request, company_name: str = Form(...)):
         )
 
         google_results = results[0]
-        twitter_comments, instagram_comments, youtube_comments, reddit_comments = (
-            results[1], results[2], results[3], results[4],
-        )
+        twitter_comments, instagram_comments = results[1], results[2]
+        youtube_by_product: List[Dict[str, Any]] = results[3] if not isinstance(results[3], BaseException) else []
+        reddit_by_product: List[Dict[str, Any]] = results[4] if not isinstance(results[4], BaseException) else []
 
         google_by_product: List[Dict[str, Any]] = []
         google_all_comments: List[str] = []
         for job, outcome in zip(google_jobs, google_results):
             comments = list(outcome) if not isinstance(outcome, BaseException) else []
-
             comments = comments[:config.MAX_COMMENTS_PER_PRODUCT]
             google_by_product.append({"product": job["label"], "comments": comments})
             google_all_comments.extend(comments)
+
+        youtube_all_comments: List[str] = []
+        for entry in youtube_by_product:
+            youtube_all_comments.extend(entry["comments"])
+
+        reddit_all_comments: List[str] = []
+        for entry in reddit_by_product:
+            reddit_all_comments.extend(entry["comments"])
 
         platform_comments = {
             "Google":    google_all_comments,
             "Twitter":   list(twitter_comments)   if not isinstance(twitter_comments,   BaseException) else [],
             "Instagram": list(instagram_comments) if not isinstance(instagram_comments, BaseException) else [],
-            "YouTube":   list(youtube_comments)   if not isinstance(youtube_comments,   BaseException) else [],
-            "Reddit":    list(reddit_comments)    if not isinstance(reddit_comments,    BaseException) else [],
+            "YouTube":   youtube_all_comments,
+            "Reddit":    reddit_all_comments,
+            "Website":   [],
         }
 
         comment_product_lookup: Dict[str, str] = {}
@@ -619,10 +583,27 @@ async def analyze(request: Request, company_name: str = Form(...)):
             for comment in entry["comments"]:
                 comment_product_lookup.setdefault(comment, entry["product"])
 
+        youtube_product_lookup: Dict[str, str] = {}
+        for entry in youtube_by_product:
+            for comment in entry["comments"]:
+                youtube_product_lookup.setdefault(comment, entry["product"])
+
+        reddit_product_lookup: Dict[str, str] = {}
+        for entry in reddit_by_product:
+            for comment in entry["comments"]:
+                reddit_product_lookup.setdefault(comment, entry["product"])
+
+        platform_product_lookups = {
+            "Google": comment_product_lookup,
+            "YouTube": youtube_product_lookup,
+            "Reddit": reddit_product_lookup,
+        }
+
         combined = []
         for platform, comments in platform_comments.items():
+            lookup = platform_product_lookups.get(platform, {})
             for comment in comments:
-                product_label = comment_product_lookup.get(comment, "General") if platform == "Google" else "General"
+                product_label = lookup.get(comment, "General")
                 cleaned = normalize_text(remove_links(clean_comment(comment)))
                 if cleaned:
                     combined.append((platform, cleaned, product_label))
@@ -635,13 +616,6 @@ async def analyze(request: Request, company_name: str = Form(...)):
         _sentiment_loop = asyncio.get_running_loop()
         pipe = await _sentiment_loop.run_in_executor(_SENTIMENT_EXECUTOR, get_sentiment_pipeline)
 
-        # Batched sentiment call: one (chunked) pass over all unique comments
-        # instead of one pipeline call per comment. analyze_sentiment_batch()
-        # returns sentiments in the same order as `unique`, with identical
-        # label mapping / keyword fallback semantics to analyze_sentiment().
-        # Run via the same dedicated executor as the preload above, so this
-        # (still synchronous, still unmodified) call runs off the event
-        # loop instead of blocking it.
         comment_texts = [comment for _, comment in unique]
         sentiments = await _sentiment_loop.run_in_executor(
             _SENTIMENT_EXECUTOR, analyze_sentiment_batch, pipe, comment_texts
@@ -664,12 +638,6 @@ async def analyze(request: Request, company_name: str = Form(...)):
         if df.empty:
             df = pd.DataFrame(columns=["comment", "platform", "sentiment", "product", "timestamp"])
 
-        # --- Product Intelligence split -------------------------------
-        # product_rows: comments tied to one of the user's selected products.
-        # brand_rows: everything else (base Google Maps/business search +
-        # all Twitter/Instagram/YouTube comments, none of which are scraped
-        # per-product) — this becomes the separate Brand Reputation block
-        # instead of being blended into product-centric metrics.
         product_rows, brand_rows = _split_product_and_brand_rows(comment_rows)
 
         overall_stats = _compute_overall_stats(product_rows)
@@ -686,27 +654,12 @@ async def analyze(request: Request, company_name: str = Form(...)):
         platform_sentiment = _aggregate_by_key(product_rows, "platform")
         brand_reputation = _aggregate_brand_reputation(brand_rows)
 
-        # --- Aspect Intelligence (Phase 1) --------------------------------
-        # Per-product aspect extraction + per-aspect sentiment + aspect
-        # score/frequency/importance, computed only over product_rows
-        # (never brand_rows) so Brand Reputation stays completely separate
-        # from product-level aspect data, mirroring the existing
-        # product_sentiment/brand_reputation split above. Purely additive -
-        # never raises, never alters comment_rows/product_sentiment/
-        # brand_reputation/summary/PDF below.
         try:
             aspect_intelligence = build_aspect_intelligence_by_product(product_rows, pipe=pipe)
         except Exception:
             logger.exception("Aspect intelligence build failed for %s", company_name)
             aspect_intelligence = {}
 
-        # --- Confidence Score + Buying Recommendation (additive) ----------
-        # Reads only what's already been computed above (product_sentiment,
-        # platform_sentiment, aspect_intelligence). Never recomputes
-        # sentiment/aspects; degrades to "No Data"/"Not Enough Data" rather
-        # than raising, mirroring the try/except around aspect_intelligence
-        # just above. Does not alter product_sentiment/platform_sentiment/
-        # aspect_intelligence themselves.
         try:
             platforms_covered_count = len([p for p, c in platform_comments.items() if c])
             overall_platform_agreement = _platform_agreement(platform_sentiment)
@@ -791,16 +744,12 @@ async def analyze(request: Request, company_name: str = Form(...)):
 
         insight_tabs = _build_insight_tabs(product_rows, platform_comments)
 
-        # Title shown on the dashboard/PDF: the selected product names,
-        # not the company name (Product Intelligence, not Company Sentiment).
         product_title = ", ".join(scrape_targets) if scrape_targets else company_name
 
         export_base = Path("downloads") / f"{re.sub(r'[^a-zA-Z0-9]+', '_', company_name).strip('_').lower()}"
         export_base.mkdir(parents=True, exist_ok=True)
         _log_stage("Report Generation", time.perf_counter() - _stage_start)
 
-        # Human-readable "Report Generated" stamp for the dashboard header.
-        # Purely additive — does not alter any existing field or API shape.
         report_generated = datetime.utcnow().strftime("%B %d, %Y at %H:%M UTC")
 
         platform_counts = {
@@ -808,10 +757,10 @@ async def analyze(request: Request, company_name: str = Form(...)):
             "Twitter":   len(platform_comments["Twitter"]),
             "Instagram": len(platform_comments["Instagram"]),
             "YouTube":   len(platform_comments["YouTube"]),
+            "Reddit":    len(platform_comments["Reddit"]),
+            "Website":   len(platform_comments["Website"]),
         }
 
-        # --- Professional PDF Report (additive; failure never breaks the
-        # dashboard — CSV/Excel/JSON exports above are unaffected either way).
         pdf_path_str = ""
         try:
             pdf_path = generate_pdf_report(
@@ -857,14 +806,7 @@ async def analyze(request: Request, company_name: str = Form(...)):
                 "product_sentiment": product_sentiment,
                 "platform_sentiment": platform_sentiment,
                 "brand_reputation": brand_reputation,
-                # Additive (Phase 1): per-product aspect extraction +
-                # per-aspect sentiment + aspect score/frequency/importance,
-                # derived from product_rows only. Existing keys above/below
-                # are all unchanged.
                 "aspect_intelligence": aspect_intelligence,
-                # --- Additive (Phase 2): Confidence Score + Buying
-                # Recommendation (overall + per selected product). All
-                # existing keys above/below are unchanged.
                 "confidence_score":     confidence_score,
                 "buying_recommendation": overall_buying_recommendation,
                 "product_recommendations": product_recommendations,
@@ -892,7 +834,7 @@ async def analyze(request: Request, company_name: str = Form(...)):
         _log_stage("Dashboard Rendering", time.perf_counter() - _stage_start)
         return response
 
-    except Exception as exc:
+    except Exception:
         logger.exception("Analysis failed")
         _empty_summary = {
             "executive_summary": "Analysis unavailable due to an error.",
@@ -908,7 +850,6 @@ async def analyze(request: Request, company_name: str = Form(...)):
             "recommendations":         [],
             "product_summaries":       [],
             "brand_reputation_summary": "No brand-wide (non-product) reviews were collected for this run.",
-            # --- Additive (Phase 2) defaults for error path -------------
             "best_aspects": [], "worst_aspects": [],
             "confidence_score": {"score": 0, "label": "No Data", "css_class": "no-data"},
             "buying_recommendation": {
@@ -965,10 +906,6 @@ async def analyze(request: Request, company_name: str = Form(...)):
         _log_total_and_breakdown()
 @app.post("/discover_products")
 async def discover_products_endpoint(request: Request, company_name: str = Form(...)):
-    # Mirrors the URL-validation prologue of /analyze exactly, then stops
-    # right after Product Discovery so the user can hand-pick products —
-    # regardless of how many were found — instead of only being routed
-    # here automatically when the count exceeds 10.
     company_name = company_name.strip()
     if not company_name:
         return templates.TemplateResponse(
@@ -1022,14 +959,6 @@ async def discover_products_endpoint(request: Request, company_name: str = Form(
 
         product_data = await discover_products(company_data)
 
-        # --- Product-URL-centric discovery output ------------------------
-        # discover_products() already builds a full catalogue (name, url,
-        # image, brand, category, ...) internally; previously only bare
-        # product-name strings were forwarded to select_products.html. Now
-        # each discovered product keeps its URL (and image/brand/category)
-        # all the way through to the selection screen, ranked the same way
-        # (by confidence, capped at config.MAX_PRODUCTS) as the old
-        # `products` name list was.
         catalogue = product_data.get("catalogue", [])
         products = []
         for item in catalogue:
@@ -1042,9 +971,6 @@ async def discover_products_endpoint(request: Request, company_name: str = Form(
                 "image": item.get("image", ""),
                 "category": item.get("category", ""),
             }
-            # Pre-serialized once here (plain Jinja2 has no built-in `tojson`
-            # filter) so select_products.html can drop it straight into a
-            # data-product="" attribute and JSON.parse it back on submit.
             product_obj["json"] = json.dumps(product_obj, ensure_ascii=True)
             products.append(product_obj)
         products = products[: config.MAX_PRODUCTS]
@@ -1084,64 +1010,13 @@ async def analyze_selected(
     website: str = Form(...),
     selected_products: str = Form(...),
 ):
-    # === Performance profiling instrumentation (mirrors /analyze) =========
-    pipeline_start = time.perf_counter()
-    stage_times: Dict[str, float] = {}
-
-    def _log_stage(name: str, elapsed: float) -> None:
-        stage_times[name] = stage_times.get(name, 0.0) + elapsed
-        logger.info(
-            "\n%s\nStage: %s\nTime: %.2f sec\n%s",
-            "=" * 50, name, elapsed, "=" * 50,
-        )
-
-    async def _timed(name: str, coro, timeout: float = None):
-        # See the first _timed() helper (analyze_website route) for the
-        # full rationale - this is the identical duplicate used by
-        # analyze_selected(). Kept in sync intentionally.
-        _start = time.perf_counter()
-        try:
-            if timeout is not None:
-                try:
-                    return await asyncio.wait_for(coro, timeout=timeout)
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        "%s exceeded its %.0fs hard timeout — returning [] "
-                        "(no partial results are recoverable from a "
-                        "cancelled coroutine; any underlying background "
-                        "work may keep running unseen after this point).",
-                        name, timeout,
-                    )
-                    return []
-            return await coro
-        finally:
-            _log_stage(name, time.perf_counter() - _start)
-
-    def _log_total_and_breakdown() -> None:
-        total_elapsed = time.perf_counter() - pipeline_start
-        logger.info(
-            "\n==========================\nTOTAL EXECUTION TIME\n==========================\n%.2f sec",
-            total_elapsed,
-        )
-        if total_elapsed > 0 and stage_times:
-            breakdown = ["Stage runtime share (% of total execution time):"]
-            for stage_name, elapsed in stage_times.items():
-                pct = (elapsed / total_elapsed) * 100
-                breakdown.append(f"  {stage_name}: {pct:.1f}%")
-            logger.info("\n".join(breakdown))
-    # === end instrumentation setup =========================================
+    _log_stage, _timed, _log_total_and_breakdown = _make_pipeline_profiler()
 
     website = website.strip()
-    company_name = website  # fallback label until metadata resolves below
+    company_name = website
 
-    # Parse the JSON array of Product objects posted by select_products.html
-    # (de-duplicated by URL, falling back to name — see _parse_selected_products).
     selected_product_objects: List[SelectedProduct] = _parse_selected_products(selected_products)
 
-    # `scrape_targets` (plain product names) is kept as-is downstream so the
-    # existing scrape -> sentiment -> summary -> PDF -> dashboard pipeline
-    # (labels, lookups, template context) is untouched. It is now simply
-    # derived from the structured objects instead of being the primary input.
     scrape_targets: List[str] = [p.name for p in selected_product_objects]
 
     if not website:
@@ -1159,8 +1034,6 @@ async def analyze_selected(
     try:
         _stage_start = time.perf_counter()
 
-        # `website` arrives already normalized from select_products.html, but
-        # we defend against a raw/unnormalized value just in case.
         normalized_website = normalize_url(website) if is_url(website) else website
 
         metadata = await extract_website_metadata(normalized_website)
@@ -1191,31 +1064,13 @@ async def analyze_selected(
             len(scrape_targets), company_name, scrape_targets,
         )
 
-        # --- From here on this is the identical scrape -> sentiment ->
-        # dashboard pipeline used by /analyze, just driven by the user's
-        # selected_products instead of an auto-discovered scrape_targets
-        # list. No pipeline logic, function, or output shape is altered. ---
         google_jobs: List[Dict[str, Any]] = [{"label": "General", "data": company_data}]
         for product_obj in selected_product_objects:
             product_company_data = dict(company_data)
             product_company_data["company_name"] = f"{company_data['company_name']} {product_obj.name}"
-            # Full Product object carried alongside company_data so future
-            # scrapers (per-product, URL-aware) can consume it directly
-            # instead of only a bare product-name string. Existing scrapers
-            # only read "company_name"/other pre-existing keys, so this is
-            # purely additive and does not change their behavior.
             product_company_data["product"] = product_obj.as_dict()
             google_jobs.append({"label": product_obj.name, "data": product_company_data})
 
-        # YouTube jobs mirror google_jobs' "General + one per product" shape,
-        # but keep `company_name` un-concatenated (it doubles as the brand
-        # fallback for the scraper's "<brand> <product> review" search tier
-        # when a product has no brand of its own) and pass the product's
-        # name/brand separately via `product_name`/`product_brand`, which the
-        # scraper reads to drive its product-centric search priority order.
-        # The "General" entry carries neither key, so it gets exactly
-        # today's behavior from the scraper: straight to the official
-        # channel logic.
         youtube_jobs: List[Dict[str, Any]] = [{"label": "General", "data": company_data}]
         for product_obj in selected_product_objects:
             yt_product_data = dict(company_data)
@@ -1223,11 +1078,6 @@ async def analyze_selected(
             yt_product_data["product_brand"] = product_obj.brand
             youtube_jobs.append({"label": product_obj.name, "data": yt_product_data})
 
-        # Reddit jobs mirror youtube_jobs' shape and data contract exactly
-        # (bare company_name + separate product_name/product_brand), since
-        # reddit_scraper.py's product-centric search priority order
-        # (Product -> Brand+Product -> Company+Product) is driven by those
-        # same fields.
         reddit_jobs: List[Dict[str, Any]] = [{"label": "General", "data": company_data}]
         for product_obj in selected_product_objects:
             reddit_product_data = dict(company_data)
@@ -1235,11 +1085,6 @@ async def analyze_selected(
             reddit_product_data["product_brand"] = product_obj.brand
             reddit_jobs.append({"label": product_obj.name, "data": reddit_product_data})
 
-        # Website Review jobs: one per selected product only (no "General"
-        # entry) - scrape_website_reviews() reads company_data["product_url"]
-        # and its own docstring is explicit that a specific product page is
-        # the reliable source (JSON-LD/review-app data lives there), not the
-        # site root, so there's nothing useful for a company-wide job to do.
         website_review_jobs: List[Dict[str, Any]] = []
         for product_obj in selected_product_objects:
             website_review_data = dict(company_data)
@@ -1248,33 +1093,16 @@ async def analyze_selected(
             website_review_jobs.append({"label": product_obj.name, "data": website_review_data})
 
         google_semaphore = asyncio.Semaphore(config.MAX_PARALLEL_TASKS)
-        # Bounded to the YouTube scraper's own browser-pool size rather than
-        # config.MAX_PARALLEL_TASKS: that pool (not this semaphore) is the
-        # real concurrency limit, so sizing the semaphore to match keeps
-        # every job's asyncio.wait_for clock from starting before a browser
-        # worker is actually available to run it.
         youtube_semaphore = asyncio.Semaphore(MAX_BROWSER_WORKERS)
-        # Same reasoning as youtube_semaphore above, sized to Reddit's own
-        # (deliberately small) worker pool instead of config.MAX_PARALLEL_TASKS,
-        # since Reddit's public JSON endpoints rate-limit unauthenticated
-        # clients more aggressively than a generic concurrency cap would allow for.
         reddit_semaphore = asyncio.Semaphore(MAX_REDDIT_WORKERS)
-        # Sized to website_review_scraper.py's own ThreadPoolExecutor
-        # (MAX_WORKERS), same reasoning as youtube_semaphore/reddit_semaphore
-        # above - it's plain httpx (no browser), so this is a much smaller,
-        # cheaper pool than the browser-based scrapers'.
         website_review_semaphore = asyncio.Semaphore(MAX_WEBSITE_REVIEW_WORKERS)
 
         GOOGLE_JOB_TIMEOUT_SECONDS = 48
-        TWITTER_TIMEOUT_SECONDS = 26
-        INSTAGRAM_TIMEOUT_SECONDS = 26
+        TWITTER_TIMEOUT_SECONDS = 32
+        INSTAGRAM_TIMEOUT_SECONDS = 34
         YOUTUBE_TIMEOUT_SECONDS = 30
         REDDIT_TIMEOUT_SECONDS = 20
-        # website_review_scraper.py's own internal TIME_BUDGET_SECONDS is 15s
-        # and it never launches a browser, so this only needs a small margin
-        # on top of that (unlike the browser-scraper timeouts above, which
-        # also have to absorb several seconds of Chromium setup time).
-        WEBSITE_REVIEW_TIMEOUT_SECONDS = 20
+        WEBSITE_REVIEW_TIMEOUT_SECONDS = 60
 
         async def _scrape_google_job(job: Dict[str, Any]) -> List[str]:
             async with google_semaphore:
@@ -1296,13 +1124,6 @@ async def analyze_selected(
                     )
                     return []
                 except asyncio.CancelledError:
-                    # Defense-in-depth: scrape_google_reviews() already shields
-                    # the shared background scrape from any single caller's
-                    # cancellation and swallows this itself, but we catch it
-                    # here too so a CancelledError can never reach
-                    # asyncio.gather()'s results list below - it isn't an
-                    # Exception subclass, so isinstance(outcome, Exception)
-                    # would otherwise miss it and crash on list(outcome).
                     logger.warning("Google Reviews job for %r was cancelled", job.get("label"))
                     return []
                 except Exception:
@@ -1345,12 +1166,7 @@ async def analyze_selected(
                     logger.exception("YouTube Scraper job for %r failed", job.get("label"))
                     return []
 
-        async def _scrape_youtube_jobs_group() -> List[str]:
-            # Same "General + one per product" job pattern as Google above,
-            # but merged (deduplicated) back into a single flat comment
-            # list here, since downstream (sentiment/dashboard/PDF) still
-            # expects one "YouTube" comment list, not a per-product
-            # breakdown - identical output shape to before this change.
+        async def _scrape_youtube_jobs_group() -> List[Dict[str, Any]]:
             _group_start = time.perf_counter()
             try:
                 per_job_results = await asyncio.gather(
@@ -1359,17 +1175,19 @@ async def analyze_selected(
                 )
             finally:
                 _log_stage("YouTube Scraper", time.perf_counter() - _group_start)
-            merged: List[str] = []
             seen_keys: set = set()
-            for outcome in per_job_results:
+            by_product: List[Dict[str, Any]] = []
+            for job, outcome in zip(youtube_jobs, per_job_results):
                 comments = list(outcome) if not isinstance(outcome, BaseException) else []
+                deduped: List[str] = []
                 for c in comments:
                     key = c.strip().lower()
                     if not key or key in seen_keys:
                         continue
                     seen_keys.add(key)
-                    merged.append(c)
-            return merged
+                    deduped.append(c)
+                by_product.append({"product": job["label"], "comments": deduped})
+            return by_product
 
         async def _scrape_reddit_job(job: Dict[str, Any]) -> List[str]:
             async with reddit_semaphore:
@@ -1393,11 +1211,7 @@ async def analyze_selected(
                     logger.exception("Reddit Scraper job for %r failed", job.get("label"))
                     return []
 
-        async def _scrape_reddit_jobs_group() -> List[str]:
-            # Same "General + one per product" job pattern as Google/YouTube
-            # above, merged (deduplicated) back into a single flat comment
-            # list here, since downstream (sentiment/dashboard/PDF) expects
-            # one "Reddit" comment list, not a per-product breakdown.
+        async def _scrape_reddit_jobs_group() -> List[Dict[str, Any]]:
             _group_start = time.perf_counter()
             try:
                 per_job_results = await asyncio.gather(
@@ -1406,17 +1220,19 @@ async def analyze_selected(
                 )
             finally:
                 _log_stage("Reddit Scraper", time.perf_counter() - _group_start)
-            merged: List[str] = []
             seen_keys: set = set()
-            for outcome in per_job_results:
+            by_product: List[Dict[str, Any]] = []
+            for job, outcome in zip(reddit_jobs, per_job_results):
                 comments = list(outcome) if not isinstance(outcome, BaseException) else []
+                deduped: List[str] = []
                 for c in comments:
                     key = c.strip().lower()
                     if not key or key in seen_keys:
                         continue
                     seen_keys.add(key)
-                    merged.append(c)
-            return merged
+                    deduped.append(c)
+                by_product.append({"product": job["label"], "comments": deduped})
+            return by_product
 
         async def _scrape_website_review_job(job: Dict[str, Any]) -> List[str]:
             async with website_review_semaphore:
@@ -1441,9 +1257,6 @@ async def analyze_selected(
                     return []
 
         async def _scrape_website_review_jobs_group() -> List[Any]:
-            # Kept per-job (like Google above), NOT merged into one flat
-            # list like YouTube/Reddit - every website review must stay
-            # attributed to the specific product page it was scraped from.
             _group_start = time.perf_counter()
             try:
                 return await asyncio.gather(
@@ -1453,15 +1266,6 @@ async def analyze_selected(
             finally:
                 _log_stage("Website Review Scraper", time.perf_counter() - _group_start)
 
-        # Product Intelligence Engine (Phase 3A): for every selected product,
-        # fetch that product's own page HTML exactly once and derive name/
-        # brand/category/image/price/availability/specifications/FAQ/
-        # aggregate rating/rating count/website reviews from that single
-        # fetch. Runs as its own branch of this same gather() so it adds no
-        # serial latency on top of the existing Google/Twitter/Instagram/
-        # YouTube/Reddit collection - build_product_intelligence_batch()
-        # carries its own internal concurrency cap and per-product timeout,
-        # so a slow/blocked product page can never block this branch either.
         results = await asyncio.gather(
             _scrape_google_jobs_group(),
             _timed("Twitter Scraper", scrape_twitter_comments(company_data), timeout=TWITTER_TIMEOUT_SECONDS),
@@ -1477,14 +1281,10 @@ async def analyze_selected(
         )
 
         google_results = results[0]
-        twitter_comments, instagram_comments, youtube_comments, reddit_comments = (
-            results[1], results[2], results[3], results[4],
-        )
+        twitter_comments, instagram_comments = results[1], results[2]
+        youtube_by_product: List[Dict[str, Any]] = results[3] if not isinstance(results[3], BaseException) else []
+        reddit_by_product: List[Dict[str, Any]] = results[4] if not isinstance(results[4], BaseException) else []
         product_intelligence_results = results[5] if not isinstance(results[5], BaseException) else []
-        # Additive, product-centric enrichment payload - one entry per
-        # selected product, in the same order as scrape_targets/products.
-        # Never referenced by the existing scrape -> sentiment -> PDF
-        # pipeline above/below; it is purely extra context for dashboard.html.
         product_intelligence: List[Dict[str, Any]] = [
             pi.as_dict() if hasattr(pi, "as_dict") else pi
             for pi in (product_intelligence_results or [])
@@ -1499,31 +1299,6 @@ async def analyze_selected(
             google_by_product.append({"product": job["label"], "comments": comments})
             google_all_comments.extend(comments)
 
-        # --- Website Reviews (Product Intelligence) -----------------------
-        # Two sources, both scoped to a single selected product's own page,
-        # merged into one list:
-        #   1) product_intelligence.py's website_reviews field (JSON-LD ->
-        #      structured provider -> generic HTML), already computed above
-        #      via build_product_intelligence_batch().
-        #   2) scrapers/website_review_scraper.py's scrape_website_reviews()
-        #      - previously written but never called anywhere in app.py -
-        #      run as its own per-product job (website_review_jobs, above).
-        # Both extractors use the same JSON-LD-first detection order against
-        # the same product page, so the same review can legitimately surface
-        # from both sources. Deduped here by normalized (whitespace-
-        # collapsed, case-insensitive) text before either one reaches
-        # `platform_comments`/`combined`, on top of (not instead of) the
-        # existing clean -> unique_comments() dedupe pipeline below - so a
-        # duplicate can never inflate Website review counts even before
-        # sentiment analysis runs. Unlike Google comments, which are matched
-        # to a product heuristically, every one of these is already known to
-        # belong to exactly the right product - making Website Reviews the
-        # highest-confidence product sentiment source available. Folding
-        # them into `platform_comments`/`combined` here is the only change
-        # needed to put them through the existing clean -> dedupe ->
-        # sentiment-batch -> aspect/confidence pipeline below, completely
-        # unchanged. Product Discovery, the Dashboard, the PDF, and every
-        # route/API shape are untouched by this.
         website_review_texts: List["tuple[str, str]"] = []
         _seen_website_review_keys: set = set()
 
@@ -1547,12 +1322,20 @@ async def analyze_selected(
             for text in comments:
                 _add_website_review(job["label"], text)
 
+        youtube_all_comments: List[str] = []
+        for entry in youtube_by_product:
+            youtube_all_comments.extend(entry["comments"])
+
+        reddit_all_comments: List[str] = []
+        for entry in reddit_by_product:
+            reddit_all_comments.extend(entry["comments"])
+
         platform_comments = {
             "Google":    google_all_comments,
             "Twitter":   list(twitter_comments)   if not isinstance(twitter_comments,   BaseException) else [],
             "Instagram": list(instagram_comments) if not isinstance(instagram_comments, BaseException) else [],
-            "YouTube":   list(youtube_comments)   if not isinstance(youtube_comments,   BaseException) else [],
-            "Reddit":    list(reddit_comments)    if not isinstance(reddit_comments,    BaseException) else [],
+            "YouTube":   youtube_all_comments,
+            "Reddit":    reddit_all_comments,
             "Website":   [text for _, text in website_review_texts],
         }
 
@@ -1561,23 +1344,35 @@ async def analyze_selected(
             for comment in entry["comments"]:
                 comment_product_lookup.setdefault(comment, entry["product"])
 
+        youtube_product_lookup: Dict[str, str] = {}
+        for entry in youtube_by_product:
+            for comment in entry["comments"]:
+                youtube_product_lookup.setdefault(comment, entry["product"])
+
+        reddit_product_lookup: Dict[str, str] = {}
+        for entry in reddit_by_product:
+            for comment in entry["comments"]:
+                reddit_product_lookup.setdefault(comment, entry["product"])
+
         website_product_lookup: Dict[str, str] = {}
         for product_name, text in website_review_texts:
             website_product_lookup.setdefault(text, product_name)
 
+        platform_product_lookups = {
+            "Google": comment_product_lookup,
+            "YouTube": youtube_product_lookup,
+            "Reddit": reddit_product_lookup,
+            "Website": website_product_lookup,
+        }
+
         combined = []
         for platform, comments in platform_comments.items():
+            lookup = platform_product_lookups.get(platform, {})
             for comment in comments:
-                if platform == "Google":
-                    product_label = comment_product_lookup.get(comment, "General")
-                elif platform == "Website":
-                    product_label = website_product_lookup.get(comment, "General")
-                else:
-                    product_label = "General"
+                product_label = lookup.get(comment, "General")
                 cleaned = normalize_text(remove_links(clean_comment(comment)))
                 if cleaned:
                     combined.append((platform, cleaned, product_label))
-
         unique = unique_comments([(p, c) for p, c, _ in combined])
         product_lookup_by_key = {(p, c.lower()): prod for p, c, prod in combined}
 
@@ -1607,7 +1402,6 @@ async def analyze_selected(
         if df.empty:
             df = pd.DataFrame(columns=["comment", "platform", "sentiment", "product", "timestamp"])
 
-        # --- Product Intelligence split (mirrors /analyze) ---------------
         product_rows, brand_rows = _split_product_and_brand_rows(comment_rows)
 
         overall_stats = _compute_overall_stats(product_rows)
@@ -1624,18 +1418,12 @@ async def analyze_selected(
         platform_sentiment = _aggregate_by_key(product_rows, "platform")
         brand_reputation = _aggregate_brand_reputation(brand_rows)
 
-        # --- Aspect Intelligence (Phase 1, mirrors /analyze) --------------
-        # Scoped to product_rows only - never brand_rows - so Brand
-        # Reputation stays completely separate from product-level aspect
-        # data. Purely additive; never alters anything above/below it.
         try:
             aspect_intelligence = build_aspect_intelligence_by_product(product_rows, pipe=pipe)
         except Exception:
             logger.exception("Aspect intelligence build failed for %s", company_name)
             aspect_intelligence = {}
 
-        # --- Confidence Score + Buying Recommendation (additive, mirrors
-        # /analyze) -----------------------------------------------------
         try:
             platforms_covered_count = len([p for p, c in platform_comments.items() if c])
             overall_platform_agreement = _platform_agreement(platform_sentiment)
@@ -1732,10 +1520,10 @@ async def analyze_selected(
             "Twitter":   len(platform_comments["Twitter"]),
             "Instagram": len(platform_comments["Instagram"]),
             "YouTube":   len(platform_comments["YouTube"]),
+            "Reddit":    len(platform_comments["Reddit"]),
+            "Website":   len(platform_comments["Website"]),
         }
 
-        # --- Professional PDF Report (additive; failure never breaks the
-        # dashboard — CSV/Excel/JSON exports above are unaffected either way).
         pdf_path_str = ""
         try:
             pdf_path = generate_pdf_report(
@@ -1797,21 +1585,8 @@ async def analyze_selected(
                     "values": [positive, negative, neutral],
                 },
                 "summary":        summary,
-                # Additive (Phase 3A): one structured Product Intelligence
-                # object per selected product - name/brand/category/url/
-                # image/price/availability/specifications/faq/aggregate
-                # rating/rating count/website reviews. Existing template
-                # keys above are all unchanged.
                 "product_intelligence": product_intelligence,
-                # Additive (Phase 1): per-product aspect extraction +
-                # per-aspect sentiment + aspect score/frequency/importance,
-                # derived from product_rows only - distinct from
-                # product_intelligence above (that's catalog/page data;
-                # this is review-derived aspect sentiment).
                 "aspect_intelligence": aspect_intelligence,
-                # --- Additive (Phase 2): Confidence Score + Buying
-                # Recommendation (overall + per selected product). All
-                # existing keys above/below are unchanged.
                 "confidence_score":     confidence_score,
                 "buying_recommendation": overall_buying_recommendation,
                 "product_recommendations": product_recommendations,
@@ -1839,7 +1614,6 @@ async def analyze_selected(
             "recommendations":         [],
             "product_summaries":       [],
             "brand_reputation_summary": "No brand-wide (non-product) reviews were collected for this run.",
-            # --- Additive (Phase 2) defaults for error path -------------
             "best_aspects": [], "worst_aspects": [],
             "confidence_score": {"score": 0, "label": "No Data", "css_class": "no-data"},
             "buying_recommendation": {
@@ -1961,17 +1735,6 @@ def _aggregate_by_key(comment_rows: List[Dict[str, Any]], key: str) -> Dict[str,
         }
     return aggregated
 
-# =============================================================================
-# Product Intelligence aggregation helpers
-# =============================================================================
-# These helpers implement the Company Sentiment -> Product Intelligence shift:
-# comments are split into (a) rows tied to a user-selected product, and
-# (b) rows that aren't tied to any specific product — the base/"General"
-# Google search plus all Twitter/Instagram/YouTube comments (those three
-# scrapers are brand-wide, not per-product). Group (b), which includes the
-# Google Maps/business reviews, is treated as Brand Reputation and kept out
-# of every product-centric metric, per the "don't mix Google Maps into
-# product sentiment" requirement.
 
 def _split_product_and_brand_rows(
     comment_rows: List[Dict[str, Any]],
@@ -1996,10 +1759,6 @@ def _compute_overall_stats(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 def _aggregate_brand_reputation(brand_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Brand Reputation block: everything NOT attributable to a selected
-    product, broken out with Google Maps/business reviews called out
-    separately since those are the reviews users most associate with
-    overall brand reputation rather than any one product."""
     overall = _compute_overall_stats(brand_rows)
     by_platform = _aggregate_by_key(brand_rows, "platform")
     google_maps_rows = [r for r in brand_rows if r.get("platform") == "Google"]
@@ -2068,28 +1827,9 @@ def _build_insight_tabs(
         "by_platform":  by_platform,
     }
 
-# ============================================================================
-# Confidence Score + Buying Recommendation (additive integration layer)
-# ----------------------------------------------------------------------------
-# These helpers ONLY read data that's already computed elsewhere in this
-# file (product_sentiment, platform_sentiment, aspect_intelligence output
-# from aspect_intelligence.py). None of them re-run sentiment analysis,
-# re-extract aspects, or touch aspect_intelligence.py / product_intelligence.py
-# / sentiment.py / the scrapers / routes / PDF generation. Every call site
-# below degrades to a "No Data" / "Not Enough Data" result rather than
-# raising, mirroring the try/except already wrapped around
-# build_aspect_intelligence_by_product() in /analyze.
-# ============================================================================
 
 def _score_spread_to_consistency(scores: List[float]) -> float:
-    """Shared 0-100 'consistency' helper: low spread (std-dev) across a set
-    of 0-100 scores maps to high consistency. Reused for both aspect-level
-    consistency (spread across one product's aspect scores) and
-    cross-platform agreement (spread across per-platform scores)."""
     if len(scores) < 2:
-        # Nothing to disagree with - treat single-score/no-score sets as
-        # fully consistent; sparse data is already penalized separately by
-        # the review-volume component of the confidence score below.
         return 100.0 if scores else 0.0
     mean = sum(scores) / len(scores)
     variance = sum((s - mean) ** 2 for s in scores) / len(scores)
@@ -2098,18 +1838,11 @@ def _score_spread_to_consistency(scores: List[float]) -> float:
 
 
 def _aspect_consistency(aspects: "List[Dict[str, Any]] | None") -> float:
-    """0-100: how consistent a product's aspect scores are with each other
-    (e.g. Sound Quality=90, Build Quality=85, Comfort=88 -> high
-    consistency; Sound Quality=95, Battery=20 -> low consistency, a "mixed
-    bag" product). Reads aspect_intelligence output only; never mutates it."""
     scores = [a.get("score", 0) for a in (aspects or []) if a.get("total")]
     return _score_spread_to_consistency(scores)
 
 
 def _platform_agreement(platform_sentiment: "Dict[str, Dict[str, Any]] | None") -> float:
-    """0-100: how much the platforms that returned data agree with each
-    other on sentiment score. Reads platform_sentiment (already built by
-    _aggregate_by_key) only."""
     scores = [v.get("score", 0) for v in (platform_sentiment or {}).values() if v.get("total")]
     return _score_spread_to_consistency(scores)
 
@@ -2120,12 +1853,6 @@ def _compute_confidence_score(
     platform_agreement: float,
     aspect_consistency: float,
 ) -> Dict[str, Any]:
-    """Confidence Score (0-100): combines review volume, number of
-    platforms, agreement between platforms, and consistency, per
-    requirement. Weights (volume 30% / platform diversity 20% / platform
-    agreement 25% / aspect consistency 25%) are a transparent arithmetic
-    blend of figures already computed elsewhere in this file - not a new
-    sentiment model."""
     volume_score = min(100.0, (review_count / 50.0) * 100.0) if review_count else 0.0
     platform_score = min(100.0, (platforms_covered / 4.0) * 100.0)
 
@@ -2177,19 +1904,11 @@ def _compute_buying_recommendation(
     review_count: int,
     confidence: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Buying Recommendation - combines overall sentiment score, per-aspect
-    scores, review volume, and the confidence/consistency figures above,
-    instead of using overall sentiment alone (per requirement). Reads
-    already-computed product_sentiment/aspect_intelligence figures only;
-    never recomputes sentiment or aspect extraction itself."""
     aspects = aspects or []
     scored_aspects = [a for a in aspects if a.get("total")]
     aspect_scores = [a["score"] for a in scored_aspects]
     avg_aspect_score = round(sum(aspect_scores) / len(aspect_scores), 1) if aspect_scores else product_score
 
-    # Blend overall sentiment score with the aspect-level average so a
-    # product that "sounds fine overall" but scores badly on the specific
-    # things reviewers complain about doesn't get an inflated recommendation.
     blended_score = round((product_score * 0.5) + (avg_aspect_score * 0.5), 1)
     confidence_score = confidence.get("score", 0)
 
@@ -2267,16 +1986,11 @@ def generate_summary(
     selected_products: "List[str] | None" = None,
     product_sentiment: "Dict[str, Dict[str, Any]] | None" = None,
     brand_reputation: "Dict[str, Any] | None" = None,
-    # --- Additive (Phase 2): all optional, all default to None/{} so any
-    # existing caller of generate_summary() keeps working unchanged. -------
     aspect_intelligence: "Dict[str, List[Dict[str, Any]]] | None" = None,
     confidence_score: "Dict[str, Any] | None" = None,
     buying_recommendation: "Dict[str, Any] | None" = None,
     product_recommendations: "Dict[str, Dict[str, Any]] | None" = None,
 ) -> Dict[str, Any]:
-    # NOTE: `comment_rows` here is expected to already be scoped to rows tied
-    # to a selected product (see _split_product_and_brand_rows), so every
-    # stat this function derives is product-centric by construction.
     sentiments = [item["sentiment"] for item in comment_rows]
     positive = sentiments.count("positive")
     negative = sentiments.count("negative")
@@ -2290,7 +2004,6 @@ def generate_summary(
     selected_products = selected_products or []
     product_sentiment = product_sentiment or {}
 
-    # --- Additive (Phase 2) inputs, all optional -----------------------
     aspect_intelligence = aspect_intelligence or {}
     confidence_score = confidence_score or {
         "score": 0, "label": "No Data", "css_class": "no-data",
@@ -2301,9 +2014,6 @@ def generate_summary(
     }
     product_recommendations = product_recommendations or {}
 
-    # ---- Per-product executive summaries -----------------------------
-    # One individual summary per user-selected product, built purely from
-    # figures already aggregated in product_sentiment — no new statistics.
     product_summaries: List[Dict[str, Any]] = []
     for product_name in selected_products:
         stats = product_sentiment.get(product_name, {
@@ -2328,15 +2038,9 @@ def generate_summary(
             "neutral_pct": stats["neutral_pct"],
             "score": stats["score"], "score_label": stats["score_label"],
             "summary": narrative,
-            # --- Additive: per-product Buying Recommendation, if computed
-            # by the caller. Absent/None -> template degrades gracefully.
             "recommendation": product_recommendations.get(product_name),
         })
 
-    # ---- Best / worst aspects across all selected products (additive) --
-    # Purely derived from aspect_intelligence's already-computed per-aspect
-    # scores; used only to enrich the executive summary text and dashboard,
-    # never fed back into any score/label computed elsewhere.
     all_scored_aspects: List[Dict[str, Any]] = []
     for product_name, aspects in aspect_intelligence.items():
         for a in aspects:
@@ -2345,7 +2049,6 @@ def generate_summary(
     best_aspects = sorted(all_scored_aspects, key=lambda a: a["score"], reverse=True)[:3]
     worst_aspects = sorted(all_scored_aspects, key=lambda a: a["score"])[:3]
 
-    # ---- Brand Reputation narrative (Google Maps + brand-wide social) --
     brand_reputation = brand_reputation or {
         "positive": 0, "negative": 0, "neutral": 0, "total": 0,
         "positive_pct": 0.0, "negative_pct": 0.0, "neutral_pct": 0.0,
@@ -2399,10 +2102,6 @@ def generate_summary(
 
     products_label = ", ".join(selected_products) if selected_products else "the selected product(s)"
 
-    # ---- Additive: best/worst-aspect + recommendation/confidence clause -
-    # Appended to the existing executive_summary sentence rather than
-    # replacing it, so every existing consumer of this field keeps getting
-    # its original leading sentence unchanged.
     if best_aspects or worst_aspects:
         best_names = ", ".join(a["aspect"] for a in best_aspects) if best_aspects else "not enough data"
         worst_names = ", ".join(a["aspect"] for a in worst_aspects) if worst_aspects else "not enough data"
@@ -2436,13 +2135,9 @@ def generate_summary(
         "top_positive_topics":    key_positive_insights,
         "recommendations":        recommendations,
 
-        # --- Additive: Product Intelligence fields (new; existing keys
-        # above are all preserved for frontend/PDF compatibility) --------
         "product_summaries":         product_summaries,
         "brand_reputation_summary":  brand_reputation_summary,
 
-        # --- Additive (Phase 2): Aspect summary / Confidence / Buying
-        # Recommendation fields. Existing keys above are all unchanged. ---
         "best_aspects":              best_aspects,
         "worst_aspects":             worst_aspects,
         "confidence_score":          confidence_score,
@@ -2450,17 +2145,9 @@ def generate_summary(
         "product_recommendations":  product_recommendations,
     }
 
-# =============================================================================
-# Professional PDF Report (reportlab only) — ADDITIVE FEATURE
-# =============================================================================
-# generate_pdf_report() is a pure, self-contained helper. It only *reads*
-# values that were already computed by the existing pipeline (brand score,
-# summary, sentiment aggregates, etc.) and lays them out as a PDF. It does
-# not recompute, alter, or invent any statistic, and it is not called from
-# anywhere except once per analysis run, after the CSV/Excel/JSON export.
 
-_PDF_PRIMARY   = colors.HexColor("#5A4FCF")   # purple — main headings / bands
-_PDF_BLUE      = colors.HexColor("#3B5BDB")   # blue — secondary headings
+_PDF_PRIMARY   = colors.HexColor("#5A4FCF")
+_PDF_BLUE      = colors.HexColor("#3B5BDB")
 _PDF_DARK      = colors.HexColor("#1B1B1B")
 _PDF_MUTED     = colors.HexColor("#7B746C")
 _PDF_BORDER    = colors.HexColor("#E3DEEF")
@@ -2613,13 +2300,6 @@ def generate_pdf_report(
     brand_reputation: "Dict[str, Any] | None" = None,
     product_title: str = "",
 ) -> Path:
-    """
-    Builds a professional multi-page Product Intelligence Report from data
-    the existing pipeline has already computed (summary, brand score,
-    sentiment aggregates, platform counts, product sentiment, selected
-    products, brand reputation). No new statistics are calculated here —
-    every figure below is read directly from the arguments passed in.
-    """
     styles = _pdf_styles()
     story: List[Any] = []
 
@@ -2634,7 +2314,6 @@ def generate_pdf_report(
         "google_maps": {"total": 0, "score": 0, "score_label": "No Data"},
     }
 
-    # ---------------------------------------------------------------- Cover
     story.append(Spacer(1, 2.6 * cm))
     cover_band = Table(
         [[Paragraph("ManobhavaAI", styles["cover_title"])],
@@ -2672,7 +2351,6 @@ def generate_pdf_report(
     story.append(detail_card)
     story.append(PageBreak())
 
-    # ------------------------------------------------------- Executive Summary
     story.extend(_pdf_section_heading("Executive Summary", styles))
     story.append(Paragraph(
         summary.get("executive_summary", "No executive summary available."),
@@ -2680,7 +2358,6 @@ def generate_pdf_report(
     ))
     story.append(Spacer(1, 16))
 
-    # ------------------------------------------------------- Overall Statistics
     story.extend(_pdf_section_heading("Overall Product Statistics", styles))
     stats_rows = [
         ["Product Score", f"{brand_score} / 100"],
@@ -2698,7 +2375,6 @@ def generate_pdf_report(
     ))
     story.append(Spacer(1, 16))
 
-    # ------------------------------------------------------- Selected Products
     story.extend(_pdf_section_heading("Selected Products", styles))
     story.extend(_pdf_bullet_list(
         selected_products or [], styles,
@@ -2706,7 +2382,6 @@ def generate_pdf_report(
     ))
     story.append(Spacer(1, 16))
 
-    # ------------------------------------------------------- Per-Product Summaries
     story.extend(_pdf_section_heading("Product-by-Product Summary", styles))
     product_summaries = summary.get("product_summaries") or []
     if product_summaries:
@@ -2721,7 +2396,6 @@ def generate_pdf_report(
         ))
     story.append(Spacer(1, 8))
 
-    # ------------------------------------------------------- Platform Summary
     story.extend(_pdf_section_heading("Platform Summary", styles))
     platform_order = ["Google", "Twitter", "Instagram", "YouTube"]
     platform_rows = [[p, str(platform_counts.get(p, 0))] for p in platform_order]
@@ -2731,7 +2405,6 @@ def generate_pdf_report(
     ))
     story.append(Spacer(1, 16))
 
-    # ------------------------------------------------------- Product Sentiment
     story.extend(_pdf_section_heading("Product Sentiment Table", styles))
     real_products = {k: v for k, v in (product_sentiment or {}).items() if k != "General"}
     if real_products:
@@ -2749,10 +2422,6 @@ def generate_pdf_report(
         story.append(Paragraph("No product-level sentiment data is available.", styles["body"]))
     story.append(Spacer(1, 16))
 
-    # ------------------------------------------------------- Brand Reputation
-    # Kept separate from Product Sentiment: this covers Google Maps/business
-    # reviews plus general (non-product-attributable) social mentions, which
-    # reflect overall brand reputation rather than any single product.
     story.extend(_pdf_section_heading("Brand Reputation (Google Maps & Social)", styles))
     story.append(Paragraph(summary.get("brand_reputation_summary", ""), styles["body"]))
     story.append(Spacer(1, 10))
@@ -2769,7 +2438,6 @@ def generate_pdf_report(
     ))
     story.append(Spacer(1, 16))
 
-    # ------------------------------------------------------- Top Positive Insights
     story.extend(_pdf_section_heading("Top Positive Insights", styles))
     story.extend(_pdf_bullet_list(
         summary.get("key_positive_insights", []), styles,
@@ -2778,7 +2446,6 @@ def generate_pdf_report(
     ))
     story.append(Spacer(1, 16))
 
-    # ------------------------------------------------------- Top Complaints
     story.extend(_pdf_section_heading("Top Complaints", styles))
     story.extend(_pdf_bullet_list(
         summary.get("key_complaints", []), styles,
@@ -2787,7 +2454,6 @@ def generate_pdf_report(
     ))
     story.append(Spacer(1, 16))
 
-    # ------------------------------------------------------- Recommendations
     story.extend(_pdf_section_heading("Recommendations", styles))
     story.extend(_pdf_bullet_list(
         summary.get("recommendations", []), styles,
@@ -2795,7 +2461,6 @@ def generate_pdf_report(
     ))
     story.append(Spacer(1, 16))
 
-    # ------------------------------------------------------- Final Conclusion
     story.extend(_pdf_section_heading("Final Conclusion", styles))
     platforms_covered = summary.get("platforms_covered", 0)
     conclusion = (

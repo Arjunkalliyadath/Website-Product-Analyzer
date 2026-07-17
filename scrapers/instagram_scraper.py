@@ -11,7 +11,7 @@ from typing import Dict, List, Tuple
 
 import httpx
 
-from scrapers.browser_utils import browser_launch_slot, normalize_comments
+from scrapers.browser_utils import browser_launch_slot, normalize_comments, find_social_profile_url
 from config import (
     MAX_INSTAGRAM_COMMENTS,
     MAX_SCROLL_ITERATIONS,
@@ -34,6 +34,13 @@ MIN_RESULTS_BEFORE_FALLBACK = 5
 # from once we're past the profile grid itself.
 MAX_POSTS_TO_VISIT = 20
 
+# How many grid thumbnails to click through on the profile embed page to
+# *discover* real post URLs (see the comment above the click loop in
+# scrape_instagram_comments for why this is necessary). Kept smaller than
+# MAX_POSTS_TO_VISIT since each discovery click costs a real navigation
+# round-trip, unlike the old (broken) static href scan it replaces.
+MAX_POSTS_TO_DISCOVER = 8
+
 # --- Hard internal time budget -----------------------------------------
 # Kept a few seconds under the outer asyncio.wait_for() cap applied in
 # app.py (26s, widened from 20s - the old value was below observed
@@ -45,7 +52,7 @@ MAX_POSTS_TO_VISIT = 20
 # Lowered from 16 -> 12 now that
 # navigation itself fails fast (NAV_TIMEOUT_MS, NAVIGATION_RETRIES in
 # config.py).
-TIME_BUDGET_SECONDS = 12
+TIME_BUDGET_SECONDS = 20
 
 _CHROME_MARKERS = (
     "followers", " posts", "view full profile", "following",
@@ -732,10 +739,33 @@ async def scrape_instagram_comments(company_data: Dict[str, str]) -> List[str]:
     target = (
         company_data.get("instagram_url")
         or company_data.get("instagram")
-        or company_data.get("company_name", "")
     )
+
+    loop = asyncio.get_event_loop()
+
     if not target:
-        return []
+        company_name = (company_data.get("company_name") or "").strip()
+        if company_name:
+            try:
+                target = await loop.run_in_executor(
+                    _EXECUTOR, find_social_profile_url, company_name, "instagram",
+                )
+            except Exception:
+                target = ""
+            if target:
+                target = target.split("?")[0].split("#")[0]
+                logger.info(
+                    "Instagram scrape: no handle from the site scan; "
+                    "search fallback found %r for %r.", target, company_name,
+                )
+        if not target:
+            logger.info(
+                "Instagram scrape: no handle from the site scan and the "
+                "search fallback found nothing for %r; skipping rather "
+                "than guessing a handle from the name.",
+                company_data.get("company_name"),
+            )
+            return []
 
     handle = target
     for prefix in ("https://www.instagram.com/", "https://instagram.com/"):
@@ -746,7 +776,6 @@ async def scrape_instagram_comments(company_data: Dict[str, str]) -> List[str]:
     profile_url = _profile_url(handle)
     company_name = company_data.get("company_name", handle)
 
-    loop = asyncio.get_event_loop()
     embed_preflight_url = profile_url.rstrip("/") + "/embed/"
     try:
         preflight_blocked = await loop.run_in_executor(_EXECUTOR, _httpx_preflight_blocked, embed_preflight_url)
@@ -866,12 +895,66 @@ async def scrape_instagram_comments(company_data: Dict[str, str]) -> List[str]:
                         except Exception:
                             pass
                 try:
-                    for a in page.locator("a[href*='/p/'], a[href*='/reel/']").all()[:MAX_POSTS_TO_VISIT]:
-                        href = a.get_attribute("href")
-                        if href:
-                            full = "https://www.instagram.com" + href if href.startswith("/") else href
-                            if full not in post_links:
-                                post_links.append(full)
+                    # Instagram's profile embed grid renders every
+                    # thumbnail as <a href="#" role="link"> - the real
+                    # navigation is wired up via a JS click handler, not a
+                    # normal href, so scanning for a[href*='/p/'] (the old
+                    # approach) can never find anything here and
+                    # post_links stayed empty. Click each thumbnail
+                    # instead - that fires the real handler - and read
+                    # the resulting page URL, which the widget updates to
+                    # the individual post's own permalink.
+                    thumbs_sel = "a[role='link'][href='#']"
+                    thumb_count = page.locator(thumbs_sel).count()
+                    for idx in range(min(thumb_count, MAX_POSTS_TO_DISCOVER)):
+                        if time_left() <= 4:
+                            break
+                        try:
+                            thumbs = page.locator(thumbs_sel)
+                            if idx >= thumbs.count():
+                                break
+                            thumbs.nth(idx).click(timeout=2000)
+                            page.wait_for_timeout(400)
+                            new_url = page.url or ""
+                            if (
+                                ("/p/" in new_url or "/reel/" in new_url)
+                                and new_url not in post_links
+                            ):
+                                post_links.append(new_url)
+                            else:
+                                # No real navigation happened - the click
+                                # may have opened an in-page overlay
+                                # instead. Grab whatever caption/comment
+                                # content is visible right now before
+                                # closing it, so this thumbnail isn't a
+                                # total loss either way.
+                                try:
+                                    overlay_loc, _ = _first_matching_locator(
+                                        page, _CAPTION_SELECTOR_CHAIN
+                                    )
+                                    if overlay_loc is not None:
+                                        for loc in overlay_loc.all():
+                                            try:
+                                                _add(loc.inner_text())
+                                            except Exception:
+                                                pass
+                                except Exception:
+                                    pass
+                            page.go_back(timeout=3000)
+                            page.wait_for_selector(thumbs_sel, timeout=3000)
+                        except Exception:
+                            # Best-effort: if the click/back cycle leaves
+                            # the page in a bad state, reload the grid
+                            # fresh rather than abandoning the rest of
+                            # the thumbnails.
+                            try:
+                                _goto_with_retry(
+                                    page, embed_url,
+                                    timeout=_adaptive_nav_timeout(time_left),
+                                    time_left=time_left,
+                                )
+                            except Exception:
+                                break
                 except Exception:
                     pass
 

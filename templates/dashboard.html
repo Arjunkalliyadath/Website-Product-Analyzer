@@ -16,7 +16,7 @@
       --surface:  #FFFDF8;
       --border:   #E8DDCF;
       --primary:  #5A4FCF;
-      --primary-l: rgba(90,79,207,0.10);
+      --primary-l: rgba(90,79,207,0.08);
       --positive: #2E7D32;
       --negative: #B3264A;
       --neutral:  #8A6A1F;
@@ -27,6 +27,14 @@
       --blue-card:   #D9E7FF;
       --green-card:  #D8F2C2;
       --dark:        #1B1B1B;
+
+      /* Consistent spacing / radius / shadow scale for a calmer, enterprise feel */
+      --r-sm: 10px;
+      --r-md: 14px;
+      --r-lg: 16px;
+      --shadow-sm: 0 1px 2px rgba(36,33,29,.04), 0 1px 1px rgba(36,33,29,.03);
+      --shadow-md: 0 4px 14px rgba(36,33,29,.06);
+      --shadow-lg: 0 10px 26px rgba(36,33,29,.08);
     }
 
     html { scroll-behavior: smooth; }
@@ -35,13 +43,14 @@
       background: var(--bg);
       color: var(--text);
       font-family: 'Poppins', -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      font-size: 15px;
+      font-size: 14.5px;
+      line-height: 1.5;
     }
 
     .shell {
       max-width: 1160px;
       margin: 0 auto;
-      padding: 0 1.5rem 4rem;
+      padding: 0 1.5rem 3rem;
     }
 
     
@@ -49,14 +58,13 @@
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding: 1.1rem 0;
-      background: rgba(255,253,248,.72);
+      background: rgba(255,253,248,.8);
       backdrop-filter: blur(10px);
       border: 1px solid var(--border);
-      border-radius: 22px;
-      padding: 1rem 1.2rem;
-      margin: 1.2rem 0 2rem;
-      box-shadow: 0 12px 30px rgba(65,48,28,.06);
+      border-radius: var(--r-md);
+      padding: .75rem 1.1rem;
+      margin: 1.25rem 0 1.5rem;
+      box-shadow: var(--shadow-sm);
     }
     .brand {
       display: flex; align-items: center; gap: .6rem;
@@ -122,8 +130,8 @@
     .link-handle { color: var(--muted); }
 
     
-    .grid-4 { display: grid; grid-template-columns: repeat(4,1fr); gap: .9rem; margin-bottom: 1.25rem; }
-    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1.25rem; margin-bottom: 1.25rem; }
+    .grid-4 { display: grid; grid-template-columns: repeat(4,1fr); gap: .85rem; margin-bottom: 1.1rem; }
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-bottom: 1.1rem; }
     @media (max-width: 860px) {
       .grid-4 { grid-template-columns: repeat(2,1fr); }
     }
@@ -135,20 +143,20 @@
     .card {
       background: var(--surface);
       border: 1px solid var(--border);
-      border-radius: 22px;
-      padding: 1.35rem 1.5rem;
-      box-shadow: 0 14px 32px rgba(65,48,28,.07);
+      border-radius: var(--r-lg);
+      padding: 1.15rem 1.3rem;
+      box-shadow: var(--shadow-sm);
     }
     .card-label {
       font-size: .7rem;
       font-weight: 600;
-      letter-spacing: .07em;
+      letter-spacing: .06em;
       text-transform: uppercase;
       color: var(--muted);
-      margin-bottom: .55rem;
+      margin-bottom: .5rem;
     }
     .card-value {
-      font-size: 2rem;
+      font-size: 1.85rem;
       font-weight: 700;
       letter-spacing: -.02em;
       line-height: 1;
@@ -178,7 +186,7 @@
 
     
     .sentiment-breakdown-card { display: flex; flex-direction: column; transition: box-shadow .25s ease, transform .25s ease; }
-    .sentiment-breakdown-card:hover { box-shadow: 0 18px 40px rgba(65,48,28,.11); transform: translateY(-2px); }
+    .sentiment-breakdown-card:hover { box-shadow: var(--shadow-md); transform: translateY(-1px); }
 
     .sentbrk-chart-center { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); text-align: center; pointer-events: none; }
     .sentbrk-chart-center-value { font-size: 1.5rem; font-weight: 700; color: var(--text); letter-spacing: -.02em; line-height: 1; }
@@ -217,7 +225,7 @@
     .sentbrk-bar-count { margin-top: .32rem; font-size: .72rem; color: var(--muted); margin-left: 1.9rem; }
 
     .sentbrk-empty { display: flex; flex-direction: column; align-items: center; text-align: center; padding: 1.6rem .5rem .4rem; gap: .55rem; }
-    .sentbrk-empty-icon { width: 64px; height: 64px; display: flex; align-items: center; justify-content: center; animation: sentbrkFloat 3.2s ease-in-out infinite; }
+    .sentbrk-empty-icon { width: 64px; height: 64px; display: flex; align-items: center; justify-content: center; }
     @keyframes sentbrkFloat { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-5px); } }
 
     .sentbrk-empty-title { font-size: .98rem; font-weight: 700; color: var(--text); margin-top: .2rem; }
@@ -449,7 +457,7 @@
       width: 44px; height: 44px; border-radius: 50%; flex-shrink: 0;
       background: var(--primary-l); color: var(--primary);
       display: flex; align-items: center; justify-content: center;
-      animation: emptyFloat 3.2s ease-in-out infinite;
+      
     }
     @keyframes emptyFloat { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-4px); } }
 
@@ -470,11 +478,10 @@
     .buyrec-card { position: relative; overflow: hidden; }
 
     .buyrec-hero {
-      display: grid; grid-template-columns: 1.3fr auto 1fr; gap: 1.6rem; align-items: center;
-      padding: 1.5rem; border-radius: 20px; margin-top: .3rem;
-      background: linear-gradient(145deg, rgba(90,79,207,.06), rgba(90,79,207,.015));
+      display: grid; grid-template-columns: 1.3fr auto 1fr; gap: 1.4rem; align-items: center;
+      padding: 1.25rem 1.4rem; border-radius: var(--r-lg); margin-top: .3rem;
+      background: linear-gradient(145deg, rgba(90,79,207,.05), rgba(90,79,207,.01));
       border: 1px solid var(--border);
-      backdrop-filter: blur(6px);
     }
     .buyrec-hero--very-positive, .buyrec-hero--positive { background: linear-gradient(145deg, rgba(46,125,50,.08), rgba(46,125,50,.015)); }
     .buyrec-hero--mixed { background: linear-gradient(145deg, rgba(138,106,31,.08), rgba(138,106,31,.015)); }
@@ -498,9 +505,7 @@
     .buyrec-pending-icon {
       flex-shrink: 0; width: 30px; height: 30px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
       background: rgba(138,106,31,.14); color: var(--neutral); font-size: .95rem;
-      animation: buyrecPulse 2.2s ease-in-out infinite;
-    }
-    @keyframes buyrecPulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(138,106,31,.22); } 50% { box-shadow: 0 0 0 6px rgba(138,106,31,0); } }
+      }
     .buyrec-pending-title { font-weight: 700; font-size: .88rem; margin-bottom: .25rem; }
     .buyrec-pending-text { font-size: .8rem; color: var(--muted); line-height: 1.55; max-width: 42ch; }
 
@@ -537,7 +542,7 @@
       border: 1px solid var(--border); border-radius: 16px; padding: 1rem 1.1rem;
       background: var(--surface); transition: transform .2s ease, box-shadow .2s ease, border-color .2s ease;
     }
-    .buyrec-product-card:hover { transform: translateY(-3px); box-shadow: 0 14px 28px rgba(65,48,28,.09); border-color: var(--primary); }
+    .buyrec-product-card:hover { transform: translateY(-1px); box-shadow: var(--shadow-md); border-color: var(--primary); }
 
     .buyrec-product-card--very-positive, .buyrec-product-card--positive { border-left: 3px solid var(--positive); }
     .buyrec-product-card--mixed { border-left: 3px solid var(--neutral); }
@@ -569,11 +574,11 @@
     @media (max-width: 760px) { .brandrep-hero { grid-template-columns: 1fr; } }
 
     .brandrep-score-card, .brandrep-gmaps-card {
-      border: 1px solid var(--border); border-radius: 18px; padding: 1.25rem 1.4rem;
-      background: linear-gradient(150deg, rgba(90,79,207,.05), rgba(90,79,207,.01));
-      transition: box-shadow .2s ease, transform .2s ease;
+      border: 1px solid var(--border); border-radius: var(--r-lg); padding: 1.15rem 1.3rem;
+      background: linear-gradient(150deg, rgba(90,79,207,.04), rgba(90,79,207,.01));
+      transition: box-shadow .2s ease;
     }
-    .brandrep-score-card:hover, .brandrep-gmaps-card:hover { box-shadow: 0 14px 30px rgba(65,48,28,.08); transform: translateY(-2px); }
+    .brandrep-score-card:hover, .brandrep-gmaps-card:hover { box-shadow: var(--shadow-md); }
 
     .brandrep-score-card--excellent, .brandrep-score-card--good { background: linear-gradient(150deg, rgba(46,125,50,.07), rgba(46,125,50,.01)); }
     .brandrep-score-card--mixed { background: linear-gradient(150deg, rgba(138,106,31,.07), rgba(138,106,31,.01)); }
@@ -623,7 +628,7 @@
     .brandrep-gmaps-empty { display: flex; flex-direction: column; align-items: center; text-align: center; padding: .6rem .5rem .2rem; gap: .4rem; }
     .brandrep-gmaps-empty-icon {
       width: 46px; height: 46px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
-      background: var(--bg); color: var(--muted); animation: brandrepFloat 3.2s ease-in-out infinite;
+      background: var(--bg); color: var(--muted);
     }
     @keyframes brandrepFloat { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-4px); } }
     .brandrep-gmaps-empty-title { font-weight: 700; font-size: .86rem; margin-top: .2rem; }
@@ -634,7 +639,7 @@
       border: 1px solid var(--border); border-radius: 16px; padding: 1rem 1.1rem;
       background: var(--surface); transition: transform .2s ease, box-shadow .2s ease, border-color .2s ease;
     }
-    .brandrep-platform-card:hover { transform: translateY(-3px); box-shadow: 0 14px 28px rgba(65,48,28,.09); border-color: var(--primary); }
+    .brandrep-platform-card:hover { transform: translateY(-1px); box-shadow: var(--shadow-md); border-color: var(--primary); }
     .brandrep-platform-card--excellent, .brandrep-platform-card--good { border-left: 3px solid var(--positive); }
     .brandrep-platform-card--mixed { border-left: 3px solid var(--neutral); }
     .brandrep-platform-card--poor { border-left: 3px solid var(--negative); }
@@ -678,62 +683,67 @@
     
     .sentiment-table { width: 100%; border-collapse: collapse; margin-top: .5rem; }
     .sentiment-table th {
-      text-align: left; font-size: .7rem; font-weight: 600; letter-spacing: .05em;
-      text-transform: uppercase; color: var(--muted); padding: .5rem .6rem;
+      text-align: left; font-size: .68rem; font-weight: 600; letter-spacing: .05em;
+      text-transform: uppercase; color: var(--muted); padding: .7rem .75rem;
       border-bottom: 1px solid var(--border);
     }
-    .sentiment-table td { padding: .6rem; font-size: .84rem; border-bottom: 1px solid var(--border); }
+    .sentiment-table td { padding: .75rem; font-size: .84rem; border-bottom: 1px solid var(--border); }
     .sentiment-table tr:last-child td { border-bottom: none; }
     .mini-bar { display: flex; height: 6px; border-radius: 100px; overflow: hidden; width: 100%; min-width: 90px; }
 
 
-    /* Pinterest-inspired light refresh: structure and backend variables unchanged */
+    /* Brand + KPI cards: clean surfaces with a restrained accent, not full pastel fills */
     .brand-icon {
-      background: linear-gradient(135deg, var(--dark), #3A342E);
-      box-shadow: 0 8px 18px rgba(0,0,0,.16);
+      background: var(--dark);
+      box-shadow: none;
     }
-    .brand-name { font-weight: 800; }
+    .brand-name { font-weight: 700; }
     .company-header {
       background: var(--dark);
       color: #fff;
-      border-radius: 28px;
-      padding: 1.6rem 1.8rem;
-      box-shadow: 0 18px 38px rgba(27,27,27,.16);
+      border-radius: var(--r-lg);
+      padding: 1.35rem 1.5rem;
+      box-shadow: var(--shadow-md);
     }
-    .company-eyebrow { color: #F8E08E; }
+    .company-eyebrow { color: #F0D877; }
     .company-name { color: #fff; }
     .company-link {
-      background: rgba(255,255,255,.10);
-      border-color: rgba(255,255,255,.18);
+      background: rgba(255,255,255,.08);
+      border-color: rgba(255,255,255,.16);
       color: #fff;
     }
-    .company-link:hover { background: rgba(255,255,255,.16); border-color: rgba(255,255,255,.36); }
+    .company-link:hover { background: rgba(255,255,255,.14); border-color: rgba(255,255,255,.3); }
     .company-link .link-label { color: #fff; }
-    .company-link .link-handle, .company-link .link-sep { color: rgba(255,255,255,.68); }
+    .company-link .link-handle, .company-link .link-sep { color: rgba(255,255,255,.62); }
 
-    .card--total    { background: var(--yellow-card); border-color: #ECD06D; }
-    .card--positive { background: var(--green-card);  border-color: #BEE79E; }
-    .card--negative { background: var(--pink-card);   border-color: #EEAFC8; }
-    .card--neutral  { background: var(--blue-card);   border-color: #BCD2FA; }
+    .card--total, .card--positive, .card--negative, .card--neutral {
+      background: var(--surface);
+      border-top: 3px solid var(--border);
+    }
+    .card--total    { border-top-color: #D9B23C; }
+    .card--positive { border-top-color: var(--positive); }
+    .card--negative { border-top-color: var(--negative); }
+    .card--neutral   { border-top-color: #3B6FE0; }
     .card--total .card-label,
     .card--positive .card-label,
     .card--negative .card-label,
-    .card--neutral .card-label,
+    .card--neutral .card-label { color: var(--muted); }
     .card--total .card-sub,
     .card--positive .card-sub,
     .card--negative .card-sub,
-    .card--neutral .card-sub { color: rgba(36,33,29,.68); }
+    .card--neutral .card-sub { color: var(--muted); }
     .card--total .card-value,
     .card--positive .card-value,
     .card--negative .card-value,
     .card--neutral .card-value { color: var(--text); }
 
     .score-value { color: var(--primary); }
-    .exec-stat, .comment-card, .chip, .filter-btn, .dl-btn {
-      border-radius: 16px;
+    .exec-stat, .chip, .filter-btn, .dl-btn {
+      border-radius: var(--r-sm);
     }
+    .comment-card { border-radius: var(--r-md); }
     .filter-btn.active {
-      box-shadow: 0 8px 18px rgba(90,79,207,.18);
+      box-shadow: none;
     }
     .comment-card:hover {
       transform: translateY(-1px);
@@ -774,7 +784,7 @@
     .herohead { position: relative; overflow: hidden; }
     .herohead::before {
       content: ""; position: absolute; inset: 0; pointer-events: none;
-      background: radial-gradient(560px 260px at 85% -10%, rgba(90,79,207,.35), transparent 70%);
+      background: radial-gradient(560px 260px at 85% -10%, rgba(90,79,207,.2), transparent 70%);
     }
     .herohead-top { position: relative; display: flex; align-items: flex-start; justify-content: space-between; gap: 1.2rem; flex-wrap: wrap; }
     .herohead-id { display: flex; align-items: flex-start; gap: 1rem; }
@@ -782,8 +792,8 @@
       flex-shrink: 0; width: 52px; height: 52px; border-radius: 16px;
       background: linear-gradient(150deg, #7A6FE0, #5A4FCF);
       display: flex; align-items: center; justify-content: center;
-      font-size: 1.3rem; font-weight: 800; color: #fff;
-      box-shadow: 0 10px 22px rgba(90,79,207,.35);
+      font-size: 1.25rem; font-weight: 700; color: #fff;
+      box-shadow: var(--shadow-md);
     }
     .herohead-ai-pill {
       display: inline-flex; align-items: center; gap: .3rem; margin-right: .6rem;
@@ -791,15 +801,11 @@
       letter-spacing: .03em; text-transform: uppercase;
       background: linear-gradient(120deg, rgba(122,111,224,.35), rgba(90,79,207,.2));
       border: 1px solid rgba(255,255,255,.3); color: #fff; vertical-align: middle;
-      animation: heroPillGlow 2.6s ease-in-out infinite;
     }
-    @keyframes heroPillGlow { 0%, 100% { box-shadow: 0 0 0 0 rgba(122,111,224,.25); } 50% { box-shadow: 0 0 0 5px rgba(122,111,224,0); } }
     .herohead-timestamp { display: flex; align-items: center; gap: .4rem; margin-top: .3rem; white-space: nowrap; }
     .herohead-timestamp-dot {
       width: 6px; height: 6px; border-radius: 50%; background: #6EE7A0; flex-shrink: 0;
-      box-shadow: 0 0 0 0 rgba(110,231,160,.5); animation: heroDotPulse 2s ease-in-out infinite;
-    }
-    @keyframes heroDotPulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(110,231,160,.45); } 50% { box-shadow: 0 0 0 4px rgba(110,231,160,0); } }
+      }
 
     .herokpi-grid {
       display: grid; grid-template-columns: 1.7fr 1fr 1fr 1fr; gap: 1rem; margin-bottom: 1.25rem; align-items: stretch;
@@ -812,7 +818,7 @@
       border: 1px solid var(--border);
       transition: box-shadow .2s ease, transform .2s ease;
     }
-    .herokpi-brand:hover { box-shadow: 0 16px 34px rgba(65,48,28,.09); transform: translateY(-2px); }
+    .herokpi-brand:hover { box-shadow: var(--shadow-md); transform: translateY(-1px); }
     .herokpi-brand--excellent, .herokpi-brand--good { background: linear-gradient(150deg, rgba(46,125,50,.08), rgba(46,125,50,.015)); }
     .herokpi-brand--mixed { background: linear-gradient(150deg, rgba(138,106,31,.08), rgba(138,106,31,.015)); }
     .herokpi-brand--poor { background: linear-gradient(150deg, rgba(179,38,74,.08), rgba(179,38,74,.015)); }
@@ -840,7 +846,7 @@
       display: flex; flex-direction: column; justify-content: center;
       transition: box-shadow .2s ease, transform .2s ease;
     }
-    .herokpi-card:hover { box-shadow: 0 14px 30px rgba(65,48,28,.08); transform: translateY(-2px); }
+    .herokpi-card:hover { box-shadow: var(--shadow-md); transform: translateY(-1px); }
     .herokpi-icon {
       width: 34px; height: 34px; border-radius: 10px; margin-bottom: .7rem;
       display: flex; align-items: center; justify-content: center;
@@ -864,39 +870,28 @@
 
     /* --- Section header (new, purely decorative/additive) --- */
     .analytics-hero-heading {
-      display: flex; align-items: center; gap: .85rem;
-      margin: 2.4rem 0 1.1rem;
+      display: flex; align-items: center; gap: .75rem;
+      margin: 1.75rem 0 1rem;
     }
     .analytics-hero-icon {
       width: 42px; height: 42px; border-radius: 13px; flex-shrink: 0;
       background: linear-gradient(150deg, #7A6FE0, var(--primary));
       display: flex; align-items: center; justify-content: center;
-      color: #fff; box-shadow: 0 10px 22px rgba(90,79,207,.32);
+      color: #fff; box-shadow: var(--shadow-md);
     }
-    .analytics-hero-title { font-size: 1.18rem; font-weight: 800; letter-spacing: -.01em; color: var(--text); }
+    .analytics-hero-title { font-size: 1.1rem; font-weight: 700; letter-spacing: -.01em; color: var(--text); }
     .analytics-hero-sub { font-size: .82rem; color: var(--muted); margin-top: .18rem; }
 
-    /* --- Universal premium treatment for analytics cards --- */
+    /* --- Universal treatment for analytics cards: calm hover, no motion gimmicks --- */
     .analytics-card {
       position: relative;
-      border-radius: 20px;
-      overflow: hidden;
-      transition: box-shadow .25s ease, transform .25s ease, border-color .25s ease;
-    }
-    .analytics-card::before {
-      content: "";
-      position: absolute; inset: 0 0 auto 0; height: 3px;
-      background: linear-gradient(90deg, var(--primary), #9B90F0, var(--primary));
-      background-size: 200% 100%;
-      opacity: 0; transition: opacity .25s ease;
+      border-radius: var(--r-lg);
+      transition: box-shadow .2s ease, border-color .2s ease;
     }
     .analytics-card:hover {
-      box-shadow: 0 22px 46px rgba(65,48,28,.14);
-      transform: translateY(-3px);
-      border-color: rgba(90,79,207,.32);
+      box-shadow: var(--shadow-md);
+      border-color: rgba(90,79,207,.28);
     }
-    .analytics-card:hover::before { opacity: 1; animation: analyticsSheen 2.4s linear infinite; }
-    @keyframes analyticsSheen { 0% { background-position: 0% 0; } 100% { background-position: 200% 0; } }
 
     /* --- Chart card header: icon + title + description (new pattern) --- */
     .chart-card-header { display: flex; align-items: flex-start; gap: .75rem; margin-bottom: .3rem; }
@@ -922,10 +917,10 @@
     .card--neutral .kpi-icon  { color: #1D4ED8; }
 
     /* --- grid-4 KPI row polish (scoped: fires only where .analytics-card is present) --- */
-    .grid-4 { gap: 1rem; }
-    .grid-4 .analytics-card { border-width: 1px; padding: 1.5rem 1.5rem 1.4rem; }
-    .grid-4 .analytics-card .card-value { font-size: 2.2rem; margin-top: .1rem; }
-    .grid-4 .analytics-card .card-sub { margin-top: .45rem; }
+    .grid-4 { gap: .85rem; }
+    .grid-4 .analytics-card { border-width: 1px; padding: 1.15rem 1.3rem 1.1rem; }
+    .grid-4 .analytics-card .card-value { font-size: 1.95rem; margin-top: .1rem; }
+    .grid-4 .analytics-card .card-sub { margin-top: .4rem; }
 
     /* --- Sentiment Distribution card ("Overall Sentiment Chart") --- */
     .analytics-sentiment-distribution .chart-card-header { margin-bottom: .1rem; }
@@ -1019,7 +1014,7 @@
     .pi-dist-legend { display: flex; gap: .55rem; margin-top: .35rem; font-size: .68rem; font-weight: 600; }
 
     .pi-score-cell { display: flex; align-items: center; gap: .55rem; }
-    .pi-score-value { font-size: 1.05rem; font-weight: 800; letter-spacing: -.01em; color: var(--text); min-width: 1.6rem; }
+    .pi-score-value { font-size: 1.05rem; font-weight: 700; letter-spacing: -.01em; color: var(--text); min-width: 1.6rem; }
     .pi-score-pill { margin-top: 0; white-space: nowrap; }
 
     .pi-empty-row td { padding: 0; border-bottom: none; }
@@ -1046,7 +1041,6 @@
     </a>
     <a class="nav-back" href="/">← New search</a>
   </nav>
-
   <div class="company-header herohead">
     <div class="herohead-top">
       <div class="herohead-id">
@@ -1172,29 +1166,9 @@
       <div class="card-sub herokpi-sub">across all collected reviews</div>
     </div>
   </div>
-
-  {%- set products = products | default([], true) -%}
   {%- set services = services | default([], true) -%}
-  {% if products or services %}
-  <div class="grid-2" style="margin-bottom:1.25rem;">
-    {% if products %}
-    <div class="card">
-      <div class="card-label">Products Found</div>
-      <div class="chip-list">
-        {% for p in products %}
-        <span class="chip {% if p in ((product_sentiment | default({}, true)).keys() | list) and p != 'General' %}chip-scraped{% endif %}">{{ p }}</span>
-        {% endfor %}
-      </div>
-      {% if top_positive_product or top_negative_product %}
-      <div class="card-sub" style="margin-top:.75rem;">
-        {% if top_positive_product %}Top positive: <strong style="color:var(--positive)">{{ top_positive_product }}</strong>{% endif %}
-        {% if top_positive_product and top_negative_product %} &nbsp;·&nbsp; {% endif %}
-        {% if top_negative_product %}Top negative: <strong style="color:var(--negative)">{{ top_negative_product }}</strong>{% endif %}
-      </div>
-      {% endif %}
-    </div>
-    {% endif %}
-    {% if services %}
+  {% if services %}
+  <div class="grid-2" style="margin-bottom:1.1rem;">
     <div class="card">
       <div class="card-label">Services Found</div>
       <div class="chip-list">
@@ -1203,110 +1177,8 @@
         {% endfor %}
       </div>
     </div>
-    {% endif %}
   </div>
   {% endif %}
-
-  
-  {%- set product_intelligence = product_intelligence | default([], true) -%}
-  {% if product_intelligence %}
-  <div class="card" style="margin-bottom:1.25rem;">
-    <div class="section-title">Product Intelligence</div>
-    <p class="card-sub" style="margin:-.35rem 0 1rem;">
-      Structured details pulled directly from each selected product's own page —
-      one fetch per product, covering name, brand, pricing, specifications, FAQs,
-      and on-site rating/reviews.
-    </p>
-    <div class="grid-2" style="margin-bottom:0;">
-      {% for p in product_intelligence %}
-      <div class="card" style="background:var(--bg);">
-        <div style="display:flex; gap:.9rem; align-items:flex-start;">
-          {% if p.image %}
-          <img src="{{ p.image }}" alt="{{ p.name | default('Product') }}"
-               style="width:64px; height:64px; object-fit:cover; border-radius:12px; border:1px solid var(--border); flex-shrink:0;" />
-          {% endif %}
-          <div style="flex:1; min-width:0;">
-            {% if p.brand %}<div class="card-label" style="margin-bottom:.15rem;">{{ p.brand }}</div>{% endif %}
-            <div style="font-weight:700; font-size:.95rem;">{{ p.name | default("Untitled Product") }}</div>
-            {% if p.category %}<div class="card-sub">{{ p.category }}</div>{% endif %}
-          </div>
-        </div>
-
-        {% if p.price or p.availability or p.aggregate_rating %}
-        <div class="chip-list">
-          {% if p.price %}<span class="chip">{{ p.price }}</span>{% endif %}
-          {% if p.availability %}<span class="chip">{{ p.availability }}</span>{% endif %}
-          {% if p.aggregate_rating %}<span class="chip">★ {{ p.aggregate_rating }}{% if p.rating_count %} ({{ p.rating_count }}){% endif %}</span>{% endif %}
-        </div>
-        {% endif %}
-
-        {% if p.specifications %}
-        <div style="margin-top:.9rem;">
-          <div class="card-sub" style="font-weight:600; text-transform:uppercase; letter-spacing:.05em; font-size:.68rem; margin-bottom:.4rem;">Specifications</div>
-          <table class="sentiment-table" style="margin-top:0;">
-            {% for key, value in p.specifications.items() %}
-            <tr><td style="font-weight:600; width:40%;">{{ key }}</td><td>{{ value }}</td></tr>
-            {% endfor %}
-          </table>
-        </div>
-        {% endif %}
-
-        {% if p.faq %}
-        <div style="margin-top:.9rem;">
-          <div class="card-sub" style="font-weight:600; text-transform:uppercase; letter-spacing:.05em; font-size:.68rem; margin-bottom:.4rem;">FAQ</div>
-          <div class="insight-list">
-            {% for item in p.faq %}
-            <div class="insight-item">
-              <span class="insight-icon">Q</span>
-              <div><strong>{{ item.question }}</strong><br>{{ item.answer }}</div>
-            </div>
-            {% endfor %}
-          </div>
-        </div>
-        {% endif %}
-
-        {% if p.website_reviews %}
-        <div style="margin-top:.9rem;">
-          <div class="card-sub" style="font-weight:600; text-transform:uppercase; letter-spacing:.05em; font-size:.68rem; margin-bottom:.4rem;">Website Reviews</div>
-          <div class="comments-list" style="max-height:420px;">
-            {% for r in p.website_reviews %}
-            <div class="comment-card" data-platform="Website">
-              <div class="comment-sentiment-dot" style="background: var(--neutral);"></div>
-              <div class="comment-card-inner">
-                <div class="comment-top-row">
-                  <span class="platform-badge" style="--platform-color:#5A4FCF;">
-                    <span class="platform-badge-icon">🌐</span>
-                    <span class="platform-badge-name">Website</span>
-                  </span>
-                  {% if r.rating %}<span class="badge badge-neu">★ {{ r.rating }}</span>{% endif %}
-                </div>
-                <div class="comment-body">
-                  <div class="comment-text">{{ r.text }}</div>
-                  <div class="comment-meta">
-                    {% if p.name %}<span class="product-badge">{{ p.name }}</span>{% endif %}
-                    {% if r.author %}<span class="comment-author">{{ r.author }}</span>{% endif %}
-                    {% if r.date %}<span class="comment-timestamp">{{ r.date }}</span>{% endif %}
-                  </div>
-                </div>
-              </div>
-            </div>
-            {% endfor %}
-          </div>
-        </div>
-        {% endif %}
-
-
-        {% if p.url %}
-        <div class="download-row">
-          <a class="dl-btn" href="{{ p.url }}" target="_blank">View product page →</a>
-        </div>
-        {% endif %}
-      </div>
-      {% endfor %}
-    </div>
-  </div>
-  {% endif %}
-  
   <div class="grid-4">
     <div class="card card--total analytics-card">
       <div class="kpi-icon"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div>
@@ -1333,9 +1205,8 @@
       <div class="card-sub">{{ neutral_pct | default(0) }}% of total</div>
     </div>
   </div>
-
   
-  <div class="card analytics-card analytics-sentiment-distribution" style="margin-bottom:1.25rem;">
+  <div class="card analytics-card analytics-sentiment-distribution" style="margin-bottom:1.1rem;">
     <div class="chart-card-header">
       <div class="chart-card-icon">
         <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="10" width="4" height="10" rx="1"/><rect x="10" y="4" width="4" height="16" rx="1"/><rect x="17" y="13" width="4" height="7" rx="1"/></svg>
@@ -1358,9 +1229,7 @@
       </div>
     </div>
   </div>
-
-  
-  <div class="grid-2 analytics-grid" style="margin-bottom:1.25rem;">
+  <div class="grid-2 analytics-grid" style="margin-bottom:1.1rem;">
     <div class="card sentiment-breakdown-card analytics-card">
       <div class="chart-card-header">
         <div class="chart-card-icon">
@@ -1457,17 +1326,20 @@
         </div>
       </div>
       <div class="platform-list">
-        {%- set platform_counts = platform_counts | default({}, true) -%}
         {%- set pc_google = platform_counts.Google | default(0) -%}
         {%- set pc_twitter = platform_counts.Twitter | default(0) -%}
         {%- set pc_instagram = platform_counts.Instagram | default(0) -%}
         {%- set pc_youtube = platform_counts.YouTube | default(0) -%}
-        {%- set max_count = [pc_google, pc_twitter, pc_instagram, pc_youtube] | max -%}
+        {%- set pc_reddit = platform_counts.Reddit | default(0) -%}
+        {%- set pc_website = platform_counts.Website | default(0) -%}
+        {%- set max_count = [pc_google, pc_twitter, pc_instagram, pc_youtube, pc_reddit, pc_website] | max -%}
         {% set platforms = [
           ('Google', pc_google, '🔍', '#4285F4'),
           ('Twitter / X', pc_twitter, '𝕏', '#000000'),
           ('Instagram', pc_instagram, '📸', '#E1306C'),
-          ('YouTube', pc_youtube, '▶', '#FF0000')
+          ('YouTube', pc_youtube, '▶', '#FF0000'),
+          ('Reddit', pc_reddit, '🧵', '#FF4500'),
+          ('Website', pc_website, '🌐', '#0F766E')
         ] %}
         {% for name, count, icon, color in platforms %}
         <div class="platform-row">
@@ -1485,11 +1357,10 @@
       </div>
     </div>
   </div>
-
   {%- set product_sentiment = product_sentiment | default({}, true) -%}
   {% if product_sentiment and (product_sentiment.keys() | list | length) > 1 %}
   
-  <div class="card analytics-card analytics-product-comparison" style="margin-bottom:1.25rem;">
+  <div class="card analytics-card analytics-product-comparison" style="margin-bottom:1.1rem;">
     <div class="chart-card-header">
       <div class="chart-card-icon">
         <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
@@ -1562,11 +1433,21 @@
     </div>
   </div>
   {% endif %}
-
+  {%- set summary = summary | default({}, true) -%}
+  {% if summary.key_insights %}
+  <div class="card" style="margin-bottom:1.1rem;">
+    <div class="section-title">Key Insights</div>
+    <div class="insight-list">
+      {% for item in summary.key_insights %}
+      <div class="insight-item"><span class="insight-icon">•</span><span>{{ item }}</span></div>
+      {% endfor %}
+    </div>
+  </div>
+  {% endif %}
   
   {%- set aspect_intelligence = aspect_intelligence | default({}, true) -%}
   {% if aspect_intelligence %}
-  <div class="card" style="margin-bottom:1.25rem;">
+  <div class="card" style="margin-bottom:1.1rem;">
     <div class="section-title">Aspect-Based Sentiment</div>
     <p class="card-sub" style="margin:-.35rem 0 1rem;">
       What reviewers actually say, broken down by product feature —
@@ -1610,14 +1491,13 @@
     {% endfor %}
   </div>
   {% endif %}
-
   {%- set confidence_score = confidence_score | default({}, true) -%}
   {%- set buying_recommendation = buying_recommendation | default({}, true) -%}
   {%- set product_recommendations = product_recommendations | default({}, true) -%}
   {%- set buyrec_class = buying_recommendation.css_class | default('no-data') -%}
   {%- set conf_class = confidence_score.css_class | default('no-data') -%}
   {%- set conf_score_val = confidence_score.score | default(0) -%}
-  <div class="card buyrec-card" style="margin-bottom:1.25rem;">
+  <div class="card buyrec-card" style="margin-bottom:1.1rem;">
     <div class="section-title">Buying Recommendation &amp; Confidence</div>
     <p class="card-sub" style="margin:-.35rem 0 1rem;">
       Combines overall sentiment, per-aspect scores, review volume, and
@@ -1699,12 +1579,12 @@
     </div>
     {% endif %}
   </div>
-
   {%- set brand_reputation = brand_reputation | default({}, true) -%}
   {%- set brand_gmaps = brand_reputation.google_maps | default({}, true) -%}
   {%- set brand_class = (brand_reputation.score_label | default("No Data")) | lower | replace(' ', '-') -%}
   {%- set gmaps_class = (brand_gmaps.score_label | default("No Data")) | lower | replace(' ', '-') -%}
-  <div class="card brandrep-card" style="margin-bottom:1.25rem;">
+  {% if (brand_reputation.total | default(0)) > 0 or (brand_gmaps.total | default(0)) > 0 %}
+  <div class="card brandrep-card" style="margin-bottom:1.1rem;">
     <div class="section-title">Brand Reputation</div>
     <p class="card-sub" style="margin:-.35rem 0 1rem;">
       Kept separate from product sentiment above — this covers Google Maps
@@ -1789,9 +1669,106 @@
     </div>
     {% endif %}
   </div>
+  {% endif %}
+  {%- set product_intelligence = product_intelligence | default([], true) -%}
+  {% if product_intelligence %}
+  <div class="card" style="margin-bottom:1.1rem;">
+    <div class="section-title">Product Intelligence</div>
+    <p class="card-sub" style="margin:-.35rem 0 1rem;">
+      Structured details pulled directly from each selected product's own page —
+      one fetch per product, covering name, brand, pricing, specifications, FAQs,
+      and on-site rating/reviews.
+    </p>
+    <div class="grid-2" style="margin-bottom:0;">
+      {% for p in product_intelligence %}
+      <div class="card" style="background:var(--bg);">
+        <div style="display:flex; gap:.9rem; align-items:flex-start;">
+          {% if p.image %}
+          <img src="{{ p.image }}" alt="{{ p.name | default('Product') }}"
+               style="width:64px; height:64px; object-fit:cover; border-radius:12px; border:1px solid var(--border); flex-shrink:0;" />
+          {% endif %}
+          <div style="flex:1; min-width:0;">
+            {% if p.brand %}<div class="card-label" style="margin-bottom:.15rem;">{{ p.brand }}</div>{% endif %}
+            <div style="font-weight:700; font-size:.95rem;">{{ p.name | default("Untitled Product") }}</div>
+            {% if p.category %}<div class="card-sub">{{ p.category }}</div>{% endif %}
+          </div>
+        </div>
 
-  
-  <div class="card" style="margin-bottom:1.25rem;">
+        {% if p.price or p.availability or p.aggregate_rating %}
+        <div class="chip-list">
+          {% if p.price %}<span class="chip">{{ p.price }}</span>{% endif %}
+          {% if p.availability %}<span class="chip">{{ p.availability }}</span>{% endif %}
+          {% if p.aggregate_rating %}<span class="chip">★ {{ p.aggregate_rating }}{% if p.rating_count %} ({{ p.rating_count }}){% endif %}</span>{% endif %}
+        </div>
+        {% endif %}
+
+        {% if p.specifications %}
+        <div style="margin-top:.9rem;">
+          <div class="card-sub" style="font-weight:600; text-transform:uppercase; letter-spacing:.05em; font-size:.68rem; margin-bottom:.4rem;">Specifications</div>
+          <table class="sentiment-table" style="margin-top:0;">
+            {% for key, value in p.specifications.items() %}
+            <tr><td style="font-weight:600; width:40%;">{{ key }}</td><td>{{ value }}</td></tr>
+            {% endfor %}
+          </table>
+        </div>
+        {% endif %}
+
+        {% if p.faq %}
+        <div style="margin-top:.9rem;">
+          <div class="card-sub" style="font-weight:600; text-transform:uppercase; letter-spacing:.05em; font-size:.68rem; margin-bottom:.4rem;">FAQ</div>
+          <div class="insight-list">
+            {% for item in p.faq[:1] %}
+            <div class="insight-item">
+              <span class="insight-icon">Q</span>
+              <div><strong>{{ item.question }}</strong><br>{{ item.answer }}</div>
+            </div>
+            {% endfor %}
+          </div>
+        </div>
+        {% endif %}
+
+        {% if p.website_reviews %}
+        <div style="margin-top:.9rem;">
+          <div class="card-sub" style="font-weight:600; text-transform:uppercase; letter-spacing:.05em; font-size:.68rem; margin-bottom:.4rem;">Website Reviews</div>
+          <div class="comments-list" style="max-height:420px;">
+            {% for r in p.website_reviews %}
+            <div class="comment-card" data-platform="Website">
+              <div class="comment-sentiment-dot" style="background: var(--neutral);"></div>
+              <div class="comment-card-inner">
+                <div class="comment-top-row">
+                  <span class="platform-badge" style="--platform-color:#5A4FCF;">
+                    <span class="platform-badge-icon">🌐</span>
+                    <span class="platform-badge-name">Website</span>
+                  </span>
+                  {% if r.rating %}<span class="badge badge-neu">★ {{ r.rating }}</span>{% endif %}
+                </div>
+                <div class="comment-body">
+                  <div class="comment-text">{{ r.text }}</div>
+                  <div class="comment-meta">
+                    {% if p.name %}<span class="product-badge">{{ p.name }}</span>{% endif %}
+                    {% if r.author %}<span class="comment-author">{{ r.author }}</span>{% endif %}
+                    {% if r.date %}<span class="comment-timestamp">{{ r.date }}</span>{% endif %}
+                  </div>
+                </div>
+              </div>
+            </div>
+            {% endfor %}
+          </div>
+        </div>
+        {% endif %}
+
+
+        {% if p.url %}
+        <div class="download-row">
+          <a class="dl-btn" href="{{ p.url }}" target="_blank">View product page →</a>
+        </div>
+        {% endif %}
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+  {% endif %}
+  <div class="card" style="margin-bottom:1.1rem;">
     <div class="section-title">Platform-wise Sentiment</div>
     <table class="sentiment-table">
       <thead>
@@ -1817,150 +1794,6 @@
       </tbody>
     </table>
   </div>
-
-  
-  {%- set summary = summary | default({}, true) %}
-  <div class="card" style="margin-bottom:1.25rem;">
-    <div class="section-title">Executive Summary</div>
-    <p class="summary-text">{{ summary.executive_summary | default("Summary unavailable.") }}</p>
-
-    <div class="exec-grid">
-      <div class="exec-stat">
-        <div class="exec-label">Overall Brand Score</div>
-        <div class="exec-value">{{ brand_score | default(0) }} <span class="exec-unit">/ 100</span></div>
-      </div>
-      <div class="exec-stat">
-        <div class="exec-label">Overall Sentiment</div>
-        <div class="exec-value">{{ summary.overall_sentiment | default("No Data") }}</div>
-      </div>
-      <div class="exec-stat">
-        <div class="exec-label">Products Analysed</div>
-        <div class="exec-value">{{ products_scraped | default(0) }}</div>
-      </div>
-      <div class="exec-stat">
-        <div class="exec-label">Platforms Covered</div>
-        <div class="exec-value">{{ summary.platforms_covered | default(0) }}</div>
-      </div>
-      <div class="exec-stat">
-        <div class="exec-label">Total Reviews</div>
-        <div class="exec-value">{{ total | default(0) }}</div>
-      </div>
-      <div class="exec-stat">
-        <div class="exec-label">Top Positive Product</div>
-        <div class="exec-value exec-value--sm" style="color:var(--positive)">{{ top_positive_product | default("", true) or "—" }}</div>
-      </div>
-      <div class="exec-stat">
-        <div class="exec-label">Top Negative Product</div>
-        <div class="exec-value exec-value--sm" style="color:var(--negative)">{{ top_negative_product | default("", true) or "—" }}</div>
-      </div>
-      <div class="exec-stat">
-        <div class="exec-label">Most Discussed Product</div>
-        <div class="exec-value exec-value--sm">{{ most_discussed_product | default("", true) or "—" }}</div>
-      </div>
-      <div class="exec-stat">
-        <div class="exec-label">Most Mentioned Feature</div>
-        <div class="exec-value exec-value--sm">{{ summary.most_mentioned_feature | default("Not enough data") }}</div>
-      </div>
-      <div class="exec-stat">
-        <div class="exec-label">Buying Recommendation</div>
-        <div class="exec-value exec-value--sm">{{ (summary.buying_recommendation | default({}, true)).label | default("No Data") }}</div>
-      </div>
-      <div class="exec-stat">
-        <div class="exec-label">Confidence Score</div>
-        <div class="exec-value">{{ (summary.confidence_score | default({}, true)).score | default(0) }} <span class="exec-unit">/ 100</span></div>
-      </div>
-    </div>
-
-    {% if summary.product_summaries %}
-    <div class="insight-heading">Product-by-Product Summary</div>
-    <div class="insight-list" style="margin-bottom:1.1rem;">
-      {% for item in summary.product_summaries %}
-      <div class="insight-item">
-        <span class="insight-icon">•</span>
-        <span>
-          <strong>{{ item.product }}:</strong> {{ item.summary }}
-          {% if item.recommendation %}
-          <span class="score-label {{ item.recommendation.css_class | default('no-data') }}" style="margin-left:.4rem; margin-top:0; vertical-align:middle;">{{ item.recommendation.label }}</span>
-          {% endif %}
-        </span>
-      </div>
-      {% endfor %}
-    </div>
-    {% endif %}
-
-    {% if summary.key_insights %}
-    <div class="insight-heading">Key Insights</div>
-    <div class="insight-list" style="margin-bottom:1.1rem;">
-      {% for item in summary.key_insights %}
-      <div class="insight-item"><span class="insight-icon">•</span><span>{{ item }}</span></div>
-      {% endfor %}
-    </div>
-    {% endif %}
-
-    <div class="insight-columns">
-      <div>
-        <div class="insight-heading">Key Positive Insights</div>
-        <div class="insight-list">
-          {% for item in summary.key_positive_insights | default([], true) %}
-          <div class="insight-item"><span class="insight-icon" style="color:var(--positive)">✓</span><span>{{ item }}</span></div>
-          {% endfor %}
-        </div>
-      </div>
-      <div>
-        <div class="insight-heading">Key Customer Complaints</div>
-        <div class="insight-list">
-          {% for item in summary.key_complaints | default([], true) %}
-          <div class="insight-item"><span class="insight-icon" style="color:var(--negative)">!</span><span>{{ item }}</span></div>
-          {% endfor %}
-        </div>
-      </div>
-    </div>
-
-    {% if summary.best_aspects or summary.worst_aspects %}
-    <div class="insight-columns" style="margin-top:1.1rem;">
-      <div>
-        <div class="insight-heading">Best-Performing Aspects</div>
-        <div class="insight-list">
-          {% for a in summary.best_aspects | default([], true) %}
-          <div class="insight-item"><span class="insight-icon" style="color:var(--positive)">✓</span><span><strong>{{ a.aspect }}</strong> ({{ a.product }}) — {{ a.score }}/100</span></div>
-          {% else %}
-          <div class="insight-item"><span>Not enough aspect data collected yet.</span></div>
-          {% endfor %}
-        </div>
-      </div>
-      <div>
-        <div class="insight-heading">Aspects Needing Attention</div>
-        <div class="insight-list">
-          {% for a in summary.worst_aspects | default([], true) %}
-          <div class="insight-item"><span class="insight-icon" style="color:var(--negative)">!</span><span><strong>{{ a.aspect }}</strong> ({{ a.product }}) — {{ a.score }}/100</span></div>
-          {% else %}
-          <div class="insight-item"><span>Not enough aspect data collected yet.</span></div>
-          {% endfor %}
-        </div>
-      </div>
-    </div>
-    {% endif %}
-
-    <div class="insight-heading" style="margin-top:1.1rem;">Suggested Improvements</div>
-    <div class="insight-list">
-      {% for rec in summary.recommendations | default([], true) %}
-      <div class="insight-item">
-        <span class="insight-icon">→</span>
-        <span>{{ rec }}</span>
-      </div>
-      {% endfor %}
-    </div>
-
-    {% if pdf_path %}
-    <div style="margin-top:1.4rem; border-top:1px solid var(--border); padding-top:1.1rem;">
-      <div class="card-label">Export Data</div>
-      <div class="download-row">
-        <a class="dl-btn" href="/{{ pdf_path }}">↓ 📄 Download Analysis Report</a>
-      </div>
-    </div>
-    {% endif %}
-  </div>
-
   {% macro comment_card(c) %}
   {%- set _pl = (c.platform | default('')) | lower -%}
   {%- set _picon = '▶' if 'you' in _pl else ('🔍' if 'goog' in _pl else ('👽' if 'reddit' in _pl else ('𝕏' if ('twit' in _pl or _pl == 'x') else ('📸' if 'insta' in _pl else ('🌐' if ('web' in _pl or 'site' in _pl) else '💬'))))) -%}
@@ -1983,7 +1816,7 @@
         <div class="comment-text">{{ c.comment | default("") }}</div>
         <div class="comment-meta">
           {% if c.product and c.product != 'General' %}<span class="product-badge">{{ c.product }}</span>{% endif %}
-          {% if c.date %}<span class="comment-timestamp">{{ c.date }}</span>{% endif %}
+          {% if c.timestamp %}<span class="comment-timestamp">{{ c.timestamp }}</span>{% endif %}
         </div>
       </div>
     </div>
@@ -2037,7 +1870,14 @@
       {% else %}<div class="empty"><div class="empty-icon"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div><div>No comments collected yet for this platform — try running the analysis again later.</div></div>{% endif %}
     </div>
   </div>
-
+  {% if pdf_path %}
+  <div class="card" style="margin-bottom:1.1rem;">
+    <div class="section-title">Download Report</div>
+    <div class="download-row">
+      <a class="dl-btn" href="/{{ pdf_path }}">↓ 📄 Download Analysis Report</a>
+    </div>
+  </div>
+  {% endif %}
 </div>
 
 <script>

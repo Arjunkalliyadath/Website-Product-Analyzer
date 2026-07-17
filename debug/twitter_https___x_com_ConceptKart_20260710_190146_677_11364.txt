@@ -1,4 +1,0 @@
-reason: nav_failure
-target_url: https://x.com/ConceptKart
-final_url: https://x.com/ConceptKart
-page_title: Conceptkart.com (@conceptkart) / X

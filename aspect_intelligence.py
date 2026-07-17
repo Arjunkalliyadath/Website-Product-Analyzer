@@ -1,71 +1,102 @@
 """
-aspect_intelligence.py
-------------------------
-Phase 1 of the Product Aspect Intelligence layer.
+Module Name: aspect_intelligence.py
 
-This module is intentionally separate from `product_intelligence.py`.
-`product_intelligence.py` already owns a different meaning of "Product
-Intelligence" in this codebase - CATALOG data (price, availability,
-specs, FAQ, on-page rating) fetched once from each product's own page.
-This module instead works on REVIEW TEXT already collected by the
-existing Google/Twitter/Instagram/YouTube scrapers and already
-sentiment-scored by sentiment.py. To avoid redefining or colliding with
-the existing "Product Intelligence" name/contract, this new layer is
-called "Aspect Intelligence" throughout.
+Purpose:
+    Phase 1 of the Product Aspect Intelligence layer. Detects fixed-taxonomy
+    product aspects (Sound Quality, Bass, Treble, Vocals, Comfort, Build
+    Quality, Cable, Accessories, Microphone, Battery, Connectivity, Price,
+    Value for Money, Packaging, Delivery, Customer Service, Warranty,
+    Durability, Fit, Gaming, Noise Isolation) inside review text already
+    collected by the existing Google/Twitter/Instagram/YouTube scrapers,
+    classifies sentiment on the LOCAL snippet around each mention (not the
+    whole comment), and aggregates per-product, per-aspect Score,
+    Frequency, and Importance metrics.
 
-Scope of THIS phase only:
-    - Aspect detection: a fixed, product-review-relevant taxonomy
-      (Sound Quality, Bass, Treble, Vocals, Comfort, Build Quality,
-      Cable, Accessories, Microphone, Battery, Connectivity, Price,
-      Value for Money, Packaging, Delivery, Customer Service, Warranty,
-      Durability, Fit, Gaming, Noise Isolation), matched via a curated
-      keyword/phrase lexicon.
-    - Per-aspect sentiment: classified on the LOCAL snippet of text
-      around each aspect mention (not the whole comment), reusing the
-      existing, already-vetted sentiment.py pipeline
-      (analyze_sentiment_batch / get_sentiment_pipeline) so a comment
-      like "great sound but the battery life is disappointing" yields
-      Sound Quality: positive and Battery: negative, instead of one
-      blended label for the whole comment.
-    - Aggregation per product: Aspect Score (0-100, same weighting and
-      label bands as the brand/product score already used elsewhere in
-      app.py - positive counts fully, neutral counts half), Frequency
-      (how many / what % of that product's reviews mention this aspect),
-      and Importance (this aspect's share of ALL aspect mentions for the
-      product - how much of the aspect-level conversation is about this
-      aspect specifically, relative to every other aspect discussed).
+    This module is intentionally separate from `product_intelligence.py`,
+    which owns a different meaning of "Product Intelligence" in this
+    codebase (CATALOG data - price, availability, specs, FAQ, on-page
+    rating - fetched once from each product's own page). To avoid
+    colliding with that existing name/contract, this layer is called
+    "Aspect Intelligence" throughout.
 
-Explicitly OUT of scope for this phase (future phases, by agreement):
-    - Confidence Score (review count, platform diversity, cross-platform
-      agreement, duplicate handling, sentiment consistency -> 0-100)
-    - Recommendation Engine (Highly Recommended / Recommended / Mixed /
-      Buy with Caution / Not Recommended) and its human-readable
-      explanation
-    - Any change to the PDF report
+Responsibilities:
+    - Match a curated keyword/phrase lexicon against comment text to
+      detect aspect mentions (most-specific phrase first, at most one
+      mention per aspect per comment).
+    - Isolate the local clause around each mention so a comment such as
+      "great sound quality but the battery life is disappointing" yields
+      independent sentiment for Sound Quality and Battery instead of one
+      blended label.
+    - Classify sentiment on every extracted snippet via the existing,
+      already-vetted sentiment.py pipeline (analyze_sentiment_batch /
+      get_sentiment_pipeline) rather than a second hand-rolled lexicon.
+    - Aggregate, per product and per aspect: Score (0-100, same weighting
+      and label bands as app.py's brand/product score - positive counts
+      fully, neutral counts half), Frequency (how many / what % of that
+      product's reviews mention this aspect), and Importance (this
+      aspect's share of all aspect mentions for that product).
+    - Degrade to "no aspect data for this product" on any internal failure
+      rather than raising, so this phase can never break the existing
+      comment_rows / product_sentiment / brand_reputation / summary / PDF
+      pipeline.
 
-Design notes:
-    - Aspect extraction only ever runs over `product_rows` (comments
-      already attributed to a selected product by the existing
-      _split_product_and_brand_rows() in app.py) - never over
-      `brand_rows`/General/Google-Maps comments. This keeps Brand
-      Reputation completely separate from product-level intelligence,
-      matching the separation the pipeline already enforces for
-      product_sentiment vs brand_reputation.
-    - "Other meaningful aspects if present" (freeform aspect discovery
-      beyond the fixed taxonomy) is NOT implemented in this phase - doing
-      that reliably needs NLP/LLM-based key-phrase extraction, and this
-      codebase is deliberately offline/network-free at analysis time (see
-      sentiment.py). The fixed taxonomy below is easy to extend with more
-      phrases or additional aspects without touching the extraction logic.
-    - Nothing here raises. Any failure degrades to "no aspect data for
-      this product" rather than breaking the existing comment_rows /
-      product_sentiment / brand_reputation / summary / PDF pipeline that
-      already works.
+Architecture:
+    Aspect extraction runs only over `product_rows` (comments already
+    attributed to a selected product by app.py's
+    _split_product_and_brand_rows()) - never over `brand_rows`/General/
+    Google-Maps comments - keeping Brand Reputation separate from
+    product-level intelligence, matching the existing product_sentiment
+    vs brand_reputation separation.
 
-Public entry point (the only thing app.py should call):
-    build_aspect_intelligence_by_product(product_rows, pipe=None)
-        -> Dict[str, List[Dict[str, Any]]]   # product name -> aspects,
-                                              # sorted by mention count desc
+    "Other meaningful aspects if present" (freeform aspect discovery
+    beyond the fixed taxonomy) is out of scope for this phase - reliable
+    freeform discovery needs NLP/LLM-based key-phrase extraction, and this
+    codebase is deliberately offline/network-free at analysis time (see
+    sentiment.py). The fixed taxonomy is easy to extend with more phrases
+    or aspects without touching the extraction logic.
+
+    Explicitly out of scope for this phase (future phases, by agreement):
+    Confidence Score, the Recommendation Engine and its explanation, and
+    any change to the PDF report.
+
+    Public entry point (the only thing app.py should call):
+        build_aspect_intelligence_by_product(product_rows, pipe=None)
+            -> Dict[str, List[Dict[str, Any]]]
+
+Aspect Pipeline:
+    1. For every row in `product_rows`, track each product's total review
+       count (for Frequency), then run the fixed lexicon against the
+       comment text and extract a local clause snippet around every
+       aspect mention found - pure text/regex work, no model calls yet.
+    2. Run one batched sentiment call (analyze_sentiment_batch) across
+       every extracted snippet from every product, and attach the
+       resulting label back onto each mention record.
+    3. Group mention records by product, then by aspect, and aggregate
+       each aspect's positive/negative/neutral counts, percentages,
+       Score, Frequency, Importance, and up to MAX_SAMPLE_SNIPPETS
+       positive/negative sample snippets. Aspects are sorted by mention
+       count (descending) within each product; products with no detected
+       aspect mentions are absent from the result.
+
+Inputs:
+    product_rows: List[Dict[str, Any]] - comment rows already attributed
+        to a selected product (each with at least "product", "comment",
+        and "platform" keys).
+    pipe: Optional[Any] - an already-loaded sentiment pipeline object from
+        sentiment.get_sentiment_pipeline(); loaded/reused internally when
+        omitted.
+
+Outputs:
+    Dict[str, List[Dict[str, Any]]] mapping product name to a list of
+    per-aspect summaries (aspect, positive/negative/neutral counts and
+    percentages, score, score_label, frequency, frequency_pct,
+    importance_pct, sample_positive, sample_negative), sorted by mention
+    count descending. Returns {} when there are no product_rows, no
+    detected aspect mentions, or on any internal failure - never raises.
+
+Dependencies:
+    logging, re, typing, and sentiment (analyze_sentiment_batch,
+    get_sentiment_pipeline).
 """
 
 from __future__ import annotations
@@ -78,14 +109,6 @@ from sentiment import analyze_sentiment_batch, get_sentiment_pipeline
 
 logger = logging.getLogger(__name__)
 
-# --------------------------------------------------------------------------
-# Aspect taxonomy
-# --------------------------------------------------------------------------
-# Ordered as requested. Each aspect maps to a list of trigger phrases,
-# most-specific first (checked in order; first phrase that matches wins
-# so "sound quality" is preferred over a bare "sound" match when both
-# would apply to the same span of text).
-# --------------------------------------------------------------------------
 ASPECT_LEXICON: Dict[str, List[str]] = {
     "Sound Quality": [
         "sound quality", "audio quality", "sound performance",
@@ -144,27 +167,13 @@ ASPECT_LEXICON: Dict[str, List[str]] = {
     ],
 }
 
-# Snippet window (characters on each side of the matched phrase) used as
-# the OUTER bound when scoping sentiment classification to the LOCAL
-# context of a mention.
 _SNIPPET_RADIUS_CHARS = 70
 
-# Clause boundaries: sentence punctuation plus contrastive/coordinating
-# conjunctions. Used to clamp each snippet to the surrounding clause
-# rather than a fixed character window, so a review like "great sound
-# quality but the battery life is disappointing" correctly isolates
-# "the battery life is disappointing" for Battery instead of also pulling
-# in "great...quality" from the unrelated clause on the other side of
-# "but". Falls back to the fixed radius above when no boundary is found
-# nearby (e.g. short single-clause comments).
 _BOUNDARY_RE = re.compile(
     r"[.!?;]+|\b(?:but|however|although|though|while|except|yet|whereas|and|so|because)\b",
     re.IGNORECASE,
 )
 
-# Precompiled, case-insensitive, word-bounded patterns for every phrase,
-# built once at import time (pure regex compilation - no network, no I/O,
-# safe to do eagerly unlike sentiment.py's model loading).
 _ASPECT_PATTERNS: Dict[str, List[re.Pattern]] = {
     aspect: [re.compile(r"\b" + re.escape(phrase) + r"\b", re.IGNORECASE) for phrase in phrases]
     for aspect, phrases in ASPECT_LEXICON.items()
@@ -172,14 +181,6 @@ _ASPECT_PATTERNS: Dict[str, List[re.Pattern]] = {
 
 MAX_SAMPLE_SNIPPETS = 2
 
-
-# --------------------------------------------------------------------------
-# Score / label bands - identical weighting to app.py's
-# _compute_brand_score(), duplicated locally (small, pure function) so this
-# module has no import-time dependency on app.py, mirroring the same
-# "small local copy" pattern product_intelligence.py already uses for its
-# own fetch settings.
-# --------------------------------------------------------------------------
 
 def _score(positive: int, negative: int, neutral: int, total: int) -> Tuple[float, str]:
     if not total:
@@ -198,27 +199,13 @@ def _score(positive: int, negative: int, neutral: int, total: int) -> Tuple[floa
     return score, label
 
 
-# --------------------------------------------------------------------------
-# Aspect mention extraction
-# --------------------------------------------------------------------------
-
 def _extract_snippet(text: str, start: int, end: int) -> str:
-    """Local clause around a matched aspect phrase.
-
-    Clamps to the nearest clause boundary (sentence punctuation or a
-    contrastive/coordinating conjunction) on each side, within an outer
-    radius of _SNIPPET_RADIUS_CHARS, so sentiment classification sees only
-    the clause actually describing this aspect - not an adjacent clause
-    with different (possibly opposite) sentiment. Falls back to the plain
-    radius, trimmed to a word boundary, when no clause boundary is found
-    within range (typical for short, single-clause comments).
-    """
     lo_limit = max(0, start - _SNIPPET_RADIUS_CHARS)
     hi_limit = min(len(text), end + _SNIPPET_RADIUS_CHARS)
 
     lo = lo_limit
     for m in _BOUNDARY_RE.finditer(text, lo_limit, start):
-        lo = m.end()  # keep the LAST boundary before the match = clause start
+        lo = m.end()
     if lo == lo_limit and lo > 0:
         space_at = text.find(" ", lo, start)
         if space_at != -1:
@@ -227,7 +214,7 @@ def _extract_snippet(text: str, start: int, end: int) -> str:
     hi = hi_limit
     m = _BOUNDARY_RE.search(text, end, hi_limit)
     if m:
-        hi = m.start()  # first boundary after the match = clause end
+        hi = m.start()
     elif hi < len(text):
         space_at = text.rfind(" ", end, hi)
         if space_at != -1:
@@ -238,10 +225,6 @@ def _extract_snippet(text: str, start: int, end: int) -> str:
 
 
 def _find_aspect_mentions(comment: str) -> Dict[str, str]:
-    """Returns {aspect_name: local_snippet} for every aspect mentioned in
-    this comment. At most one mention per aspect per comment (first
-    matching phrase, first occurrence) - frequency counts then mean
-    "how many reviews mention this aspect", not raw keyword hits."""
     mentions: Dict[str, str] = {}
     for aspect, patterns in _ASPECT_PATTERNS.items():
         for pattern in patterns:
@@ -251,10 +234,6 @@ def _find_aspect_mentions(comment: str) -> Dict[str, str]:
                 break
     return mentions
 
-
-# --------------------------------------------------------------------------
-# Aggregation
-# --------------------------------------------------------------------------
 
 def _unique_snippets(records: List[Dict[str, Any]], sentiment: str, limit: int) -> List[str]:
     seen: set = set()
@@ -272,15 +251,19 @@ def _unique_snippets(records: List[Dict[str, Any]], sentiment: str, limit: int) 
     return out
 
 
+def _count_by_sentiment(records: List[Dict[str, Any]], sentiment: str) -> int:
+    return sum(1 for r in records if r["sentiment"] == sentiment)
+
+
 def _summarize_aspect(
     aspect: str,
     records: List[Dict[str, Any]],
     total_mentions_for_product: int,
     total_reviews_for_product: int,
 ) -> Dict[str, Any]:
-    positive = sum(1 for r in records if r["sentiment"] == "positive")
-    negative = sum(1 for r in records if r["sentiment"] == "negative")
-    neutral = sum(1 for r in records if r["sentiment"] == "neutral")
+    positive = _count_by_sentiment(records, "positive")
+    negative = _count_by_sentiment(records, "negative")
+    neutral = _count_by_sentiment(records, "neutral")
     total = len(records)
 
     score, score_label = _score(positive, negative, neutral, total)
@@ -296,17 +279,11 @@ def _summarize_aspect(
         "neutral_pct": round((neutral / total) * 100, 1) if total else 0.0,
         "score": score,
         "score_label": score_label,
-        # Frequency: how many / what % of THIS PRODUCT'S reviews mention
-        # this aspect at all.
         "frequency": total,
         "frequency_pct": (
             round((total / total_reviews_for_product) * 100, 1)
             if total_reviews_for_product else 0.0
         ),
-        # Importance: this aspect's share of ALL aspect mentions for this
-        # product - i.e. how much of the aspect-level conversation is
-        # about this aspect specifically, relative to every other aspect
-        # discussed for the same product.
         "importance_pct": (
             round((total / total_mentions_for_product) * 100, 1)
             if total_mentions_for_product else 0.0
@@ -320,34 +297,12 @@ def build_aspect_intelligence_by_product(
     product_rows: List[Dict[str, Any]],
     pipe: Optional[Any] = None,
 ) -> Dict[str, List[Dict[str, Any]]]:
-    """Builds per-product aspect intelligence from comment rows that are
-    already attributed to a selected product (see
-    app._split_product_and_brand_rows() - pass its `product_rows` output
-    here, never `brand_rows`).
-
-    `pipe` may be the already-loaded sentiment pipeline object the caller
-    obtained from sentiment.get_sentiment_pipeline() (recommended, avoids
-    a redundant lookup); if omitted, this module loads/reuses it itself.
-
-    Returns {product_name: [aspect_summary, ...]}, aspects sorted by
-    mention count (descending). Products with no detected aspect mentions
-    are simply absent from the result - callers/templates should treat a
-    missing or empty dict as "no aspect data available" and degrade
-    gracefully (dashboard.html only renders this section when non-empty).
-
-    Never raises: any internal failure logs and returns {} rather than
-    propagating, so it can never break the existing sentiment / summary /
-    PDF pipeline that already works.
-    """
     if not product_rows:
         return {}
 
     try:
         active_pipe = pipe if pipe is not None else get_sentiment_pipeline()
 
-        # Step 1 - extract aspect mentions per comment (pure text/regex
-        # work, no model calls yet), tracking each product's total review
-        # count along the way for the Frequency calculation below.
         mention_records: List[Dict[str, Any]] = []
         product_review_counts: Dict[str, int] = {}
         for row in product_rows:
@@ -369,16 +324,11 @@ def build_aspect_intelligence_by_product(
         if not mention_records:
             return {}
 
-        # Step 2 - one batched sentiment call for every extracted snippet
-        # across every product, reusing the same pipeline/keyword-fallback
-        # logic already vetted for whole-comment sentiment elsewhere in
-        # this app, instead of a second hand-rolled lexicon.
         snippet_texts = [m["snippet"] for m in mention_records]
         snippet_sentiments = analyze_sentiment_batch(active_pipe, snippet_texts)
         for record, sentiment in zip(mention_records, snippet_sentiments):
             record["sentiment"] = sentiment
 
-        # Step 3 - group by product, then by aspect, and aggregate.
         by_product: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
         for record in mention_records:
             by_product.setdefault(record["product"], {}).setdefault(record["aspect"], []).append(record)

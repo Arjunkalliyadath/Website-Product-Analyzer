@@ -1,4 +1,0 @@
-reason: nav_failure
-target_url: https://x.com/Headphone_Zone
-final_url: https://x.com/Headphone_Zone
-page_title: Headphone Zone (@Headphone_Zone) / X

@@ -219,6 +219,98 @@
       .footer { flex-direction: column; align-items: stretch; }
       .footer-left { justify-content: space-between; }
     }
+
+    /* ============================================================
+       PHASE 2 — ANALYSIS-PHASE LOADING OVERLAY
+       Covers the work that happens inside POST /analyze_selected:
+       collecting reviews, running sentiment analysis, and building
+       the executive report — right up until the dashboard loads.
+       ============================================================ */
+    .analysis-overlay {
+      display: none;
+      position: fixed; inset: 0; z-index: 60;
+      background: rgba(247,242,233,.97);
+      backdrop-filter: blur(6px);
+      align-items: center; justify-content: center;
+      padding: 1.5rem;
+      overflow-y: auto;
+    }
+    .analysis-overlay.active { display: flex; }
+    .analysis-card {
+      width: 100%; max-width: 440px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 22px;
+      padding: 2rem;
+      box-shadow: 0 20px 44px rgba(65,48,28,.1);
+    }
+    .analysis-title { font-size: 1.05rem; font-weight: 700; margin-bottom: .3rem; }
+    .analysis-subtitle { font-size: .82rem; color: var(--muted); margin-bottom: 1.75rem; }
+
+    .stage-list { display: flex; flex-direction: column; gap: 1.1rem; margin-bottom: 1.75rem; }
+    .stage { display: flex; align-items: center; gap: .8rem; }
+    .stage-indicator {
+      position: relative;
+      width: 22px; height: 22px; flex-shrink: 0;
+      border-radius: 50%;
+      border: 2px solid var(--border);
+      display: grid; place-items: center;
+    }
+    .stage-label { font-size: .88rem; font-weight: 500; color: var(--muted); transition: color .2s; }
+    .stage.active .stage-indicator {
+      border-color: var(--border); border-top-color: var(--primary);
+      animation: stage-spin .8s linear infinite;
+    }
+    .stage.active .stage-label { color: var(--text); font-weight: 600; }
+    .stage.done .stage-indicator { border-color: var(--positive); background: var(--positive); animation: none; }
+    .stage.done .stage-indicator::after { content: "✓"; color: #fff; font-size: .68rem; font-weight: 700; }
+    .stage.done .stage-label { color: var(--text); }
+    @keyframes stage-spin { to { transform: rotate(360deg); } }
+
+    .live-details {
+      display: flex; justify-content: center; gap: .75rem;
+      padding: 1rem; background: var(--bg); border: 1px solid var(--border); border-radius: 14px;
+      margin-bottom: 1.5rem;
+    }
+    .live-detail { text-align: center; }
+    .live-detail-value { font-size: 1.15rem; font-weight: 800; color: var(--primary); }
+    .live-detail-label { font-size: .66rem; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; margin-top: .15rem; }
+
+    .analysis-log-toggle {
+      display: flex; align-items: center; justify-content: space-between; gap: .5rem;
+      width: 100%; background: none; border: none; cursor: pointer;
+      font-family: inherit; font-size: .82rem; font-weight: 600; color: var(--muted);
+      padding: .4rem 0;
+    }
+    .analysis-log-toggle:hover { color: var(--primary); }
+    .analysis-log-toggle .chevron { transition: transform .15s; font-size: .9rem; }
+    .analysis-log-toggle.open .chevron { transform: rotate(180deg); }
+    .analysis-log {
+      display: none;
+      list-style: none;
+      font-size: .78rem;
+      padding: .6rem 0 0;
+      flex-direction: column; gap: .45rem;
+      max-height: 160px; overflow-y: auto;
+    }
+    .analysis-log.open { display: flex; }
+    .analysis-log li { display: flex; align-items: center; gap: .5rem; }
+    .analysis-log li.log-done { color: var(--muted); }
+    .analysis-log li.log-done::before { content: "✓"; color: var(--positive); font-weight: 700; }
+
+    /* --- Completion screen --- */
+    .completion-card { text-align: center; display: none; }
+    .completion-card.active { display: block; }
+    .completion-check {
+      width: 50px; height: 50px; border-radius: 50%;
+      background: var(--positive); color: #fff;
+      display: grid; place-items: center;
+      font-size: 1.25rem; font-weight: 700;
+      margin: 0 auto 1rem;
+    }
+    .completion-title { font-size: 1.1rem; font-weight: 700; margin-bottom: 1.25rem; }
+    .completion-stats { display: flex; justify-content: center; margin-bottom: 1.25rem; }
+    .completion-note { font-size: .8rem; color: var(--muted); }
   </style>
 </head>
 <body>
@@ -292,6 +384,76 @@
     <div class="modal-title">Hold on</div>
     <div class="modal-message">Please select at least one product before analyzing.</div>
     <button type="button" class="btn btn-primary" id="modalCloseBtn">Got it</button>
+  </div>
+</div>
+
+<div class="analysis-overlay" id="analysisOverlay">
+  <div class="analysis-card">
+
+    <!-- Progress state -->
+    <div id="progressState">
+      <div class="analysis-title">Analyzing <span id="analysisProductCount">0</span> products</div>
+      <div class="analysis-subtitle">This can take a minute or two — feel free to wait here.</div>
+
+      <div class="stage-list" id="analysisStageList">
+        <div class="stage" data-stage="0">
+          <span class="stage-indicator"></span>
+          <span class="stage-label">Collecting Reviews</span>
+        </div>
+        <div class="stage" data-stage="1">
+          <span class="stage-indicator"></span>
+          <span class="stage-label">Running AI Sentiment Analysis</span>
+        </div>
+        <div class="stage" data-stage="2">
+          <span class="stage-indicator"></span>
+          <span class="stage-label">Generating Executive Report</span>
+        </div>
+      </div>
+
+      <!--
+        LIVE DETAILS
+        Only "Products" is real (the person's own selection). Platforms and
+        Reviews used to show numbers here too, but /analyze_selected is a
+        single synchronous request with no progress feed to bind them to —
+        they were animating with Math.random() and had no relationship to
+        the real counts, so they were removed rather than shown as fake
+        data. If a real status endpoint (SSE / WebSocket / polling) is added
+        later, this is where genuine live counts should go back in.
+      -->
+      <div class="live-details">
+        <div class="live-detail">
+          <div class="live-detail-value" id="liveProducts">0</div>
+          <div class="live-detail-label">Products</div>
+        </div>
+      </div>
+
+      <button type="button" class="analysis-log-toggle" id="logToggle">
+        <span>View Analysis Log</span>
+        <span class="chevron">⌄</span>
+      </button>
+      <!--
+        ANALYSIS LOG
+        Lines are generated client-side in step with the stage timer above,
+        purely so this section has something meaningful to show today. The
+        markup/IDs are designed so a future backend log stream can populate
+        this list directly instead — no backend log plumbing is assumed here.
+      -->
+      <ul class="analysis-log" id="analysisLog"></ul>
+    </div>
+
+    <!-- Completion state -->
+    <div class="completion-card" id="completionCard">
+      <div class="completion-check">✓</div>
+      <div class="completion-title">Analysis Complete</div>
+      <div class="completion-stats">
+        <div class="live-detail">
+          <div class="live-detail-value" id="finalProducts">0</div>
+          <div class="live-detail-label">Products Found</div>
+        </div>
+      </div>
+      <div class="completion-note">Opening dashboard…</div>
+    </div>
+
   </div>
 </div>
 
@@ -404,12 +566,96 @@
   // checkboxes themselves stay unnamed and are never submitted directly.
   const selectedProductsInput = document.getElementById('selectedProductsInput');
 
+  // ---- Phase 2 analysis overlay: stages, live details, log, completion ----
+  const analysisOverlay        = document.getElementById('analysisOverlay');
+  const progressState          = document.getElementById('progressState');
+  const completionCard         = document.getElementById('completionCard');
+  const analysisStages         = Array.from(document.querySelectorAll('#analysisStageList .stage'));
+  const liveProductsEl         = document.getElementById('liveProducts');
+  const analysisProductCountEl = document.getElementById('analysisProductCount');
+  const logToggle              = document.getElementById('logToggle');
+  const analysisLog            = document.getElementById('analysisLog');
+  const finalProductsEl        = document.getElementById('finalProducts');
+
+  logToggle.addEventListener('click', function () {
+    logToggle.classList.toggle('open');
+    analysisLog.classList.toggle('open');
+  });
+
+  function addLogLine(text) {
+    const li = document.createElement('li');
+    li.className = 'log-done';
+    li.textContent = text;
+    analysisLog.appendChild(li);
+    analysisLog.scrollTop = analysisLog.scrollHeight;
+  }
+
+  // Purely illustrative pacing for the stepper, log, and live counters.
+  // /analyze_selected is a single synchronous request today with no real
+  // progress feed to bind to, so none of this timer is treated as ground
+  // truth — the fetch() in the submit handler below is what actually
+  // decides when the work is done, never this animation.
+  function runProgressAnimation() {
+    const logLines = [
+      'Connected to review sources',
+      'Reviews collected',
+      'Sentiment model running',
+      'Sentiment scoring complete',
+      'Compiling executive report'
+    ];
+
+    let stageIndex = 0;
+    function advanceStage() {
+      if (stageIndex > 0) {
+        analysisStages[stageIndex - 1].classList.remove('active');
+        analysisStages[stageIndex - 1].classList.add('done');
+      }
+      if (stageIndex < analysisStages.length) {
+        analysisStages[stageIndex].classList.add('active');
+        // As with the discovery-phase overlay on the landing page, the last
+        // stage is deliberately left spinning rather than auto-marked done —
+        // real completion is only ever signalled by the fetch() resolving.
+        if (stageIndex < analysisStages.length - 1) {
+          setTimeout(advanceStage, 2200);
+        }
+      }
+      stageIndex++;
+    }
+    advanceStage();
+
+    let logIndex = 0;
+    const logTimer = setInterval(function () {
+      if (logIndex < logLines.length) {
+        addLogLine(logLines[logIndex]);
+        logIndex++;
+      } else {
+        clearInterval(logTimer);
+      }
+    }, 1400);
+
+    return function stopAnimation() {
+      clearInterval(logTimer);
+    };
+  }
+
+  function showCompletion(productCount) {
+    analysisStages.forEach(function (s) {
+      s.classList.remove('active');
+      s.classList.add('done');
+    });
+    progressState.style.display = 'none';
+    finalProductsEl.textContent = productCount;
+    completionCard.classList.add('active');
+  }
+
   form.addEventListener('submit', function (e) {
+    e.preventDefault();
+
     if (countChecked() === 0) {
-      e.preventDefault();
       showModal();
       return;
     }
+
     const selected = [];
     for (let i = 0; i < cards.length; i++) {
       if (checkboxes[i].checked) {
@@ -421,6 +667,46 @@
       }
     }
     selectedProductsInput.value = JSON.stringify(selected);
+
+    const productCount = selected.length;
+    liveProductsEl.textContent = productCount;
+    analysisProductCountEl.textContent = productCount;
+    analysisOverlay.classList.add('active');
+
+    const stopAnimation = runProgressAnimation();
+
+    // BACKEND INTEGRATION NOTE: this fetch hits the exact same action/method
+    // the <form> already posts to (/analyze_selected) with the same field
+    // values — we're only intercepting the browser's default navigation so
+    // the overlay above can be shown while the request is in flight, and a
+    // completion screen can be shown once it's genuinely done. This assumes
+    // /analyze_selected returns the fully rendered dashboard HTML in its
+    // response body (as the original plain <form> submission relied on). If
+    // that route is ever changed to issue an HTTP redirect instead, swap the
+    // document.write() below for `window.location.href = res.url`.
+    const formData = new FormData(form);
+    fetch(form.action, { method: 'POST', body: formData })
+      .then(function (res) {
+        if (!res.ok) throw new Error('Analysis request failed with status ' + res.status);
+        return res.text();
+      })
+      .then(function (html) {
+        stopAnimation();
+        showCompletion(productCount);
+        setTimeout(function () {
+          document.open();
+          document.write(html);
+          document.close();
+        }, 1000);
+      })
+      .catch(function (err) {
+        // Never leave the person stuck behind the overlay — fall back to a
+        // normal full-page submission if anything about the fetch fails.
+        console.error(err);
+        stopAnimation();
+        analysisOverlay.classList.remove('active');
+        form.submit();
+      });
   });
 
   refresh();

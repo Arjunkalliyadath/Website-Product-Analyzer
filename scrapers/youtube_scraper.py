@@ -13,7 +13,7 @@ from urllib.parse import quote_plus
 
 import httpx
 
-from scrapers.browser_utils import browser_launch_slot, normalize_comments
+from scrapers.browser_utils import browser_launch_slot, normalize_comments, find_social_profile_url
 from config import (
     MAX_YOUTUBE_COMMENTS,
     MAX_SCROLL_ITERATIONS,
@@ -1565,10 +1565,32 @@ async def scrape_youtube_comments(company_data: Dict[str, str]) -> List[str]:
     target = (
         company_data.get("youtube_url")
         or company_data.get("youtube")
-        or company_data.get("company_name", "")
     )
+
+    loop = asyncio.get_event_loop()
+
     if not target:
-        return []
+        company_name = (company_data.get("company_name") or "").strip()
+        if company_name:
+            try:
+                target = await loop.run_in_executor(
+                    _EXECUTOR, find_social_profile_url, company_name, "youtube",
+                )
+            except Exception:
+                target = ""
+            if target:
+                logger.info(
+                    "YouTube scrape: no channel from the site scan; "
+                    "search fallback found %r for %r.", target, company_name,
+                )
+        if not target:
+            logger.info(
+                "YouTube scrape: no channel from the site scan and the "
+                "search fallback found nothing for %r; skipping rather "
+                "than guessing a handle from the name.",
+                company_data.get("company_name"),
+            )
+            return []
 
     videos_url = _channel_url(target).rstrip("/") + "/videos"
     company_name = company_data.get("company_name", target)
@@ -1578,7 +1600,6 @@ async def scrape_youtube_comments(company_data: Dict[str, str]) -> List[str]:
     product_name = (company_data.get("product_name") or "").strip()
     product_brand = (company_data.get("product_brand") or "").strip()
 
-    loop = asyncio.get_event_loop()
     try:
         return await loop.run_in_executor(
             _EXECUTOR, _run_sync, company_name, videos_url, product_name, product_brand,

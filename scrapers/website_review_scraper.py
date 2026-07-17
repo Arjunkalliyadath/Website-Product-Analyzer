@@ -153,7 +153,12 @@ _HEADER_PROFILES: List[Dict[str, str]] = [
             "image/avif,image/webp,*/*;q=0.8"
         ),
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
+        # NOTE: no Accept-Encoding here (or in the other profiles). Hardcoding
+        # "gzip, deflate, br" made servers respond with brotli, which this
+        # venv's httpx cannot decode (no brotli package installed) — so every
+        # extraction tier ran against raw compressed bytes and found nothing.
+        # Leaving the header out lets httpx advertise exactly what it can
+        # actually decode.
         "Sec-Ch-Ua": '"Chromium";v="126", "Google Chrome";v="126", "Not-A.Brand";v="99"',
         "Sec-Ch-Ua-Mobile": "?0",
         "Sec-Ch-Ua-Platform": '"Windows"',
@@ -174,7 +179,6 @@ _HEADER_PROFILES: List[Dict[str, str]] = [
             "image/webp,*/*;q=0.8"
         ),
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
         "Sec-Fetch-Dest": "document",
         "Sec-Fetch-Mode": "navigate",
         "Sec-Fetch-Site": "same-origin",
@@ -190,7 +194,6 @@ _HEADER_PROFILES: List[Dict[str, str]] = [
             "image/avif,image/webp,*/*;q=0.8"
         ),
         "Accept-Language": "en-US,en;q=0.5",
-        "Accept-Encoding": "gzip, deflate, br",
         "Upgrade-Insecure-Requests": "1",
     },
 ]
@@ -361,12 +364,38 @@ def _extract_myshopify_domain(html: str) -> Optional[str]:
     return m.group(1).lower() if m else None
 
 
+def _extract_judgeme_dom(html: str) -> List[_Review]:
+    """Server-rendered Judge.me reviews, straight out of the product page
+    HTML. Judge.me's tokenless public widget API now answers 401
+    ("Failed to authenticate. Shop domain or Api Token is wrong" —
+    verified live against boat-lifestyle.com), so the API tier below can
+    no longer be the primary path. Fortunately most storefronts render
+    the first page of reviews directly into the product HTML as
+    .jdgm-rev__body elements, which this reads without any extra request."""
+    if "jdgm" not in html and "judge.me" not in html:
+        return []
+    out: List[_Review] = []
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        for body in soup.select(".jdgm-rev__body, .jdgm-rev__text"):
+            text = body.get_text(" ", strip=True)
+            if text and len(text.split()) >= _MIN_WORDS:
+                out.append(_Review(text=text, source="judgeme"))
+    except Exception:
+        pass
+    return out
+
+
 def _extract_judgeme(
     client: httpx.Client,
     html: str,
     shop_domains: List[str],
     fallback_product_id: Optional[str] = None,
 ) -> List[_Review]:
+    dom_reviews = _extract_judgeme_dom(html)
+    if dom_reviews:
+        return dom_reviews
+
     m = _JUDGEME_ID_RE.search(html)
     product_id = (m.group(1) or m.group(2)) if m else None
     has_fingerprint = "judge.me" in html or "jdgm" in html

@@ -1,6 +1,7 @@
 import asyncio
 import atexit
 import concurrent.futures
+import json
 import logging
 import re
 import sys
@@ -417,11 +418,17 @@ _IG_LOGIN_TEXT_MARKERS = (
 )
 
 
-def _httpx_preflight_blocked(url: str) -> bool:
-    """One plain GET, no retry: True if the response is already an
-    unambiguous login-wall/redirect, False if it looks navigable (or if
-    the check itself is inconclusive - in which case the existing
-    Playwright path decides, unchanged)."""
+def _httpx_preflight(url: str) -> "Tuple[bool, str]":
+    """One plain GET, no retry. Returns (blocked, html):
+
+    * blocked - True if the response is already an unambiguous
+      login-wall/redirect, False if it looks navigable (or if the check
+      itself is inconclusive - in which case the existing Playwright path
+      decides, unchanged).
+    * html - whatever HTML came back, so the caller can mine the
+      contextJSON payload out of it (present even on login-walled embed
+      pages) instead of throwing the response away.
+    """
     try:
         with httpx.Client(follow_redirects=True) as client:
             resp = client.get(
@@ -435,19 +442,85 @@ def _httpx_preflight_blocked(url: str) -> bool:
                 },
             )
     except Exception:
-        return False  # inconclusive - let the browser path try properly
+        return False, ""  # inconclusive - let the browser path try properly
 
+    html = resp.text or ""
     final_url = str(resp.url)
     if any(marker in final_url for marker in _IG_LOGIN_MARKERS):
-        return True
-    body_sample = resp.text[:20000].lower()
-    return any(marker in body_sample for marker in _IG_LOGIN_TEXT_MARKERS)
+        return True, html
+    body_sample = html[:20000].lower()
+    return any(marker in body_sample for marker in _IG_LOGIN_TEXT_MARKERS), html
 
 
 def _looks_blocked(page) -> bool:
     """Kept for internal call-site compatibility; now backed by the fuller
     ``_diagnose_page_state`` classification above."""
     return _diagnose_page_state(page) != "ok"
+
+
+# --- Embedded-JSON extraction ----------------------------------------------
+# Instagram's profile /embed/ page now login-walls the *rendered* DOM for
+# unauthenticated sessions (every recent run's debug capture shows
+# login_wall_present=True with zero caption elements), but the very same
+# HTML still ships the profile's recent posts as structured JSON inside a
+# "contextJSON" script payload — including each post's caption text and
+# shortcode (verified against a saved debug capture: 6 posts, all with
+# captions). Parsing that JSON out of the raw HTML sidesteps the login
+# wall entirely and needs no browser at all.
+_CONTEXT_JSON_RE = re.compile(r'"contextJSON":"((?:[^"\\]|\\.)*)"')
+
+
+def _parse_embed_context(html: str) -> "Tuple[List[str], List[str]]":
+    """Extract (caption/comment texts, post shortcodes) from a profile or
+    post /embed/ page's raw HTML. Returns ([], []) when the payload is
+    absent or unparseable — callers treat that as "nothing found", never
+    as an error."""
+    if not html:
+        return [], []
+    m = _CONTEXT_JSON_RE.search(html)
+    if not m:
+        return [], []
+    try:
+        # The payload is a JSON string *inside* a JSON document, so it
+        # decodes in two steps: un-escape the string, then parse it.
+        data = json.loads(json.loads('"' + m.group(1) + '"'))
+    except Exception:
+        return [], []
+    ctx = (data or {}).get("context") or {}
+    texts: List[str] = []
+    shortcodes: List[str] = []
+    for media in ctx.get("graphql_media") or []:
+        node = (media or {}).get("shortcode_media") or {}
+        if not isinstance(node, dict):
+            continue
+        sc = node.get("shortcode")
+        if sc and sc not in shortcodes:
+            shortcodes.append(sc)
+        for key in ("edge_media_to_caption", "edge_media_to_parent_comment",
+                    "edge_media_preview_comment"):
+            for edge in ((node.get(key) or {}).get("edges")) or []:
+                text = (((edge or {}).get("node") or {}).get("text") or "").strip()
+                if text:
+                    texts.append(text)
+    return texts, shortcodes
+
+
+def _clean_candidate(txt: str) -> str:
+    """Shared filter for caption/comment candidates: strips trailing UI
+    chrome and rejects short/non-review text. Returns "" when the text
+    should be dropped. Used both by the browser path's ``_add`` and by the
+    browser-free embedded-JSON path."""
+    txt = (txt or "").strip()
+    # Embed-DOM captions arrive wrapped in widget chrome: a leading bare
+    # username line and a trailing "View all N comments" link. Stripping
+    # both makes the DOM copy identical to the contextJSON copy of the
+    # same caption, so the two dedupe instead of double-counting.
+    txt = re.sub(r"^[A-Za-z0-9._]{2,30}\s*\n+", "", txt)
+    txt = re.sub(r"\s*View all(\s+\d+)?\s+comments\s*$", "", txt, flags=re.IGNORECASE)
+    txt = re.sub(r"\s*(Reply|See translation)\s*$", "", txt).strip()
+    if not txt or len(txt.split()) < 6 or _is_non_review(txt):
+        return ""
+    return txt
 
 
 # Evidence directory for zero-result debug captures. Lives at
@@ -778,16 +851,35 @@ async def scrape_instagram_comments(company_data: Dict[str, str]) -> List[str]:
 
     embed_preflight_url = profile_url.rstrip("/") + "/embed/"
     try:
-        preflight_blocked = await loop.run_in_executor(_EXECUTOR, _httpx_preflight_blocked, embed_preflight_url)
+        preflight_blocked, preflight_html = await loop.run_in_executor(
+            _EXECUTOR, _httpx_preflight, embed_preflight_url,
+        )
     except Exception:
-        preflight_blocked = False
+        preflight_blocked, preflight_html = False, ""
+
+    # Mine the embed page's contextJSON payload (recent posts' captions +
+    # shortcodes) out of the plain-HTTP response before any browser work.
+    # This survives the login wall: Instagram walls the rendered DOM but
+    # still ships this JSON in the same HTML.
+    seed_texts, seed_shortcodes = _parse_embed_context(preflight_html)
+    if seed_texts or seed_shortcodes:
+        logger.info(
+            "Instagram scrape: embedded contextJSON on %s yielded %d "
+            "caption/comment text(s) and %d post shortcode(s) without a browser.",
+            embed_preflight_url, len(seed_texts), len(seed_shortcodes),
+        )
+
     if preflight_blocked:
+        seed_clean = normalize_comments(
+            [t for t in (_clean_candidate(c) for c in seed_texts) if t]
+        )[:MAX_INSTAGRAM_COMMENTS]
         logger.info(
             "Instagram scrape: preflight detected a login wall for %s before "
-            "touching the browser pool - returning [] immediately "
-            "(reason=login_wall, no Chromium launch spent on this).", embed_preflight_url,
+            "touching the browser pool - returning %d embedded-JSON item(s) "
+            "immediately (reason=login_wall, no Chromium launch spent on this).",
+            embed_preflight_url, len(seed_clean),
         )
-        return []
+        return seed_clean
 
     def _run() -> List[str]:
         if sys.platform.startswith("win"):
@@ -807,15 +899,14 @@ async def scrape_instagram_comments(company_data: Dict[str, str]) -> List[str]:
 
         def _add(txt: str) -> None:
             nonlocal duplicates_removed
-            txt = (txt or "").strip()
-            # Strip trailing UI affordances that sometimes get bundled
-            # into the same text node as the caption/comment itself (e.g.
-            # a lingering "Reply" button label or "See translation"
-            # link), so two otherwise-identical comments aren't treated
-            # as unique just because one has this trailing chrome and the
-            # other doesn't.
-            txt = re.sub(r"\s*(Reply|See translation)\s*$", "", txt).strip()
-            if not txt or len(txt.split()) < 6 or _is_non_review(txt):
+            # _clean_candidate strips trailing UI affordances that
+            # sometimes get bundled into the same text node as the
+            # caption/comment itself (a lingering "Reply" button label,
+            # "See translation" link), so two otherwise-identical comments
+            # aren't treated as unique just because one has this trailing
+            # chrome and the other doesn't.
+            txt = _clean_candidate(txt)
+            if not txt:
                 return
             key = " ".join(txt.split()).lower()
             if key in seen:
@@ -823,6 +914,12 @@ async def scrape_instagram_comments(company_data: Dict[str, str]) -> List[str]:
                 return
             seen.add(key)
             results.append(txt)
+
+        # Captions recovered browser-free from the embed page's contextJSON
+        # payload go in first — the browser passes below only need to add
+        # to them (and the dedupe in _add keeps overlap harmless).
+        for txt in seed_texts:
+            _add(txt)
 
         page = None
         try:
@@ -850,7 +947,12 @@ async def scrape_instagram_comments(company_data: Dict[str, str]) -> List[str]:
 
             # --- Primary attempt: public embed page (no login wall) -------
             embed_url = profile_url.rstrip("/") + "/embed/"
-            post_links: List[str] = []
+            # Post permalinks discovered browser-free from contextJSON
+            # shortcodes come first; the click-through discovery below only
+            # runs if this seeding produced nothing.
+            post_links: List[str] = [
+                f"https://www.instagram.com/p/{sc}/" for sc in seed_shortcodes
+            ]
             profile_page_loaded = None  # None = fallback never attempted
             embed_page_loaded = _goto_with_retry(page, embed_url, timeout=_adaptive_nav_timeout(time_left), time_left=time_left)
             if embed_page_loaded:
@@ -894,6 +996,20 @@ async def scrape_instagram_comments(company_data: Dict[str, str]) -> List[str]:
                             _add(loc.inner_text())
                         except Exception:
                             pass
+                # The rendered DOM is usually login-walled, but the page
+                # source still carries the contextJSON payload — mine it
+                # here too in case the browser was served a different
+                # variant than the httpx preflight (or the preflight failed).
+                try:
+                    page_texts, page_shortcodes = _parse_embed_context(page.content())
+                    for txt in page_texts:
+                        _add(txt)
+                    for sc in page_shortcodes:
+                        link = f"https://www.instagram.com/p/{sc}/"
+                        if link not in post_links:
+                            post_links.append(link)
+                except Exception:
+                    pass
                 try:
                     # Instagram's profile embed grid renders every
                     # thumbnail as <a href="#" role="link"> - the real
@@ -905,7 +1021,10 @@ async def scrape_instagram_comments(company_data: Dict[str, str]) -> List[str]:
                     # the resulting page URL, which the widget updates to
                     # the individual post's own permalink.
                     thumbs_sel = "a[role='link'][href='#']"
-                    thumb_count = page.locator(thumbs_sel).count()
+                    # Skip click-through discovery entirely when contextJSON
+                    # already gave us real permalinks — each discovery click
+                    # costs a navigation round-trip out of the time budget.
+                    thumb_count = 0 if post_links else page.locator(thumbs_sel).count()
                     for idx in range(min(thumb_count, MAX_POSTS_TO_DISCOVER)):
                         if time_left() <= 4:
                             break
@@ -1027,6 +1146,15 @@ async def scrape_instagram_comments(company_data: Dict[str, str]) -> List[str]:
                             _add(loc.inner_text())
                         except Exception:
                             pass
+                # Post embeds sometimes carry their own contextJSON payload
+                # (caption + preview comments) in the page source even when
+                # the rendered DOM shows nothing extractable.
+                try:
+                    post_texts, _ = _parse_embed_context(page.content())
+                    for txt in post_texts:
+                        _add(txt)
+                except Exception:
+                    pass
                 logger.info(
                     "Instagram scrape: post=%s contributed %d new item(s); "
                     "running total=%d/%d.",

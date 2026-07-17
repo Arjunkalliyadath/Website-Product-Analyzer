@@ -67,6 +67,8 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional
 from urllib.parse import urlencode
 
+from bs4 import BeautifulSoup
+
 from scrapers.browser_utils import normalize_comments
 
 logger = logging.getLogger(__name__)
@@ -103,6 +105,22 @@ _REQUEST_DELAY_SECONDS = 0.4       # brief pause between successive Reddit reque
 # soft-throttled.
 _USER_AGENT = "ManobhavaAI/1.0 (product review discussion scraper; contact: support@manobhava.ai)"
 _HEADERS = {"User-Agent": _USER_AGENT, "Accept": "application/json"}
+
+# Browser-shaped headers for the old.reddit.com HTML fallback below.
+# Verified live (2026-07-17): reddit.com's edge now answers HTTP 403
+# ("blocked by network security") to EVERY *.json endpoint from this
+# client — search, comments, even subreddit listings, under any
+# User-Agent, and even from a real headless Chromium. The one thing it
+# still serves anonymously is old.reddit.com's server-rendered *HTML*,
+# provided the request looks like a normal browser page view.
+_BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 # --- Source fallback chain --------------------------------------------------
 # www.reddit.com/search.json returned a blanket HTTP 403 on *every single*
@@ -251,17 +269,21 @@ def _get_json(url: str, timeout: float, retries: int = 1) -> Optional[Dict]:
             return None
 
 
-def _search_reddit(query: str, time_left: float) -> "tuple[List[Dict], str]":
+def _search_reddit(query: str, time_left: float) -> "tuple[List[Dict], str, str]":
     """Search Reddit for discussion posts matching ``query``. Restricted to
     self (text) posts via Reddit's own ``self:yes`` search operator, with
     client-side filtering (_is_discussion_post) as a defense-in-depth
     second pass.
 
-    Tries each domain in _SEARCH_DOMAINS in turn, stopping at the first
-    one that returns a usable payload (a source fallback, not a retry -
-    see the _SEARCH_DOMAINS comment above). Returns (posts, domain) so the
-    caller can reuse the same working domain for the comment-thread
-    fetches that follow, instead of re-discovering it per post.
+    Tries each JSON domain in _SEARCH_DOMAINS in turn, stopping at the
+    first one that returns a usable payload (a source fallback, not a
+    retry - see the _SEARCH_DOMAINS comment above). When *every* JSON
+    endpoint fails (the edge-block signature — see _BROWSER_HEADERS),
+    falls back to old.reddit.com's server-rendered HTML search.
+
+    Returns (posts, domain, transport): transport is "json" or "html" so
+    the caller fetches each post's comments over the same transport that
+    the search itself just proved is working.
     """
     params = {
         "q": f"{query} self:yes",
@@ -283,10 +305,21 @@ def _search_reddit(query: str, time_left: float) -> "tuple[List[Dict], str]":
             # This domain answered but had nothing usable for this query -
             # that's a real "no results" signal, not a block, so don't
             # burn the remaining domains on the same query.
-            return [], domain
+            return [], domain, "json"
         discussion_posts.sort(key=lambda p: p.get("num_comments", 0), reverse=True)
-        return discussion_posts[:MAX_CANDIDATE_POSTS_PER_TIER], domain
-    return [], _SEARCH_DOMAINS[-1]
+        return discussion_posts[:MAX_CANDIDATE_POSTS_PER_TIER], domain, "json"
+
+    # Every JSON endpoint failed — the edge-block signature, not a
+    # no-results signal. Try the HTML front-end before giving up.
+    if time_left > 1:
+        html_posts = _search_reddit_html(query, time_left)
+        if html_posts:
+            logger.info(
+                "Reddit scrape: JSON endpoints blocked; HTML fallback found "
+                "%d discussion post(s) for %r.", len(html_posts), query,
+            )
+            return html_posts, "old.reddit.com", "html"
+    return [], _SEARCH_DOMAINS[-1], "json"
 
 
 def _fetch_post_comments(domain: str, subreddit: str, post_id: str, post_title: str, time_left: float) -> List[RedditComment]:
@@ -332,6 +365,116 @@ def _fetch_post_comments(domain: str, subreddit: str, post_id: str, post_title: 
         ))
         if len(out) >= MAX_COMMENTS_PER_POST:
             break
+    return out
+
+
+# --- HTML fallback transport (old.reddit.com server-rendered pages) --------
+# Used automatically when every JSON endpoint is edge-blocked (403) — see
+# the note above _BROWSER_HEADERS. Search results and comment threads are
+# parsed out of old.reddit.com's HTML instead; the discussion-post
+# filtering intent is preserved (the same `self:yes` operator is applied
+# server-side, plus the same title/ad exclusions client-side).
+
+def _get_html(url: str, timeout: float) -> Optional[str]:
+    request = urllib.request.Request(url, headers=_BROWSER_HEADERS)
+    try:
+        with urllib.request.urlopen(request, timeout=max(2.0, timeout)) as resp:
+            return resp.read().decode("utf-8", errors="ignore")
+    except Exception:
+        logger.warning("Reddit HTML request failed for %s", url)
+        return None
+
+
+def _search_reddit_html(query: str, time_left: float) -> List[Dict]:
+    """Search via old.reddit.com's HTML search page. Returns posts
+    normalized to the same minimal dict shape _scrape_sync reads
+    (subreddit / id / title / num_comments, plus permalink for the HTML
+    comment fetch)."""
+    url = f"https://old.reddit.com/search?{urlencode({'q': f'{query} self:yes'})}"
+    html_text = _get_html(url, time_left)
+    if not html_text:
+        return []
+
+    posts: List[Dict] = []
+    try:
+        soup = BeautifulSoup(html_text, "html.parser")
+        for div in soup.select("div.search-result-link"):
+            fullname = div.get("data-fullname") or ""  # "t3_<id>"
+            post_id = fullname.split("_", 1)[1] if fullname.startswith("t3_") else ""
+            title_a = div.select_one("a.search-title")
+            title = title_a.get_text(strip=True) if title_a else ""
+            sub_a = div.select_one("a.search-subreddit-link")
+            subreddit = (sub_a.get_text(strip=True) if sub_a else "").removeprefix("r/")
+            comments_a = div.select_one("a.search-comments")
+            permalink = comments_a.get("href") if comments_a else ""
+            m = re.search(r"(\d+)", comments_a.get_text() if comments_a else "")
+            num_comments = int(m.group(1)) if m else 0
+
+            if not post_id or not subreddit or not permalink:
+                continue
+            if not num_comments:
+                continue
+            if _EXCLUDED_TITLE_RE.search(title):
+                continue
+            posts.append({
+                "subreddit": subreddit,
+                "id": post_id,
+                "title": title,
+                "num_comments": num_comments,
+                "permalink": permalink,
+            })
+    except Exception:
+        logger.warning("Reddit HTML search parse failed for %r", query, exc_info=True)
+        return []
+
+    posts.sort(key=lambda p: p.get("num_comments", 0), reverse=True)
+    return posts[:MAX_CANDIDATE_POSTS_PER_TIER]
+
+
+def _fetch_post_comments_html(permalink: str, post_title: str, time_left: float) -> List[RedditComment]:
+    """Top-level comments parsed out of an old.reddit.com thread page —
+    the HTML-transport counterpart of _fetch_post_comments, applying the
+    same author/body filters."""
+    html_text = _get_html(permalink, time_left)
+    if not html_text:
+        return []
+
+    out: List[RedditComment] = []
+    try:
+        soup = BeautifulSoup(html_text, "html.parser")
+        area = soup.select_one("div.commentarea")
+        if area is None:
+            return []
+        for c in area.select("div.sitetable > div.comment"):
+            classes = c.get("class") or []
+            if "stickied" in classes or "deleted" in classes:
+                continue
+            author_a = c.select_one("a.author")
+            author = author_a.get_text(strip=True) if author_a else ""
+            if author.lower() in _EXCLUDED_AUTHORS:
+                continue
+            entry = c.select_one("div.entry")
+            md = entry.select_one("div.md") if entry else None
+            body = md.get_text(" ", strip=True) if md else ""
+            if not body or body in _REMOVED_BODIES:
+                continue
+
+            cleaned = _clean_reddit_markdown(body)
+            if not cleaned or len(cleaned.split()) < 3:
+                continue
+
+            score_span = c.select_one("span.score.unvoted")
+            m = re.search(r"(-?\d+)", score_span.get_text() if score_span else "")
+            out.append(RedditComment(
+                post_title=post_title,
+                comment_text=cleaned,
+                author=author or "unknown",
+                upvotes=int(m.group(1)) if m else 0,
+            ))
+            if len(out) >= MAX_COMMENTS_PER_POST:
+                break
+    except Exception:
+        logger.warning("Reddit HTML comment parse failed for %s", permalink, exc_info=True)
     return out
 
 
@@ -404,7 +547,7 @@ def _scrape_sync(company_name: str, product_name: str, product_brand: str) -> Li
             break
 
         # Search Reddit for posts matching the current query
-        posts, working_domain = _search_reddit(query, time_left())
+        posts, working_domain, transport = _search_reddit(query, time_left())
 
         # Skip to the next search tier if no posts were found
         if not posts:
@@ -434,14 +577,22 @@ def _scrape_sync(company_name: str, product_name: str, product_brand: str) -> Li
             if not subreddit or not post_id:
                 continue
 
-            # Retrieve comments from the current Reddit post
-            comments = _fetch_post_comments(
-                working_domain,
-                subreddit,
-                post_id,
-                title,
-                time_left(),
-            )
+            # Retrieve comments from the current Reddit post, over the
+            # same transport the search itself just worked on
+            if transport == "html":
+                comments = _fetch_post_comments_html(
+                    post.get("permalink", ""),
+                    title,
+                    time_left(),
+                )
+            else:
+                comments = _fetch_post_comments(
+                    working_domain,
+                    subreddit,
+                    post_id,
+                    title,
+                    time_left(),
+                )
 
             # Small delay between requests to avoid sending requests too quickly
             time.sleep(_REQUEST_DELAY_SECONDS)

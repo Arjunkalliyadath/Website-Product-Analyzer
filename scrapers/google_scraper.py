@@ -6,9 +6,11 @@ import re
 import sys
 import threading
 import time
+import urllib.request
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Dict, List, Tuple
+from urllib.parse import quote_plus
 
 from scrapers.browser_utils import browser_launch_slot, normalize_comments
 from config import (
@@ -204,6 +206,17 @@ _REVIEW_PANEL_SELECTORS = [
 # aria-label or a jsaction hook - so a role/name match alone can miss it
 # even though the control is present and clickable.
 _REVIEWS_TAB_SELECTORS = [
+    # --- Tier 0: modern (2025-2026) tab bar --------------------------------
+    # Current Maps builds render the place-page tab bar as <button
+    # role='tab'> elements whose aria-label reads "<Tab> of <business>" /
+    # "Reviews for <business>" (verified against a live 2026-07 capture:
+    # the tablist held `button[role='tab'][aria-label='Overview of ...']`,
+    # `... 'About of ...'` — plain <button role='tab'>, not div[role=
+    # 'button']).
+    "button[role='tab'][aria-label^='Reviews']",
+    "button[role='tab'][aria-label*='Reviews' i]",
+    "button[role='tab']:has-text('Reviews')",
+
     # --- Tier 1: aria-label on div[role='button'] --------------------------
     # Google Maps 2024-2026 renders the nav pills as `div[role='button']`
     # inside a `div[role='tablist']`, NOT as `<button>` elements. This is
@@ -1195,6 +1208,11 @@ def _js_click_reviews_tab(page) -> bool:
                     const label = (el.getAttribute('aria-label') || '').toLowerCase();
                     const text  = (el.innerText || el.textContent || '').trim().toLowerCase();
                     const jsa   = (el.getAttribute('jsaction') || '').toLowerCase();
+                    // Never the "Write a review" control — it opens a
+                    // sign-in modal that blocks the page.
+                    if (label.includes('write') || text.includes('write')) {
+                        continue;
+                    }
                     if (
                         label === 'reviews' ||
                         text  === 'reviews' ||
@@ -1217,6 +1235,75 @@ def _js_click_reviews_tab(page) -> bool:
         return bool(clicked)
     except Exception:
         return False
+
+
+def _is_write_review_control(loc) -> bool:
+    """True when a Reviews-tab candidate is actually the "Write a review"
+    button. Several of the broader selectors above (`[data-value*='Review'
+    i]`, `[aria-label*='Review' i]`, the Review XPaths) match it, and
+    clicking it opens a "Sign in with your Google Account to write a
+    review" modal that blocks the whole page — observed live: that single
+    mis-click is what turned an otherwise-successful place-page scrape
+    into FEED_MISSING/ZERO_REVIEWS."""
+    try:
+        label = " ".join(filter(None, [
+            loc.get_attribute("aria-label") or "",
+            loc.get_attribute("data-value") or "",
+        ]))
+        if "write" in label.lower():
+            return True
+        txt = loc.inner_text(timeout=300) or ""
+        return "write" in txt.lower()
+    except Exception:
+        return False
+
+
+# Review-content probes shared by the post-click verification below: any of
+# these appearing means the reviews list actually opened.
+_REVIEW_CONTENT_PROBE_SELECTORS = [
+    "div[role='feed']",
+    "div[data-review-id]",
+    "span.wiI7pd",
+    "div.jftiEf",
+]
+
+
+def _reviews_content_appeared(page, timeout_ms: int = 2500) -> bool:
+    """Quick check that a click on a supposed Reviews control actually
+    surfaced review content, instead of assuming any successful click did
+    (a click can 'succeed' on the wrong control, e.g. a sign-in modal)."""
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        for sel in _REVIEW_CONTENT_PROBE_SELECTORS:
+            try:
+                if page.locator(sel).count() > 0:
+                    return True
+            except Exception:
+                continue
+        try:
+            page.wait_for_timeout(250)
+        except Exception:
+            return False
+    return False
+
+
+def _dismiss_blocking_modal(page) -> None:
+    """Best-effort close of a modal a wrong click may have opened (the
+    sign-in-to-write-a-review dialog in particular), so the remaining
+    selector candidates get a clean page to act on."""
+    try:
+        cancel = page.get_by_role("button", name="Cancel", exact=False)
+        if cancel.count() > 0 and cancel.first.is_visible():
+            cancel.first.click(timeout=1000)
+            page.wait_for_timeout(300)
+            return
+    except Exception:
+        pass
+    try:
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(300)
+    except Exception:
+        pass
 
 
 def _expand_hidden_review_text(page, time_left, limit: int = 200) -> int:
@@ -1391,6 +1478,15 @@ def _scrape_maps(page, query: str, time_left, company_data: Dict[str, str] = Non
     else:
         target_name = (company_data or {}).get("company_name", query) or query
         target_website = (company_data or {}).get("website", "") or ""
+        # Compare by bare domain, not the full URL: target_website is
+        # usually "https://www.example.com", which can never appear
+        # verbatim inside a Maps place href - so the +100 website score
+        # below never fired at all.
+        target_domain = target_website.lower()
+        for _prefix in ("https://", "http://", "www."):
+            if target_domain.startswith(_prefix):
+                target_domain = target_domain[len(_prefix):]
+        target_domain = target_domain.split("/")[0].strip()
 
         def _click_place_result(click_target, attempt_query: str) -> bool:
             """Navigate to a place-result element and confirm real
@@ -1615,7 +1711,7 @@ def _scrape_maps(page, query: str, time_left, company_data: Dict[str, str] = Non
                                 similarity = SequenceMatcher(None, target_name.lower(), name_lower).ratio()
                                 if similarity >= 0.6:
                                     score += int(similarity * 80)
-                        if target_website and target_website.lower() in link.lower():
+                        if target_domain and target_domain in link.lower():
                             score += 100
 
                         if score > best_match_score:
@@ -1643,6 +1739,24 @@ def _scrape_maps(page, query: str, time_left, company_data: Dict[str, str] = Non
                     except Exception:
                         continue
                 if clicked_into_place:
+                    break
+                if results:
+                    # Every remaining selector in _PLACE_RESULT_SELECTORS
+                    # resolves the same underlying result cards this one
+                    # already did - re-evaluating them cannot produce a
+                    # different outcome, and each extra selector costs up
+                    # to 6s of wait_for_selector time. Observed live: all
+                    # candidates scoring 0 here (business genuinely absent
+                    # from Maps - e.g. an online-only D2C brand) and then
+                    # 12s+ burning on the remaining selectors, leaving the
+                    # search/Bing fallbacks no budget at all.
+                    logger.info(
+                        "[PLACE_RESULT] %d candidate(s) evaluated with no "
+                        "acceptable match for query=%r; skipping the "
+                        "remaining selectors (same underlying results) so "
+                        "the fallbacks get the time budget instead.",
+                        len(results), query,
+                    )
                     break
             except Exception:
                 continue
@@ -1738,13 +1852,70 @@ def _scrape_maps(page, query: str, time_left, company_data: Dict[str, str] = Non
     reviews_tab_found = False
     reviews_tab_selector_used = None
 
+    # --- Tier 0: the !9m1!1b1 reviews-pane deep-link -----------------------
+    # Google serves anonymous/automated sessions a "limited view of Google
+    # Maps" (its own banner text) whose place page renders NO Reviews tab
+    # at all — the tablist holds only Overview/About, so every selector
+    # strategy below is hunting for a control that simply isn't there.
+    # But the same limited view still honors the data-URL parameter that
+    # deep-links straight into the reviews pane (verified live: 16
+    # div[data-review-id] nodes rendered where the tab hunt found
+    # nothing). Build that URL from the place's CID token and navigate
+    # directly.
+    place_url = _safe_url(page)
+    if "/maps/place/" not in place_url and time_left() > 8:
+        # The Maps SPA can lag flipping the address bar to the
+        # /maps/place/ URL even after the detail page itself has rendered
+        # (observed live: layout classified as business_page via DOM
+        # indicators while page.url still read /maps/search/). Give the
+        # URL a moment to settle, then fall back to reading the place
+        # link out of the DOM.
+        _url_deadline = time.monotonic() + 3.0
+        while time.monotonic() < _url_deadline:
+            place_url = _safe_url(page)
+            if "/maps/place/" in place_url:
+                break
+            try:
+                page.wait_for_timeout(300)
+            except Exception:
+                break
+        if "/maps/place/" not in place_url:
+            try:
+                _href = page.locator("a[href*='/maps/place/']").first.get_attribute("href") or ""
+            except Exception:
+                _href = ""
+            if "/maps/place/" in _href:
+                place_url = _href
+    cid_match = re.search(r"!1s(0x[0-9a-fA-F]+:0x[0-9a-fA-F]+)", place_url)
+    if cid_match and "/maps/place/" in place_url and time_left() > 8:
+        name_part = place_url.split("/maps/place/")[1].split("/")[0]
+        deep_url = (
+            f"https://www.google.com/maps/place/{name_part}/"
+            f"data=!4m8!3m7!1s{cid_match.group(1)}!8m2!3d0!4d0!9m1!1b1!16s"
+            "?hl=en&gl=in"
+        )
+        if _goto_with_retry(page, deep_url, timeout=_adaptive_nav_timeout(time_left), time_left=time_left, retries=1):
+            page.wait_for_timeout(1500)
+            if _reviews_content_appeared(page, timeout_ms=4000):
+                reviews_tab_found = True
+                reviews_tab_selector_used = "reviews_deeplink"
+                logger.info(
+                    "Reviews pane opened via !9m1!1b1 deep-link for query=%r.",
+                    query,
+                )
+            else:
+                logger.info(
+                    "Reviews deep-link rendered no review content for "
+                    "query=%r; falling back to the tab-selector hunt.", query,
+                )
+
     # Short individual wait — the element is either already in the DOM (fast
     # path: ≤100ms) or it isn't going to appear at this selector at all.
     # 1200ms is plenty for a painted element; 4000ms per selector with 30+
     # selectors was the primary budget-killer.
     _TAB_SELECTOR_WAIT_MS = 1200
 
-    for selector in _REVIEWS_TAB_SELECTORS:
+    for selector in ([] if reviews_tab_found else _REVIEWS_TAB_SELECTORS):
         if time_left() <= 10:
             break
         try:
@@ -1759,8 +1930,24 @@ def _scrape_maps(page, query: str, time_left, company_data: Dict[str, str] = Non
             # match hidden/offscreen duplicates that don't respond.
             if not loc.is_visible():
                 continue
+            # Never click the "Write a review" button — several broad
+            # selectors match it, and it opens a sign-in modal that
+            # blocks the whole page (see _is_write_review_control).
+            if _is_write_review_control(loc):
+                continue
             loc.click(timeout=2000)
             page.wait_for_timeout(800)
+            # Confirm the click actually surfaced review content; a
+            # click can land on the wrong control and open a modal
+            # instead. If so, dismiss it and keep hunting.
+            if not _reviews_content_appeared(page):
+                logger.info(
+                    "Click via selector %r did not surface review content "
+                    "for query=%r; dismissing any modal and trying the "
+                    "next selector.", selector, query,
+                )
+                _dismiss_blocking_modal(page)
+                continue
             reviews_tab_found = True
             reviews_tab_selector_used = selector
             logger.info(
@@ -1780,8 +1967,13 @@ def _scrape_maps(page, query: str, time_left, company_data: Dict[str, str] = Non
             try:
                 btn = page.get_by_role("button", name=name_variant, exact=True)
                 if btn.count() > 0 and btn.first.is_visible():
+                    if _is_write_review_control(btn.first):
+                        continue
                     btn.first.click(timeout=2000)
                     page.wait_for_timeout(800)
+                    if not _reviews_content_appeared(page):
+                        _dismiss_blocking_modal(page)
+                        continue
                     reviews_tab_found = True
                     reviews_tab_selector_used = f"get_by_role(button, name={name_variant!r})"
                     logger.info(
@@ -1805,11 +1997,18 @@ def _scrape_maps(page, query: str, time_left, company_data: Dict[str, str] = Non
         )
         if _js_click_reviews_tab(page):
             page.wait_for_timeout(1000)
-            reviews_tab_found = True
-            reviews_tab_selector_used = "js_injection"
-            logger.info(
-                "Reviews tab clicked via JS-injection DOM walk for query=%r.", query,
-            )
+            if _reviews_content_appeared(page):
+                reviews_tab_found = True
+                reviews_tab_selector_used = "js_injection"
+                logger.info(
+                    "Reviews tab clicked via JS-injection DOM walk for query=%r.", query,
+                )
+            else:
+                logger.info(
+                    "JS-injection click did not surface review content for "
+                    "query=%r; dismissing any modal it opened.", query,
+                )
+                _dismiss_blocking_modal(page)
 
     # --- Step 3: wait for the reviews feed to actually render. -----------
     # Increased initial wait from 0ms to 1500ms after a tab click — the
@@ -1944,14 +2143,21 @@ def _scrape_search_fallback(page, query: str, time_left) -> Tuple[List[str], boo
 
 def _scrape_bing_fallback(page, query: str, time_left) -> List[str]:
     texts: List[str] = []
-    search_q = f"{query} site:trustpilot.com OR site:g2.com reviews"
+    # Broad "<query> reviews" query. The previous
+    # "site:trustpilot.com OR site:g2.com" restriction returned literally
+    # zero results for most consumer brands (verified live: 0 li.b_algo
+    # for boAt with the restricted query vs 10 with the broad one), which
+    # made this whole fallback a no-op.
+    search_q = f"{query} reviews"
     url = f"https://www.bing.com/search?q={search_q.replace(' ', '+')}"
 
     if not _goto_with_retry(page, url, timeout=_adaptive_nav_timeout(time_left), time_left=time_left, retries=1):
         return texts
 
     page.wait_for_timeout(1200)
-    for sel in ["p.b_algoSlug", "div.b_caption p"]:
+    # div.b_caption p is the current result-snippet container;
+    # p.b_algoSlug is kept as a legacy fallback.
+    for sel in ["div.b_caption p", "p.b_algoSlug"]:
         try:
             found = page.locator(sel).all_inner_texts()
         except Exception:
@@ -1960,7 +2166,49 @@ def _scrape_bing_fallback(page, query: str, time_left) -> List[str]:
             txt = (txt or "").strip()
             if txt and len(txt.split()) >= 6:
                 texts.append(txt)
+        if texts:
+            break
     return texts
+
+
+def _scrape_ddg_fallback(query: str, time_left) -> List[str]:
+    """DuckDuckGo's HTML-only endpoint (html.duckduckgo.com/html) —
+    server-rendered, works over one plain urllib GET with a browser
+    User-Agent, no JS and no captcha wall observed. Kept as the final
+    fallback tier because it's the one source here that stays available
+    even when Google serves its /sorry/ captcha page to this network
+    (observed live) and the business has no Maps listing at all."""
+    if time_left() <= 3:
+        return []
+    url = f"https://html.duckduckgo.com/html/?q={quote_plus(query + ' reviews')}"
+    request = urllib.request.Request(url, headers={
+        "User-Agent": _USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+    try:
+        with urllib.request.urlopen(request, timeout=max(3.0, min(8.0, time_left()))) as resp:
+            html = resp.read().decode("utf-8", errors="ignore")
+    except Exception:
+        logger.info("DuckDuckGo fallback request failed for query=%r.", query)
+        return []
+
+    texts: List[str] = []
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "html.parser")
+        for snippet in soup.select("a.result__snippet"):
+            txt = snippet.get_text(" ", strip=True)
+            if txt and len(txt.split()) >= 6:
+                texts.append(txt)
+    except Exception:
+        logger.warning("DuckDuckGo fallback parse failed for query=%r.", query, exc_info=True)
+    if texts:
+        logger.info(
+            "DuckDuckGo fallback found %d snippet(s) for query=%r.",
+            len(texts), query,
+        )
+    return texts[: min(MAX_GOOGLE_REVIEWS, 50)]
 
 
 def _scrape_sync(query: str, company_data: Dict[str, str] = None) -> List[str]:
@@ -2020,6 +2268,12 @@ def _scrape_sync(query: str, company_data: Dict[str, str] = None) -> List[str]:
                 raw_results.extend(_scrape_bing_fallback(page, query, time_left))
             except Exception:
                 logger.exception("Bing fallback failed for query=%r.", query)
+
+        if len(raw_results) < min(5, MAX_GOOGLE_REVIEWS) and time_left() > 3:
+            try:
+                raw_results.extend(_scrape_ddg_fallback(query, time_left))
+            except Exception:
+                logger.exception("DuckDuckGo fallback failed for query=%r.", query)
     finally:
         if page is not None:
             try:

@@ -362,12 +362,31 @@ async def analyze(request: Request, company_name: str = Form(...)):
         products = product_data.get("products", [])
 
         if len(products) > 10:
+            # select_products.html renders product objects (product.name /
+            # product.json / product.category), not bare name strings —
+            # passing the plain name list here rendered empty cards and,
+            # worse, dropped every product URL on the floor, which starved
+            # the website review scraper downstream. Build the same rich
+            # objects /discover_products builds.
+            rich_products = []
+            for item in product_data.get("catalogue", []):
+                if item.get("is_service") or not item.get("name"):
+                    continue
+                product_obj = {
+                    "name": item.get("name", ""),
+                    "url": item.get("url", ""),
+                    "brand": item.get("brand", ""),
+                    "image": item.get("image", ""),
+                    "category": item.get("category", ""),
+                }
+                product_obj["json"] = json.dumps(product_obj, ensure_ascii=True)
+                rich_products.append(product_obj)
             return templates.TemplateResponse(
                 request=request,
                 name="select_products.html",
                 context={
                     "request": request,
-                    "products": products,
+                    "products": rich_products[: config.MAX_PRODUCTS],
                     "website": normalized_website,
                     "company": company_data,
                 },
@@ -399,15 +418,38 @@ async def analyze(request: Request, company_name: str = Form(...)):
             reddit_product_data["product_name"] = product
             reddit_jobs.append({"label": product, "data": reddit_product_data})
 
+        # Website review jobs — previously only /analyze_selected ran these,
+        # so any site with few enough products to skip the selection screen
+        # always came back with zero "Website" comments. The catalogue holds
+        # the product URLs the scraper needs.
+        catalogue_url_by_name: Dict[str, str] = {}
+        for item in product_data.get("catalogue", []):
+            item_name = (item.get("name") or "").strip()
+            item_url = (item.get("url") or "").strip()
+            if item_name and item_url and not item.get("is_service"):
+                catalogue_url_by_name.setdefault(item_name, item_url)
+
+        website_review_jobs: List[Dict[str, Any]] = []
+        for product in scrape_targets:
+            product_url = catalogue_url_by_name.get(product, "")
+            if not product_url:
+                continue
+            website_review_data = dict(company_data)
+            website_review_data["product_url"] = product_url
+            website_review_data["product_name"] = product
+            website_review_jobs.append({"label": product, "data": website_review_data})
+
         google_semaphore = asyncio.Semaphore(config.MAX_PARALLEL_TASKS)
         youtube_semaphore = asyncio.Semaphore(MAX_BROWSER_WORKERS)
         reddit_semaphore = asyncio.Semaphore(MAX_REDDIT_WORKERS)
+        website_review_semaphore = asyncio.Semaphore(MAX_WEBSITE_REVIEW_WORKERS)
 
         GOOGLE_JOB_TIMEOUT_SECONDS = 48
         TWITTER_TIMEOUT_SECONDS = 32
         INSTAGRAM_TIMEOUT_SECONDS = 34
         YOUTUBE_TIMEOUT_SECONDS = 30
         REDDIT_TIMEOUT_SECONDS = 20
+        WEBSITE_REVIEW_TIMEOUT_SECONDS = 60
 
         async def _scrape_google_job(job: Dict[str, Any]) -> List[str]:
             async with google_semaphore:
@@ -539,12 +581,45 @@ async def analyze(request: Request, company_name: str = Form(...)):
                 by_product.append({"product": job["label"], "comments": deduped})
             return by_product
 
+        async def _scrape_website_review_job(job: Dict[str, Any]) -> List[str]:
+            async with website_review_semaphore:
+                try:
+                    return await asyncio.wait_for(
+                        scrape_website_reviews(job["data"]),
+                        timeout=WEBSITE_REVIEW_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Website Review job for %r exceeded its %.0fs hard "
+                        "timeout — returning [] (no partial results are "
+                        "recoverable here).",
+                        job.get("label"), WEBSITE_REVIEW_TIMEOUT_SECONDS,
+                    )
+                    return []
+                except asyncio.CancelledError:
+                    logger.warning("Website Review job for %r was cancelled", job.get("label"))
+                    return []
+                except Exception:
+                    logger.exception("Website Review job for %r failed", job.get("label"))
+                    return []
+
+        async def _scrape_website_review_jobs_group() -> List[Any]:
+            _group_start = time.perf_counter()
+            try:
+                return await asyncio.gather(
+                    *(_scrape_website_review_job(job) for job in website_review_jobs),
+                    return_exceptions=True,
+                )
+            finally:
+                _log_stage("Website Review Scraper", time.perf_counter() - _group_start)
+
         results = await asyncio.gather(
             _scrape_google_jobs_group(),
             _timed("Twitter Scraper", scrape_twitter_comments(company_data), timeout=TWITTER_TIMEOUT_SECONDS),
             _timed("Instagram Scraper", scrape_instagram_comments(company_data), timeout=INSTAGRAM_TIMEOUT_SECONDS),
             _scrape_youtube_jobs_group(),
             _scrape_reddit_jobs_group(),
+            _scrape_website_review_jobs_group(),
             return_exceptions=True,
         )
 
@@ -552,6 +627,22 @@ async def analyze(request: Request, company_name: str = Form(...)):
         twitter_comments, instagram_comments = results[1], results[2]
         youtube_by_product: List[Dict[str, Any]] = results[3] if not isinstance(results[3], BaseException) else []
         reddit_by_product: List[Dict[str, Any]] = results[4] if not isinstance(results[4], BaseException) else []
+        website_review_job_results = results[5] if not isinstance(results[5], BaseException) else []
+
+        website_review_texts: List["tuple[str, str]"] = []
+        _seen_website_review_keys: set = set()
+        for job, outcome in zip(website_review_jobs, website_review_job_results):
+            comments = list(outcome) if not isinstance(outcome, BaseException) else []
+            comments = comments[:config.MAX_COMMENTS_PER_PRODUCT]
+            for text in comments:
+                text = (text or "").strip()
+                if not text:
+                    continue
+                key = re.sub(r"\s+", " ", text).lower()
+                if key in _seen_website_review_keys:
+                    continue
+                _seen_website_review_keys.add(key)
+                website_review_texts.append((job["label"], text))
 
         google_by_product: List[Dict[str, Any]] = []
         google_all_comments: List[str] = []
@@ -575,7 +666,7 @@ async def analyze(request: Request, company_name: str = Form(...)):
             "Instagram": list(instagram_comments) if not isinstance(instagram_comments, BaseException) else [],
             "YouTube":   youtube_all_comments,
             "Reddit":    reddit_all_comments,
-            "Website":   [],
+            "Website":   [text for _, text in website_review_texts],
         }
 
         comment_product_lookup: Dict[str, str] = {}
@@ -593,10 +684,15 @@ async def analyze(request: Request, company_name: str = Form(...)):
             for comment in entry["comments"]:
                 reddit_product_lookup.setdefault(comment, entry["product"])
 
+        website_product_lookup: Dict[str, str] = {}
+        for product_name, text in website_review_texts:
+            website_product_lookup.setdefault(text, product_name)
+
         platform_product_lookups = {
             "Google": comment_product_lookup,
             "YouTube": youtube_product_lookup,
             "Reddit": reddit_product_lookup,
+            "Website": website_product_lookup,
         }
 
         combined = []
